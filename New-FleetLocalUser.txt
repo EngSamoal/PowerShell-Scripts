@@ -1,0 +1,872 @@
+#Requires -Modules VMware.VimAutomation.Core
+<#
+.SYNOPSIS
+    Creates a local Windows user account across a VM fleet using VMware Guest Operations
+    (PowerCLI Invoke-VMScript over VMware Tools), with no dependency on WinRM.
+
+.DESCRIPTION
+    - Uses VMware Guest Operations API (Invoke-VMScript) to run a script inside each guest.
+    - Checks prerequisites FIRST per VM (exists, powered on, Tools/GuestOps ready) before
+      touching it, using freshly-refreshed VM view data (not a stale cached snapshot).
+    - Performs AT MOST ONE account-creation invocation per VM. It is never blindly retried,
+      because Invoke-VMScript can fail on the RESULT channel (start / poll / read-output)
+      *after* the guest already created the account — retrying in that case would either be
+      pointless (guest script is idempotent) or, more importantly, would misrepresent what
+      actually happened. A creation retry is only permitted when the failure can be
+      positively identified as one that occurred BEFORE the guest was ever contacted
+      (e.g. auth failure, guest ops agent unreachable, very fast failure) - see
+      Test-IsPreDispatchFailure.
+    - If the creation call raises an ambiguous error (could have executed, could not have),
+      the script NEVER retries creation. Instead it falls back to a read-only verification
+      call, on its own independent retry loop, to determine the real guest state.
+    - Verification checks three things, not just existence: the account exists, is enabled,
+      and is a member of the configured local group - so a half-finished state is never
+      silently reported as success.
+    - Every generated password is written to a ledger file BEFORE the guest call is made, so
+      a password is never lost even if the result can't be confirmed. Verification and any
+      safe re-run against an existing account NEVER generates a new password.
+    - Every VM ends up in exactly one of four result CSVs:
+        1. CreatedSuccess
+        2. SkippedAlreadyExists
+        3. SkippedPrerequisiteFailed   (true prerequisite failure only - see note below)
+        4. UnconfirmedManualCheckRequired
+      All four CSVs are written only when their bucket has at least one VM in it - an empty
+      bucket produces no file (logged instead), rather than a header-only CSV.
+    - A VM is ONLY placed in SkippedPrerequisiteFailed because of a genuine prerequisite
+      problem (VM not found / powered off / Tools or Guest Operations not ready BEFORE the
+      creation attempt was made, or - separately - a verified-negative result where a
+      read-only check positively confirmed the account does NOT exist). It is never placed
+      there merely because the result channel failed after a successful creation.
+    - Full exception detail (type, message, inner exception chain, and any VMware fault
+      information) is captured to the log for every failure.
+    - Requires: vCenter connection already established (Connect-VIServer), VMware Tools
+      running in each guest, and valid in-guest credentials with local admin rights.
+    - Does NOT require WinRM, guest network reachability, or domain membership.
+    - Does NOT modify an existing account under any circumstance.
+
+.NOTES
+    Author: Automation for Samoal
+    Fill in the CONFIGURATION block before running.
+    Run against a test/pilot VM list first before fleet-wide execution.
+
+    Revision log (logic corrections vs. the previous version are marked "# CORRECTED:" or
+    "# NEW:" at the point they occur in this file):
+      - Removed blind full-script retry loop for account creation.
+      - Added pre-dispatch vs. ambiguous failure classification.
+      - Added an independent, multi-attempt, read-only verification function that checks
+        existence + enabled + group membership (not existence alone).
+      - Verification no longer shares the creation call's retry budget; it has its own
+        configurable retry count/delay so a still-recovering Guest RPC channel gets a real
+        chance to answer before the VM is marked unconfirmed.
+      - Prerequisite checks now force a refresh of VM view data before reading Tools/GuestOps
+        status, and validate GuestOperationsReady in addition to ToolsRunningStatus.
+      - Prerequisite-failure classification after a creation attempt now requires a verified
+        negative result, never just a channel error.
+      - Added full exception + inner exception + VMware fault capture to the log.
+      - CSV export now always produces a file (header row) even for empty result sets.
+      - Reduced default wait times and made every wait/retry value configurable.
+      - Added detection of DETERMINISTIC network failures (DNS/host-name resolution, TLS
+        trust, connection-refused) as distinct from transient communication errors. These
+        will not resolve by waiting and retrying - they mean this machine cannot reach the
+        target ESXi host at all, so retrying identically for the full retry budget wastes
+        time. Detected once, the failing host is remembered for the rest of the run so every
+        other VM on that host is skipped (as Unconfirmed, not Prerequisite-failed - see next
+        point) instead of repeating the same guaranteed failure per VM.
+      - CORRECTED: a DNS/host-unreachable error on the CREATION call is no longer treated as
+        proof the command never reached the guest, and no longer produces an immediate
+        SkippedPrerequisiteFailed. Field evidence showed an account created successfully
+        despite this exact error - Invoke-VMScript's PowerShell output-retrieval step needs
+        its own direct connection to the ESXi host, separate from and after the call that
+        actually starts the guest process, so this error can occur post-execution. It is now
+        routed through the same ambiguous-failure verification path as any other result-
+        channel loss; if verification also can't reach that host (same root cause), the
+        outcome is UnconfirmedManualCheckRequired with an explicit "may already exist" note,
+        never a false-negative prerequisite failure.
+      - NEW: added a fleet-wide ESXi host DNS preflight check, run once before any VM is
+        touched, instead of rediscovering an unreachable host VM-by-VM (each discovery
+        previously cost a full creation + verification round trip before landing on
+        Unconfirmed). Any host that fails this preflight is pre-seeded into the unreachable-
+        host cache, so every VM on it is skipped instantly with zero Invoke-VMScript calls.
+      - NEW: added an optional $KnownHostIPMap / $AutoAddHostsFileEntries fallback for hosts
+        that fail the DNS preflight. Invoke-VMScript cannot be told to use an IP directly for
+        a host (the name it calls out to is generated internally by vCenter/PowerCLI, not an
+        exposed parameter) - the practical equivalent is a static hosts-file entry for that
+        exact name, which this adds automatically if enabled, or logs the exact line to add
+        manually if not (default - safer for production, since it's a persistent system-wide
+        change).
+#>
+
+# ============================== CONFIGURATION ==============================
+# 1) Target VM scope. Choose ONE source below.
+$VMList = Get-Content -Path "C:\temp\vmlist.txt" | Where-Object { $_.Trim() -ne "" }
+
+# $VMList = @(
+#     "AQ-APP01",
+#     "AQ-APP02"
+# )
+
+# $VMList = (Get-Folder "SF&AQA-Windows" | Get-VM).Name
+# $VMList = (Get-VM -Tag "Fleet-Windows-Prod").Name
+
+# 2) Guest OS credential used to authenticate INSIDE each VM (must have local admin rights).
+$UseSavedCredential = $true
+$SavedCredentialPath = "C:\temp\guestcred.xml"
+
+# To create the saved credential file ONE TIME (run manually, not part of this script):
+#   Get-Credential | Export-Clixml -Path "C:\temp\guestcred.xml"
+
+if ($UseSavedCredential) {
+    if (-not (Test-Path $SavedCredentialPath)) {
+        throw "Saved credential file not found at $SavedCredentialPath. Create it first with: Get-Credential | Export-Clixml -Path '$SavedCredentialPath'"
+    }
+    $GuestCred = Import-Clixml -Path $SavedCredentialPath
+} else {
+    $GuestCred = Get-Credential -Message "Enter in-guest credential with local admin rights"
+}
+
+# 3) New local account to create.
+$NewUserName   = "xxxxxxx"
+$NewUserGroup  = "Administrators"
+$NewUserFullName    = "Esam Binmahefoudh"   # set to whatever "Full Name" you want shown
+$NewUserDescription = "IT Operations"
+$RequirePwdChangeAtLogon = $false
+
+# 4) Password strategy
+$UseRandomPasswordPerVM = $true
+$FixedPassword = $null   # only used if $UseRandomPasswordPerVM = $false; supply as SecureString
+
+# NEW: if $true, ONE random password is generated for this run and reused for EVERY VM in
+# it, instead of a different random password per VM. SECURITY NOTE: an identical password
+# across the fleet is a real lateral-movement risk - if one VM is ever compromised, the same
+# credential works on every other VM that got it. This still generates a FRESH random
+# password each time you run the script (so it's not one permanent fleet-wide password), but
+# within a single run every VM shares it. Only used when $UseRandomPasswordPerVM is $true.
+$UseSamePasswordForAllVMsThisRun = $true
+
+# 5) Timing / retry behavior
+# CORRECTED: split into two independent budgets - one for genuinely pre-dispatch failures
+# (safe to retry the creation call), one for read-only verification (safe to retry freely,
+# since it never changes guest state). Defaults reduced; the old 20s/30s cooldowns added
+# unnecessary wall-clock time without improving outcomes.
+$MaxDispatchRetries               = 1    # retries ONLY for failures proven to be pre-dispatch
+$DispatchRetryDelaySeconds        = 10
+$DispatchFailureElapsedThresholdSeconds = 5   # a creation call that failed this fast almost
+                                               # certainly never reached the guest (see
+                                               # Test-IsPreDispatchFailure)
+
+$VerificationInitialDelaySeconds  = 10   # brief settle time before the FIRST verification call
+$VerificationMaxRetries           = 3    # independent from creation retries - read-only, safe
+$VerificationRetryDelaySeconds    = 10
+
+# 6) DNS fallback for ESXi hosts that fail the preflight check below. Invoke-VMScript cannot
+#    be told to use an IP directly - the hostname it calls out to for output-retrieval is
+#    generated internally from how the host is registered in vCenter, not an exposed
+#    parameter. The only way to make that internal resolution succeed without real DNS is a
+#    static hosts-file entry for that EXACT name.
+#    You do NOT need to list every host by hand: for ANY host that fails DNS, the script
+#    automatically looks up its management IP from vCenter (which already knows it) and uses
+#    that. $KnownHostIPMap below is only a manual OVERRIDE for the rare case that auto-lookup
+#    can't find a usable management adapter for a host.
+$KnownHostIPMap = @{
+    # "sf-dhci-esx03.sixflags.local" = "10.x.x.x"
+}
+$AutoAddHostsFileEntries = $true    # CHANGED default to $true - manually flipping this each
+                                     # run has been the actual blocker for several runs in a
+                                     # row (config edits weren't landing). This only ever
+                                     # APPENDS a new line to this machine's own hosts file for
+                                     # an ESXi host that failed real DNS - it never touches any
+                                     # VM, never removes/edits an existing line, and every
+                                     # entry it adds is logged. Requires running PowerShell as
+                                     # Administrator - if not elevated, it fails to write and
+                                     # falls back to logging the line for you to add manually
+                                     # (see Add-HostsFileEntryIfMissing's catch branch below).
+                                     # Set back to $false if you'd rather review each host's
+                                     # IP before it's written.
+
+# 7) Output/logging paths
+$OutputFolder = "C:\temp\fleet"
+if (-not (Test-Path -Path $OutputFolder)) {
+    New-Item -Path $OutputFolder -ItemType Directory -Force | Out-Null
+}
+
+$LogPath              = Join-Path $OutputFolder "FleetUserCreation_Log.log"
+$SecretsPath          = Join-Path $OutputFolder "FleetUserCreation_Secrets.csv"
+$PasswordLedgerPath   = Join-Path $OutputFolder "FleetUserCreation_PasswordLedger.csv"
+$CreatedSuccessPath   = Join-Path $OutputFolder "Fleet_01_CreatedSuccess.csv"
+$SkippedExistsPath    = Join-Path $OutputFolder "Fleet_02_SkippedAlreadyExists.csv"
+$SkippedPrereqPath    = Join-Path $OutputFolder "Fleet_03_SkippedPrerequisiteFailed.csv"
+$UnconfirmedPath      = Join-Path $OutputFolder "Fleet_04_UnconfirmedManualCheckRequired.csv"
+# NOTE: file names are static (no timestamp) - each run OVERWRITES the CSVs from the
+# previous run. The log file is appended to (not overwritten), so each run's entries stack
+# on top of earlier ones in the same file - every log line still has its own timestamp from
+# Write-Log, so runs remain distinguishable within the log even without a per-run file name.
+# =============================================================================
+
+function Write-Log {
+    param([string]$Message, [string]$Level = "INFO")
+    $line = "[{0}] [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $Message
+    Add-Content -Path $LogPath -Value $line
+    Write-Host $line
+}
+
+# NEW: full exception detail capture - walks the InnerException chain and pulls VMware
+# fault information (MethodFault / vim fault type) when present, instead of logging only
+# $_.Exception.Message as before.
+function Get-FullExceptionDetail {
+    param($ErrorRecord)
+    $sb = New-Object System.Text.StringBuilder
+    $ex = $ErrorRecord.Exception
+    $depth = 0
+    while ($ex) {
+        [void]$sb.AppendLine("  [$depth] Type: $($ex.GetType().FullName)")
+        [void]$sb.AppendLine("  [$depth] Message: $($ex.Message)")
+        if ($ex.PSObject.Properties.Match('MethodFault').Count -gt 0 -and $ex.MethodFault) {
+            [void]$sb.AppendLine("  [$depth] VMware MethodFault: $($ex.MethodFault.GetType().FullName)")
+        }
+        if ($ex.PSObject.Properties.Match('FaultMessage').Count -gt 0 -and $ex.FaultMessage) {
+            [void]$sb.AppendLine("  [$depth] VMware FaultMessage: $($ex.FaultMessage | Out-String)")
+        }
+        $ex = $ex.InnerException
+        $depth++
+    }
+    if ($ErrorRecord.ErrorDetails) {
+        [void]$sb.AppendLine("  ErrorDetails: $($ErrorRecord.ErrorDetails.Message)")
+    }
+    [void]$sb.AppendLine("  CategoryInfo: $($ErrorRecord.CategoryInfo.ToString())")
+    return $sb.ToString().TrimEnd()
+}
+
+function New-RandomPassword {
+    $chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%'
+    -join (1..16 | ForEach-Object { $chars[(Get-Random -Maximum $chars.Length)] })
+}
+
+# NEW: joins every message in the exception's InnerException chain into one string, since
+# the message that actually explains what happened (e.g. a DNS resolution failure) is often
+# two or three levels deep - checking only $ErrorRecord.Exception.Message (the outer ViError
+# wrapper) misses it entirely.
+function Get-ExceptionMessageChain {
+    param($ErrorRecord)
+    $parts = @()
+    $ex = $ErrorRecord.Exception
+    while ($ex) {
+        $parts += $ex.Message
+        $ex = $ex.InnerException
+    }
+    return ($parts -join " | ")
+}
+
+# NEW: identifies failures that are DETERMINISTIC - i.e. will fail identically no matter how
+# many times or how soon they are retried, because this machine cannot reach the target ESXi
+# host at all (DNS/name resolution, TLS trust, connection actively refused). Distinct from a
+# generic transient communication error: retrying these wastes the full retry budget for a
+# guaranteed-identical result, and the correct response is to stop immediately and flag it as
+# a client-side network prerequisite problem rather than an ambiguous guest-state one.
+function Test-IsDeterministicNetworkFailure {
+    param($ErrorRecord)
+    $chain = Get-ExceptionMessageChain -ErrorRecord $ErrorRecord
+    $deterministicPatterns = @(
+        'could not be resolved',                 # DNS: remote name could not be resolved
+        'No such host is known',
+        'the remote certificate is invalid',
+        'trust relationship',
+        'actively refused'
+    )
+    foreach ($pattern in $deterministicPatterns) {
+        if ($chain -match [regex]::Escape($pattern)) { return $true }
+    }
+    return $false
+}
+
+# NEW: heuristic classification of whether a failed Invoke-VMScript call can be positively
+# proven to have never reached the guest. Only these cases are safe to retry the CREATION
+# script; everything else must fall through to verification instead of a blind retry.
+# CORRECTED: now checks the FULL exception chain (see Get-ExceptionMessageChain), not just
+# the outer message.
+# CORRECTED (again): DNS/name-resolution failures are deliberately EXCLUDED from this list.
+# Field evidence showed a guest account created successfully despite the creation call
+# failing with "the remote name could not be resolved" - Invoke-VMScript's output-retrieval
+# step apparently needs to reach the ESXi host directly, AFTER the guest script has already
+# run, so this error can occur post-execution. It does not prove non-dispatch and must be
+# treated as ambiguous (see Test-IsDeterministicNetworkFailure for the separate "don't bother
+# retrying, but don't assume non-creation either" handling).
+function Test-IsPreDispatchFailure {
+    param($ErrorRecord, [double]$ElapsedSeconds, [int]$ThresholdSeconds)
+
+    $chain = Get-ExceptionMessageChain -ErrorRecord $ErrorRecord
+    $definitePreDispatchPatterns = @(
+        'could not be contacted',            # guest ops agent / VMware Tools never reachable
+        'is not running',                    # Tools not running, caught mid-call
+        'incorrect user name or password',   # guest auth rejected before anything ran
+        'InvalidGuestLogin',
+        'cannot complete login',
+        'not supported',                     # e.g. GuestOperations not supported on this VM
+        'permission to perform this operation was denied'
+    )
+    foreach ($pattern in $definitePreDispatchPatterns) {
+        if ($chain -match [regex]::Escape($pattern)) { return $true }
+    }
+    # A failure this fast almost certainly failed during session/auth setup, before the
+    # guest process was ever started - long-poll/result-read failures take materially longer.
+    if ($ElapsedSeconds -lt $ThresholdSeconds) { return $true }
+
+    return $false
+}
+
+# NEW: refreshes VM view data before reading Tools/GuestOperations status.
+# CORRECTED: the previous version read $vm.ExtensionData.Guest.ToolsRunningStatus directly
+# off the object returned by Get-VM, which can be a cached snapshot from whenever PowerCLI
+# last refreshed it - not necessarily current at the moment of the check.
+function Get-GuestReadiness {
+    param($VM)
+    $VM.ExtensionData.UpdateViewData("Guest")
+    $guest = $VM.ExtensionData.Guest
+
+    $toolsRunning = ($guest.ToolsRunningStatus -eq "guestToolsRunning")
+    # GuestOperationsReady is the more reliable signal - Tools can report "running" while the
+    # guest RPC channel used by Invoke-VMScript is not actually ready to accept operations.
+    $guestOpsReady = $true
+    if ($guest.PSObject.Properties.Match('GuestOperationsReady').Count -gt 0 -and $null -ne $guest.GuestOperationsReady) {
+        $guestOpsReady = [bool]$guest.GuestOperationsReady
+    }
+
+    [PSCustomObject]@{
+        ToolsRunning    = $toolsRunning
+        GuestOpsReady   = $guestOpsReady
+        ToolsStatusRaw  = $guest.ToolsRunningStatus
+    }
+}
+
+# NEW: read-only verification with its OWN independent retry loop (never shares budget with
+# the creation call) and checks existence + enabled + group membership.
+# CORRECTED: previous Test-GuestAccountExists made a single attempt and only checked
+# existence, so a still-recovering Guest RPC channel had one shot to answer, and a
+# half-finished account (e.g. created but not yet in the group) would have been misreported.
+function Confirm-GuestAccountFinalState {
+    param($VM, [string]$UserName, [string]$GroupName, $Credential, [int]$MaxRetries, [int]$DelaySeconds)
+
+    $checkScript = @"
+`$ErrorActionPreference = 'Stop'
+`$user  = '$UserName'
+`$group = '$GroupName'
+`$hasLocalAccountsModule = Get-Module -ListAvailable -Name Microsoft.PowerShell.LocalAccounts -ErrorAction SilentlyContinue
+if (`$hasLocalAccountsModule) {
+    `$u = Get-LocalUser -Name `$user -ErrorAction SilentlyContinue
+    if (-not `$u) { "NOT_FOUND"; exit }
+    `$member = Get-LocalGroupMember -Group `$group -ErrorAction SilentlyContinue |
+        Where-Object { `$_.Name -eq "`$env:COMPUTERNAME\`$user" -or `$_.Name -eq `$user }
+    "EXISTS|ENABLED=`$(`$u.Enabled)|INGROUP=`$([bool]`$member)"
+} else {
+    `$notFound = net user `$user 2>&1 | Select-String "The user name could not be found" -Quiet
+    if (`$notFound) { "NOT_FOUND"; exit }
+    `$active = (net user `$user | Select-String "Account active") -match "Yes"
+    `$members = net localgroup `$group
+    `$inGroup = [bool](`$members | Select-String -SimpleMatch `$user)
+    "EXISTS|ENABLED=`$active|INGROUP=`$inGroup"
+}
+"@
+
+    $attempt = 0
+    while ($attempt -le $MaxRetries) {
+        try {
+            $result = Invoke-VMScript -VM $VM -ScriptText $checkScript -ScriptType PowerShell -GuestCredential $Credential -ErrorAction Stop
+            $out = $result.ScriptOutput.Trim()
+
+            if ($out -match "^NOT_FOUND") {
+                return [PSCustomObject]@{ Status = "NotFound"; Enabled = $null; InGroup = $null }
+            }
+            if ($out -match "^EXISTS\|ENABLED=(True|False)\|INGROUP=(True|False)") {
+                return [PSCustomObject]@{
+                    Status  = "Confirmed"
+                    Enabled = [bool]::Parse($Matches[1])
+                    InGroup = [bool]::Parse($Matches[2])
+                }
+            }
+            # Unrecognized output - treat as unreachable/ambiguous rather than guessing.
+            return [PSCustomObject]@{ Status = "Unreachable"; Enabled = $null; InGroup = $null; RawOutput = $out }
+        }
+        catch {
+            # CORRECTED: check for a deterministic network failure FIRST, before consuming any
+            # retry budget. Retrying an unresolvable DNS name 3 more times at 10s intervals
+            # cannot succeed - it wastes ~30s per VM and produces a misleadingly generic
+            # "channel unreachable" result when the real cause (and fix) is specific and known.
+            if (Test-IsDeterministicNetworkFailure -ErrorRecord $_) {
+                Write-Log "$($VM.Name) -> verification hit a DETERMINISTIC network failure reaching host '$($VM.VMHost.Name)' - will not retry further, this cannot succeed until connectivity/DNS is fixed. $(Get-FullExceptionDetail $_)" "ERROR"
+                return [PSCustomObject]@{ Status = "HostUnreachable"; Enabled = $null; InGroup = $null; UnreachableHost = $VM.VMHost.Name }
+            }
+            $attempt++
+            if ($attempt -le $MaxRetries) {
+                Write-Log "$($VM.Name) -> verification attempt $attempt/$MaxRetries failed, retrying in ${DelaySeconds}s. $(Get-FullExceptionDetail $_)" "WARN"
+                Start-Sleep -Seconds $DelaySeconds
+            } else {
+                Write-Log "$($VM.Name) -> verification exhausted all $MaxRetries retries. $(Get-FullExceptionDetail $_)" "WARN"
+            }
+        }
+    }
+    return [PSCustomObject]@{ Status = "Unreachable"; Enabled = $null; InGroup = $null }
+}
+
+# NEW: exports a CSV with a valid header row even when the data set is empty, instead of
+# silently producing no file at all (the previous behavior of Export-Csv on an empty array).
+function Export-ReportCsv {
+    param($Data, [string]$Path, [string[]]$Columns)
+    if ($Data.Count -gt 0) {
+        $Data | Export-Csv -Path $Path -NoTypeInformation
+    } else {
+        Write-Log "No records for $Path - file not created (empty result set)."
+    }
+}
+
+# NEW: adds a hostname->IP line to the local hosts file if it isn't already present, as a
+# fallback for a host that fails real DNS resolution (see $KnownHostIPMap /
+# $AutoAddHostsFileEntries). Idempotent - checks for an existing entry (commented or not)
+# for this exact hostname before appending, and never touches or removes any existing line.
+function Add-HostsFileEntryIfMissing {
+    param([string]$HostName, [string]$IPAddress)
+    $hostsPath = "$env:SystemRoot\System32\drivers\etc\hosts"
+    try {
+        $existing = Get-Content -Path $hostsPath -ErrorAction Stop
+        if ($existing | Where-Object { $_ -match "^\s*[^#\s]+\s+$([regex]::Escape($HostName))(\s|$)" }) {
+            return [PSCustomObject]@{ Success = $true; AlreadyPresent = $true; Error = $null }
+        }
+        Add-Content -Path $hostsPath -Value "$IPAddress`t$HostName`t# Added by New-FleetLocalUser.ps1 - DNS fallback, $(Get-Date -Format 'yyyy-MM-dd')" -ErrorAction Stop
+        return [PSCustomObject]@{ Success = $true; AlreadyPresent = $false; Error = $null }
+    }
+    catch {
+        return [PSCustomObject]@{ Success = $false; AlreadyPresent = $false; Error = $_.Exception.Message }
+    }
+}
+
+# NEW: looks up an ESXi host's management IP directly from vCenter, so a DNS fallback can be
+# applied automatically for EVERY unresolvable host in the fleet - not just ones manually
+# typed into $KnownHostIPMap. vCenter already knows this IP (it's how it manages the host),
+# so this doesn't depend on this machine's DNS at all.
+function Get-VMHostManagementIP {
+    param([string]$HostName)
+    try {
+        $vmhost = Get-VMHost -Name $HostName -ErrorAction Stop
+        $mgmtAdapter = $vmhost | Get-VMHostNetworkAdapter -VMKernel -ErrorAction Stop |
+            Where-Object { $_.ManagementTrafficEnabled } | Select-Object -First 1
+        if ($mgmtAdapter -and $mgmtAdapter.IP) {
+            return [PSCustomObject]@{ Success = $true; IP = $mgmtAdapter.IP; Error = $null }
+        }
+        return [PSCustomObject]@{ Success = $false; IP = $null; Error = "No management VMkernel adapter found for '$HostName'." }
+    }
+    catch {
+        return [PSCustomObject]@{ Success = $false; IP = $null; Error = $_.Exception.Message }
+    }
+}
+
+# --- Pre-flight checks (script-level, not per-VM) ---
+if (-not (Get-Module -Name VMware.VimAutomation.Core -ListAvailable)) {
+    throw "VMware.VimAutomation.Core module not found. Install with: Install-Module VMware.PowerCLI -Scope CurrentUser"
+}
+if (-not $global:DefaultVIServers -or $global:DefaultVIServers.Count -eq 0) {
+    throw "No active vCenter connection. Run Connect-VIServer <vCenterFQDN> first."
+}
+if ($NewUserName -eq "CHANGE_ME") {
+    throw "Set `$NewUserName before running."
+}
+if ($VMList.Count -eq 0) {
+    throw "`$VMList is empty. Populate it (explicit list, folder, or tag query) before running."
+}
+
+Write-Log "=== Fleet local user creation started. Target account: $NewUserName | Group: $NewUserGroup | VM count: $($VMList.Count) ==="
+
+# NEW: hosts confirmed unreachable (DNS/connectivity) this run. Once a host is added here,
+# every remaining VM on that host is skipped immediately instead of repeating the same
+# guaranteed failure and burning its full retry budget again.
+$script:UnreachableHosts = [System.Collections.Generic.HashSet[string]]::new()
+
+# NEW: fleet-wide ESXi host DNS/connectivity preflight - checked ONCE per distinct host,
+# before touching any VM, instead of being rediscovered one VM at a time (each discovery
+# previously cost a full creation-call + verification-call round trip, ~20-30s, before
+# landing on Unconfirmed). Invoke-VMScript's output-retrieval step needs THIS MACHINE to
+# resolve/reach the ESXi host directly - a DNS failure here will be identical for every VM
+# on that host, so there is no reason to wait until each VM's turn to find that out.
+Write-Log "Running fleet-wide ESXi host DNS preflight check..."
+$hostResolutionCache = @{}
+$vmHostMap = @{}
+foreach ($preflightVmName in $VMList) {
+    try {
+        $preflightVm = Get-VM -Name $preflightVmName -ErrorAction Stop
+        $preflightHostName = $preflightVm.VMHost.Name
+        $vmHostMap[$preflightVmName] = $preflightHostName
+        if ($preflightHostName -and -not $hostResolutionCache.ContainsKey($preflightHostName)) {
+            try {
+                [void][System.Net.Dns]::GetHostEntry($preflightHostName)
+                $hostResolutionCache[$preflightHostName] = $true
+            } catch {
+                $hostResolutionCache[$preflightHostName] = $false
+            }
+        }
+    } catch {
+        # VM lookup failures (VM not found, etc.) are handled per-VM in the main loop below -
+        # ignore them here, this pass only cares about host DNS resolution.
+    }
+}
+$unresolvableHosts = $hostResolutionCache.GetEnumerator() | Where-Object { -not $_.Value } | ForEach-Object { $_.Key }
+
+# NEW: for any host that failed real DNS, try to resolve its IP automatically from vCenter
+# BEFORE giving up on it - this is what makes the fallback scale to many hosts without
+# typing each one into $KnownHostIPMap by hand. vCenter already knows every host's
+# management IP; $KnownHostIPMap is now only a manual OVERRIDE for the rare case the
+# auto-lookup can't find a usable management adapter. This is what actually answers "can we
+# use an IP instead of the name?" - Invoke-VMScript itself can't be told to use an IP, but a
+# hosts-file entry for the exact name it expects achieves the same result without real DNS.
+$stillUnresolvableHosts = @()
+foreach ($badHost in $unresolvableHosts) {
+    if ($KnownHostIPMap.ContainsKey($badHost)) {
+        $knownIP = $KnownHostIPMap[$badHost]
+        Write-Log "PREFLIGHT: '$badHost' failed DNS - using manually configured IP override ($knownIP)." "INFO"
+    } else {
+        $lookup = Get-VMHostManagementIP -HostName $badHost
+        if (-not $lookup.Success) {
+            Write-Log "PREFLIGHT: '$badHost' failed DNS and its management IP could not be auto-resolved from vCenter: $($lookup.Error). Add an entry to `$KnownHostIPMap manually if you know the IP." "ERROR"
+            $stillUnresolvableHosts += $badHost
+            continue
+        }
+        $knownIP = $lookup.IP
+        Write-Log "PREFLIGHT: '$badHost' failed DNS - auto-resolved its management IP from vCenter ($knownIP)." "INFO"
+    }
+
+    if ($AutoAddHostsFileEntries) {
+        $addResult = Add-HostsFileEntryIfMissing -HostName $badHost -IPAddress $knownIP
+        if ($addResult.Success) {
+            if ($addResult.AlreadyPresent) {
+                Write-Log "PREFLIGHT: '$badHost' failed DNS but a hosts-file entry already exists for it - real resolution still failed, so something else is wrong (stale/incorrect entry?). Treating as unresolvable." "WARN"
+                $stillUnresolvableHosts += $badHost
+                continue
+            }
+            Write-Log "PREFLIGHT: '$badHost' - added hosts-file entry ($knownIP) automatically. Re-testing resolution..." "WARN"
+            try {
+                [void][System.Net.Dns]::GetHostEntry($badHost)
+                Write-Log "PREFLIGHT: '$badHost' now resolves via the hosts-file entry - proceeding normally for VMs on this host." "INFO"
+                $hostResolutionCache[$badHost] = $true
+            } catch {
+                Write-Log "PREFLIGHT: '$badHost' still does not resolve even after adding the hosts-file entry. $(Get-FullExceptionDetail $_)" "ERROR"
+                $stillUnresolvableHosts += $badHost
+            }
+        } else {
+            Write-Log "PREFLIGHT: could not write to the hosts file for '$badHost' (are you running as Administrator?): $($addResult.Error). Add this line manually: $knownIP`t$badHost" "ERROR"
+            $stillUnresolvableHosts += $badHost
+        }
+    } else {
+        Write-Log "PREFLIGHT: '$badHost' - AutoAddHostsFileEntries is `$false, so add this line manually to $env:SystemRoot\System32\drivers\etc\hosts and re-run: $knownIP`t$badHost" "WARN"
+        $stillUnresolvableHosts += $badHost
+    }
+}
+$unresolvableHosts = $stillUnresolvableHosts
+
+if ($unresolvableHosts.Count -gt 0) {
+    Write-Log "PREFLIGHT WARNING: this machine cannot resolve $($unresolvableHosts.Count) ESXi host(s) via DNS: $($unresolvableHosts -join ', '). Invoke-VMScript's output-retrieval step will fail for every VM on these hosts - this cannot be routed around in script logic (WinRM is intentionally not used). Those VMs will be skipped immediately below and reported UnconfirmedManualCheckRequired without wasting time attempting them. Fix DNS/connectivity for these hosts and re-run to actually confirm those VMs." "WARN"
+    foreach ($badHost in $unresolvableHosts) {
+        [void]$script:UnreachableHosts.Add($badHost)
+        $affectedVMs = ($vmHostMap.GetEnumerator() | Where-Object { $_.Value -eq $badHost } | ForEach-Object { $_.Key }) -join ', '
+        Write-Log "  - '$badHost' unreachable - affects: $affectedVMs" "WARN"
+    }
+} else {
+    Write-Log "Preflight check passed - all $($hostResolutionCache.Count) distinct ESXi host(s) backing target VMs resolve successfully from this machine."
+}
+
+$CreatedSuccess = @()
+$SkippedExists  = @()
+$SkippedPrereq  = @()
+$Unconfirmed    = @()
+$Secrets        = @()
+$PasswordLedger = @()
+
+# NEW: if $UseSamePasswordForAllVMsThisRun is enabled, generate the ONE shared password now,
+# before touching any VM, so every VM in this run gets the identical (freshly random) value.
+$sharedRunPassword = $null
+if ($UseRandomPasswordPerVM -and $UseSamePasswordForAllVMsThisRun) {
+    $sharedRunPassword = New-RandomPassword
+    Write-Log "UseSamePasswordForAllVMsThisRun is enabled - every VM in this run will share the SAME generated password. This is a real lateral-movement risk (see config comment) - confirm this is intentional for this batch." "WARN"
+}
+
+foreach ($vmName in $VMList) {
+
+    $row = [PSCustomObject]@{
+        VMName    = $vmName
+        Reason    = ""
+        Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    }
+
+    try {
+        # --- Per-VM prerequisite checks - run BEFORE any creation attempt ---
+        $vm = Get-VM -Name $vmName -ErrorAction Stop
+
+        # NEW: if this VM's ESXi host was already proven unreachable (DNS/connectivity) by an
+        # earlier VM in this run, skip the guest operation entirely - retrying would guarantee
+        # the same failure. CORRECTED: this is classified UnconfirmedManualCheckRequired, not
+        # SkippedPrerequisiteFailed - a DNS failure to the host does NOT prove an account
+        # wasn't/won't be created (Invoke-VMScript's output-retrieval step needs direct host
+        # connectivity even after a successful guest execution), so we have no basis to claim
+        # a prerequisite failure here. We simply could not check this VM at all.
+        if ($vm.VMHost.Name -and $script:UnreachableHosts.Contains($vm.VMHost.Name)) {
+            $row.Reason = "UNCONFIRMED: Skipped - ESXi host '$($vm.VMHost.Name)' was already confirmed unreachable from this machine (DNS/connectivity failure) earlier in this run, so this VM was not attempted at all. Outcome unknown. Fix DNS/connectivity to this host, then manually check/re-run for VMs on it."
+            $Unconfirmed += $row
+            Write-Log "$vmName -> UNCONFIRMED (skipped - host '$($vm.VMHost.Name)' already known unreachable this run, not attempted)" "WARN"
+            continue
+        }
+
+        if ($vm.PowerState -ne "PoweredOn") {
+            throw "PREREQ_FAIL: VM is not powered on (state: $($vm.PowerState))."
+        }
+
+        # CORRECTED: forces a refresh of Guest view data and checks GuestOperationsReady in
+        # addition to ToolsRunningStatus (see Get-GuestReadiness).
+        $readiness = Get-GuestReadiness -VM $vm
+        if (-not $readiness.ToolsRunning) {
+            throw "PREREQ_FAIL: VMware Tools not running (status: $($readiness.ToolsStatusRaw))."
+        }
+        if (-not $readiness.GuestOpsReady) {
+            throw "PREREQ_FAIL: Guest Operations channel not ready on this VM (Tools status: $($readiness.ToolsStatusRaw), GuestOperationsReady: false)."
+        }
+
+        # Determine password for this VM
+        if ($UseRandomPasswordPerVM -and $UseSamePasswordForAllVMsThisRun) {
+            $plainPwd = $sharedRunPassword
+        } elseif ($UseRandomPasswordPerVM) {
+            $plainPwd = New-RandomPassword
+        } else {
+            if (-not $FixedPassword) { throw "PREREQ_FAIL: UseRandomPasswordPerVM is `$false but no `$FixedPassword supplied." }
+            $plainPwd = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
+                [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($FixedPassword))
+        }
+
+        # WRITE-AHEAD: log the password to the ledger BEFORE attempting the guest call, so it
+        # is never lost even if the result can't be confirmed afterward. This password is
+        # reused for any later verification/CreatedSuccess record for this VM - never
+        # regenerated.
+        $PasswordLedger += [PSCustomObject]@{ VMName = $vmName; Username = $NewUserName; Password = $plainPwd; GeneratedAt = Get-Date -Format "yyyy-MM-dd HH:mm:ss" }
+
+        # Guest-side script: checks for existing account FIRST; creates only if absent.
+        # Idempotent by design - safe even in the rare case a pre-dispatch retry re-sends it.
+        $guestScript = @"
+`$ErrorActionPreference = 'Stop'
+`$user  = '$NewUserName'
+`$group = '$NewUserGroup'
+`$pwd   = '$plainPwd'
+`$fullName = '$NewUserFullName'
+`$description = '$NewUserDescription'
+`$forceChange = `$$RequirePwdChangeAtLogon
+
+`$hasLocalAccountsModule = Get-Module -ListAvailable -Name Microsoft.PowerShell.LocalAccounts -ErrorAction SilentlyContinue
+
+if (`$hasLocalAccountsModule) {
+    `$existing = Get-LocalUser -Name `$user -ErrorAction SilentlyContinue
+    if (`$existing) {
+        "SKIPPED_EXISTS"
+    } else {
+        `$secure = ConvertTo-SecureString `$pwd -AsPlainText -Force
+        New-LocalUser -Name `$user -Password `$secure -PasswordNeverExpires:`$false -AccountNeverExpires -FullName `$fullName -Description `$description | Out-Null
+        if (`$forceChange) {
+            net user `$user /logonpasswordchg:yes | Out-Null
+        }
+        Add-LocalGroupMember -Group `$group -Member `$user
+        "CREATED"
+    }
+} else {
+    `$notFound = net user `$user 2>&1 | Select-String "The user name could not be found" -Quiet
+    if (-not `$notFound) {
+        "SKIPPED_EXISTS"
+    } else {
+        net user `$user `$pwd /add /y | Out-Null
+        if (`$LASTEXITCODE -ne 0) { throw "net user /add failed with exit code `$LASTEXITCODE" }
+        # net user has no switch for Full Name / Description - set via the WinNT ADSI
+        # provider instead, since that's the only way to reach these fields without the
+        # LocalAccounts module.
+        `$adsiUser = [ADSI]"WinNT://`$env:COMPUTERNAME/`$user,user"
+        `$adsiUser.FullName = `$fullName
+        `$adsiUser.Description = `$description
+        `$adsiUser.SetInfo()
+        if (`$forceChange) { net user `$user /logonpasswordchg:yes | Out-Null }
+        net localgroup `$group `$user /add | Out-Null
+        "CREATED"
+    }
+}
+"@
+
+        # CORRECTED: single creation attempt, tracked with a stopwatch so a failure can be
+        # classified as pre-dispatch (safe to retry) vs. ambiguous (must verify, never retry).
+        # This replaces the old Invoke-GuestScriptWithRetry, which blindly retried the full
+        # creation script on ANY exception regardless of whether it might already have run.
+        $dispatchAttempt = 0
+        $creationSucceeded = $false
+        $creationOutput = $null
+        $lastError = $null
+
+        while ($dispatchAttempt -le $MaxDispatchRetries -and -not $creationSucceeded) {
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            try {
+                $execResult = Invoke-VMScript -VM $vm -ScriptText $guestScript -ScriptType PowerShell -GuestCredential $GuestCred -ErrorAction Stop
+                $sw.Stop()
+                $creationOutput = $execResult.ScriptOutput.Trim()
+                $creationSucceeded = $true
+            }
+            catch {
+                $sw.Stop()
+                $lastError = $_
+
+                # CORRECTED (again): field evidence shows a DNS/host-unreachable error on the
+                # creation call CAN happen after the guest already created the account -
+                # Invoke-VMScript's PowerShell output-retrieval step makes its own call that
+                # needs to reach the ESXi host directly, separate from - and after - the
+                # StartProgramInGuest call that actually launched the script. So this error
+                # does NOT prove the command never reached the guest; treating it as an
+                # instant PREREQ_FAIL was wrong and contradicted an observed case where the
+                # account was created despite this exact error. It is still useless to retry
+                # the creation call itself (DNS won't resolve in the next few seconds), so we
+                # skip straight to verification without wasting the dispatch retry budget -
+                # but the actual classification is decided by verification, same as any other
+                # ambiguous failure. The host is still cached so redundant Invoke-VMScript
+                # calls against it are avoided for the rest of the run (see below).
+                if (Test-IsDeterministicNetworkFailure -ErrorRecord $_) {
+                    [void]$script:UnreachableHosts.Add($vm.VMHost.Name)
+                    Write-Log "$vmName -> creation call failed in $([math]::Round($sw.Elapsed.TotalSeconds,1))s due to a DETERMINISTIC network/DNS failure reaching host '$($vm.VMHost.Name)'. This does NOT prove the guest script never ran - the output-retrieval step can fail this way even after a successful creation. Not retrying creation (would fail identically) - proceeding to verification. $(Get-FullExceptionDetail $_)" "WARN"
+                    break
+                }
+
+                $isPreDispatch = Test-IsPreDispatchFailure -ErrorRecord $_ -ElapsedSeconds $sw.Elapsed.TotalSeconds -ThresholdSeconds $DispatchFailureElapsedThresholdSeconds
+
+                if ($isPreDispatch -and $dispatchAttempt -lt $MaxDispatchRetries) {
+                    $dispatchAttempt++
+                    Write-Log "$vmName -> creation call failed in $([math]::Round($sw.Elapsed.TotalSeconds,1))s, classified PRE-DISPATCH (safe to retry). Attempt $dispatchAttempt/$MaxDispatchRetries in ${DispatchRetryDelaySeconds}s. $(Get-FullExceptionDetail $_)" "WARN"
+                    Start-Sleep -Seconds $DispatchRetryDelaySeconds
+                } else {
+                    # Either not provably pre-dispatch, or retry budget exhausted - stop
+                    # retrying the CREATION script and fall through to verification instead.
+                    Write-Log "$vmName -> creation call failed in $([math]::Round($sw.Elapsed.TotalSeconds,1))s, classified AMBIGUOUS (may have executed) - will NOT retry creation, verifying guest state instead. $(Get-FullExceptionDetail $_)" "WARN"
+                    break
+                }
+            }
+        }
+
+        if ($creationSucceeded) {
+            if ($creationOutput -match "^CREATED") {
+                $row.Reason = "Account created and added to $NewUserGroup"
+                $CreatedSuccess += $row
+                $Secrets += [PSCustomObject]@{ VMName = $vmName; Username = $NewUserName; Password = $plainPwd }
+                Write-Log "$vmName -> CREATED"
+            }
+            elseif ($creationOutput -match "^SKIPPED_EXISTS") {
+                $row.Reason = "Account already present on this VM - left untouched"
+                $SkippedExists += $row
+                Write-Log "$vmName -> SKIPPED (already exists)"
+            }
+            else {
+                # CORRECTED: unexpected output no longer auto-classified as a prerequisite
+                # failure. The script call itself succeeded, so we verify actual guest state
+                # rather than assuming the worst from an unparsed string.
+                Write-Log "$vmName -> unexpected script output '$creationOutput' - verifying actual guest state before classifying." "WARN"
+                Start-Sleep -Seconds $VerificationInitialDelaySeconds
+                $state = Confirm-GuestAccountFinalState -VM $vm -UserName $NewUserName -GroupName $NewUserGroup -Credential $GuestCred -MaxRetries $VerificationMaxRetries -DelaySeconds $VerificationRetryDelaySeconds
+
+                if ($state.Status -eq "Confirmed" -and $state.Enabled -and $state.InGroup) {
+                    $row.Reason = "Account created (confirmed via verification after unexpected script output '$creationOutput')"
+                    $CreatedSuccess += $row
+                    $Secrets += [PSCustomObject]@{ VMName = $vmName; Username = $NewUserName; Password = $plainPwd }
+                    Write-Log "$vmName -> CREATED (verified after unexpected output)"
+                }
+                elseif ($state.Status -eq "NotFound") {
+                    $row.Reason = "PREREQ_FAIL: Unexpected script output '$creationOutput', verification confirms account does NOT exist."
+                    $SkippedPrereq += $row
+                    Write-Log "$vmName -> SKIPPED (verified NOT created)" "ERROR"
+                }
+                elseif ($state.Status -eq "HostUnreachable") {
+                    # NEW: register the host so remaining VMs on it are skipped immediately.
+                    [void]$script:UnreachableHosts.Add($state.UnreachableHost)
+                    $row.Reason = "UNCONFIRMED: Unexpected script output '$creationOutput', and verification could not run - ESXi host '$($state.UnreachableHost)' is unreachable from this machine (DNS/connectivity failure), not a guest-state issue. Fix connectivity, then re-verify manually."
+                    $Unconfirmed += $row
+                    Write-Log "$vmName -> UNCONFIRMED (host unreachable - DNS/connectivity issue, not guest state)" "ERROR"
+                }
+                else {
+                    $row.Reason = "UNCONFIRMED: Unexpected script output '$creationOutput', and verification could not conclusively confirm final state (Status=$($state.Status), Enabled=$($state.Enabled), InGroup=$($state.InGroup)). Manually run: Get-LocalUser -Name '$NewUserName' on this VM."
+                    $Unconfirmed += $row
+                    Write-Log "$vmName -> UNCONFIRMED (unexpected output, verification inconclusive)" "WARN"
+                }
+            }
+        }
+        else {
+            # CORRECTED: this is the exact path that previously misfired. We no longer reuse
+            # the just-failed channel for a single, unretried verification call 30s later.
+            # We wait briefly, then verify with its OWN independent retry budget.
+            Write-Log "$vmName -> proceeding to verification after ambiguous creation failure ($(if($dispatchAttempt -gt 0){"after $dispatchAttempt pre-dispatch retr$(if($dispatchAttempt -eq 1){'y'}else{'ies'})"}else{'no retries attempted - not provably pre-dispatch'}))." "INFO"
+            Start-Sleep -Seconds $VerificationInitialDelaySeconds
+            $state = Confirm-GuestAccountFinalState -VM $vm -UserName $NewUserName -GroupName $NewUserGroup -Credential $GuestCred -MaxRetries $VerificationMaxRetries -DelaySeconds $VerificationRetryDelaySeconds
+
+            if ($state.Status -eq "Confirmed" -and $state.Enabled -and $state.InGroup) {
+                # CORRECTED: this is precisely the case that was previously lost - account
+                # created successfully, result channel failed, verification now confirms it.
+                $row.Reason = "Account created (confirmed via verification after a communication error on the creation call - result channel was lost, guest state is fine)"
+                $CreatedSuccess += $row
+                $Secrets += [PSCustomObject]@{ VMName = $vmName; Username = $NewUserName; Password = $plainPwd }
+                Write-Log "$vmName -> CREATED (verified after ambiguous communication failure)"
+            }
+            elseif ($state.Status -eq "Confirmed" -and (-not $state.Enabled -or -not $state.InGroup)) {
+                # Account exists but isn't fully configured - do not claim success, and do not
+                # touch the existing account (requirement: never modify an existing account).
+                $row.Reason = "UNCONFIRMED: Account exists but is not fully configured (Enabled=$($state.Enabled), InGroup=$($state.InGroup)) after a communication error on creation. Manual review required - this script will not modify an existing account."
+                $Unconfirmed += $row
+                Write-Log "$vmName -> UNCONFIRMED (partial state: Enabled=$($state.Enabled) InGroup=$($state.InGroup))" "WARN"
+            }
+            elseif ($state.Status -eq "NotFound") {
+                # CORRECTED: only reached after a verified-negative read, never merely because
+                # the channel failed - satisfies "do not classify as prereq fail merely
+                # because the result channel failed after the account was created."
+                $row.Reason = "PREREQ_FAIL: Invoke-VMScript communication error on creation; verification positively confirmed the account does NOT exist. $(Get-FullExceptionDetail $lastError)"
+                $SkippedPrereq += $row
+                Write-Log "$vmName -> SKIPPED (verified NOT created)" "ERROR"
+            }
+            elseif ($state.Status -eq "HostUnreachable") {
+                # NEW: distinct from a generic "channel unreachable" outcome - we know exactly
+                # why (DNS/connectivity to this specific host) and that further retries here
+                # would not help either. Register the host so remaining VMs on it are skipped.
+                [void]$script:UnreachableHosts.Add($state.UnreachableHost)
+                $row.Reason = "UNCONFIRMED: Could not verify - ESXi host '$($state.UnreachableHost)' is unreachable from this machine (DNS/name-resolution failure), not a guest-state issue. The account may well have been created successfully (this exact error can occur on the output-retrieval step after a successful creation) - outcome genuinely unknown until connectivity to this host is restored. Fix DNS/connectivity, then manually check/re-verify (do not blindly re-run creation)."
+                $Unconfirmed += $row
+                Write-Log "$vmName -> UNCONFIRMED (host unreachable - DNS/connectivity issue, not guest state)" "ERROR"
+            }
+            else {
+                # Verification itself could not reach the guest even after its own retries -
+                # genuinely unknown outcome. Never reported as a failure.
+                $row.Reason = "UNCONFIRMED: Guest communication channel unreachable for both the creation call and verification (after $VerificationMaxRetries verification retries). Outcome unknown - the account may already exist. Manually run: Get-LocalUser -Name '$NewUserName' on this VM before assuming it needs to be re-run."
+                $Unconfirmed += $row
+                Write-Log "$vmName -> UNCONFIRMED (verification channel also unreachable after retries - manual check required, NOT reported as failed)" "WARN"
+            }
+        }
+    }
+    catch {
+        $row.Reason = $_.Exception.Message
+        $SkippedPrereq += $row
+        Write-Log "$vmName -> SKIPPED (prerequisite/execution failure): $(Get-FullExceptionDetail $_)" "ERROR"
+    }
+}
+
+# --- Reporting: four result CSVs, one per bucket - only written if that bucket has data - plus password ledger and confirmed secrets ---
+Export-ReportCsv -Data $CreatedSuccess -Path $CreatedSuccessPath -Columns @("VMName","Reason","Timestamp")
+Export-ReportCsv -Data $SkippedExists  -Path $SkippedExistsPath  -Columns @("VMName","Reason","Timestamp")
+Export-ReportCsv -Data $SkippedPrereq  -Path $SkippedPrereqPath  -Columns @("VMName","Reason","Timestamp")
+Export-ReportCsv -Data $Unconfirmed    -Path $UnconfirmedPath    -Columns @("VMName","Reason","Timestamp")
+
+if ($PasswordLedger.Count -gt 0) {
+    $PasswordLedger | Export-Csv -Path $PasswordLedgerPath -NoTypeInformation
+    Write-Log "Password ledger (every generated password, incl. unconfirmed attempts) written to $PasswordLedgerPath - SECURE OR DELETE AFTER REVIEW." "WARN"
+}
+if ($Secrets.Count -gt 0) {
+    $Secrets | Export-Csv -Path $SecretsPath -NoTypeInformation
+    Write-Log "Confirmed per-VM passwords written to $SecretsPath - SECURE OR DELETE THIS FILE AFTER HANDOFF." "WARN"
+}
+
+Write-Log "=== SUMMARY: $($CreatedSuccess.Count) created, $($SkippedExists.Count) skipped (already existed), $($SkippedPrereq.Count) skipped (genuine prerequisite failure), $($Unconfirmed.Count) UNCONFIRMED (manual check required), out of $($VMList.Count) total ==="
+Write-Log "Files: $CreatedSuccessPath | $SkippedExistsPath | $SkippedPrereqPath | $UnconfirmedPath | Log: $LogPath"
+
+Write-Host "`n--- CREATED SUCCESS ($($CreatedSuccess.Count)) ---"
+$CreatedSuccess | Format-Table -AutoSize
+Write-Host "`n--- SKIPPED: ALREADY EXISTS ($($SkippedExists.Count)) ---"
+$SkippedExists | Format-Table -AutoSize
+Write-Host "`n--- SKIPPED: GENUINE PREREQUISITE FAILURE ($($SkippedPrereq.Count)) ---"
+$SkippedPrereq | Format-Table -AutoSize
+Write-Host "`n--- UNCONFIRMED - MANUAL CHECK REQUIRED ($($Unconfirmed.Count)) ---"
+$Unconfirmed | Format-Table -AutoSize
