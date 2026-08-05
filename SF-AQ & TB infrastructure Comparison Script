@@ -1,4 +1,3 @@
-```powershell
 #Requires -Version 5.1
 <#
 .SYNOPSIS
@@ -33,12 +32,26 @@
     Root folder for reports/logs. Defaults to .\SFTB-Comparison-<timestamp>.
 
 .PARAMETER SampleSize
-    Number of VMs randomly sampled per OS family per site for the software/agent
-    deep-dive (spec default: 5).
+    Unused unless a target VM list below is omitted for a given OS/site; kept
+    for reference only. Software/agent inventory now uses fixed VM lists.
 
 .PARAMETER SkipSoftwareInventory
     Skips the guest-level software/agent comparison (infra/cluster/config/OS
     inventory still run). Useful for a fast pass or when Tools coverage is low.
+
+.PARAMETER SFWindowsVMs
+    Explicit list of SF Windows VM names to include in the software/agent
+    inventory (e.g. -SFWindowsVMs SF-APP01,SF-APP02,...). Replaces random
+    sampling so you can pick VMs whose guest credentials you know work.
+
+.PARAMETER SFLinuxVMs
+    Explicit list of SF Linux VM names for the software/agent inventory.
+
+.PARAMETER TBWindowsVMs
+    Explicit list of TB Windows VM names for the software/agent inventory.
+
+.PARAMETER TBLinuxVMs
+    Explicit list of TB Linux VM names for the software/agent inventory.
 
 .EXAMPLE
     $winCred = Get-Credential -Message "Windows guest admin"
@@ -70,7 +83,19 @@ param(
     [int]$SampleSize = 5,
 
     [Parameter(Mandatory = $false)]
-    [switch]$SkipSoftwareInventory
+    [switch]$SkipSoftwareInventory,
+
+    [Parameter(Mandatory = $false)]
+    [string[]]$SFWindowsVMs = @(),
+
+    [Parameter(Mandatory = $false)]
+    [string[]]$SFLinuxVMs = @(),
+
+    [Parameter(Mandatory = $false)]
+    [string[]]$TBWindowsVMs = @(),
+
+    [Parameter(Mandatory = $false)]
+    [string[]]$TBLinuxVMs = @()
 )
 
 #region ------------------------------- INITIALIZATION -------------------------------
@@ -668,21 +693,32 @@ echo "$PKGS"
 }
 
 function Get-SoftwareInventoryForSite {
-    param($Server, [string]$Site, $VMConfigInventory)
+    param($Server, [string]$Site, $VMConfigInventory, [string[]]$TargetWinNames, [string[]]$TargetLinNames)
 
     if (-not $WindowsGuestCredential -and -not $LinuxGuestCredential) {
         Write-Log -Level WARN -Message "[$Site] No guest credentials supplied — skipping software/agent inventory."
         return @()
     }
 
+    if (-not $TargetWinNames -and -not $TargetLinNames) {
+        Write-Log -Level WARN -Message "[$Site] No target VM list supplied (-SFWindowsVMs/-SFLinuxVMs or -TBWindowsVMs/-TBLinuxVMs) — skipping software/agent inventory for this site."
+        return @()
+    }
+
     $eligible = $VMConfigInventory | Where-Object { $_.PowerState -eq 'PoweredOn' -and $_.ToolsStatus -in @('toolsOk', 'toolsOld') }
-    $winVMs = $eligible | Where-Object { $_.GuestOSFullName -match '(?i)windows' }
-    $linVMs = $eligible | Where-Object { $_.GuestOSFullName -match '(?i)linux|ubuntu|centos|rhel|debian|suse' }
 
-    $winSample = Get-RandomSample -Source $winVMs -Count $SampleSize
-    $linSample = Get-RandomSample -Source $linVMs -Count $SampleSize
+    $winSample = $eligible | Where-Object { $_.VMName -in $TargetWinNames }
+    $linSample = $eligible | Where-Object { $_.VMName -in $TargetLinNames }
 
-    Write-Log -Level INFO -Message "[$Site] Sampled $($winSample.Count) Windows / $($linSample.Count) Linux VMs for software inventory."
+    # Flag any requested VM that couldn't be used (not found, powered off, or Tools not ready)
+    foreach ($n in $TargetWinNames) {
+        if ($n -notin $winSample.VMName) { Write-ErrorRecord -Stage 'Software Target' -ObjectName $n -ErrorMessage "Not found, powered off, or VMware Tools not ready — skipped." }
+    }
+    foreach ($n in $TargetLinNames) {
+        if ($n -notin $linSample.VMName) { Write-ErrorRecord -Stage 'Software Target' -ObjectName $n -ErrorMessage "Not found, powered off, or VMware Tools not ready — skipped." }
+    }
+
+    Write-Log -Level INFO -Message "[$Site] Using fixed target list: $($winSample.Count) Windows / $($linSample.Count) Linux VMs for software inventory."
 
     $results = [System.Collections.Generic.List[PSObject]]::new()
 
@@ -764,8 +800,8 @@ try {
     $linuxSoftwareComparison = @()
     $agentsComparison = @()
     if (-not $SkipSoftwareInventory) {
-        $sfSoftware = Get-SoftwareInventoryForSite -Server $SFvCenter -Site 'SF' -VMConfigInventory $sfVMConfig
-        $tbSoftware = Get-SoftwareInventoryForSite -Server $TBvCenter -Site 'TB' -VMConfigInventory $tbVMConfig
+        $sfSoftware = Get-SoftwareInventoryForSite -Server $SFvCenter -Site 'SF' -VMConfigInventory $sfVMConfig -TargetWinNames $SFWindowsVMs -TargetLinNames $SFLinuxVMs
+        $tbSoftware = Get-SoftwareInventoryForSite -Server $TBvCenter -Site 'TB' -VMConfigInventory $tbVMConfig -TargetWinNames $TBWindowsVMs -TargetLinNames $TBLinuxVMs
 
         $sfWin = $sfSoftware | Where-Object { $_.OSFamily -eq 'Windows' }
         $tbWin = $tbSoftware | Where-Object { $_.OSFamily -eq 'Windows' }
@@ -912,4 +948,3 @@ finally {
 }
 
 #endregion
-```
