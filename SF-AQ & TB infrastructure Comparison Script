@@ -1,0 +1,915 @@
+```powershell
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+    Comprehensive comparison of two VMware vSphere environments (SF vs TB) across
+    infrastructure, cluster, VM configuration, OS, and installed software/agents.
+
+.DESCRIPTION
+    Connects to two already-connected vCenter Servers (via PowerCLI), collects and
+    compares infrastructure, cluster, VM configuration, and guest OS/software data
+    using VMware Tools (Invoke-VMScript) only — no WinRM required. Produces an
+    Excel workbook (multi-sheet), CSV exports per report, a detailed log file, and
+    an executive summary.
+
+.NOTES
+    Author   : Generated for Samoal (Al Qiddiya - Asset IT Operations)
+    Requires : VMware PowerCLI (already connected to both vCenters before running)
+               ImportExcel module (auto-detected; CSV-only fallback if unavailable)
+
+.PARAMETER SFvCenterServer
+    FQDN/name of the SF vCenter Server exactly as shown in $global:DefaultVIServers.
+
+.PARAMETER TBvCenterServer
+    FQDN/name of the TB vCenter Server exactly as shown in $global:DefaultVIServers.
+
+.PARAMETER WindowsGuestCredential
+    PSCredential used for Invoke-VMScript against Windows guests.
+
+.PARAMETER LinuxGuestCredential
+    PSCredential used for Invoke-VMScript against Linux guests.
+
+.PARAMETER OutputPath
+    Root folder for reports/logs. Defaults to .\SFTB-Comparison-<timestamp>.
+
+.PARAMETER SampleSize
+    Number of VMs randomly sampled per OS family per site for the software/agent
+    deep-dive (spec default: 5).
+
+.PARAMETER SkipSoftwareInventory
+    Skips the guest-level software/agent comparison (infra/cluster/config/OS
+    inventory still run). Useful for a fast pass or when Tools coverage is low.
+
+.EXAMPLE
+    $winCred = Get-Credential -Message "Windows guest admin"
+    $linCred = Get-Credential -Message "Linux guest admin"
+    .\Compare-SFTBEnvironments.ps1 -SFvCenterServer sf-vc01.aqcorp.local `
+        -TBvCenterServer tb-vc01.aqcorp.local `
+        -WindowsGuestCredential $winCred -LinuxGuestCredential $linCred
+#>
+
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$SFvCenterServer,
+
+    [Parameter(Mandatory = $true)]
+    [string]$TBvCenterServer,
+
+    [Parameter(Mandatory = $false)]
+    [System.Management.Automation.PSCredential]$WindowsGuestCredential,
+
+    [Parameter(Mandatory = $false)]
+    [System.Management.Automation.PSCredential]$LinuxGuestCredential,
+
+    [Parameter(Mandatory = $false)]
+    [string]$OutputPath = (Join-Path -Path (Get-Location) -ChildPath "SFTB-Comparison-$(Get-Date -Format 'yyyyMMdd-HHmmss')"),
+
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(1, 50)]
+    [int]$SampleSize = 5,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$SkipSoftwareInventory
+)
+
+#region ------------------------------- INITIALIZATION -------------------------------
+
+$ErrorActionPreference = 'Stop'
+$script:StartTime = Get-Date
+$script:ErrorLog = [System.Collections.Generic.List[PSObject]]::new()
+$script:ExecutionLog = [System.Collections.Generic.List[PSObject]]::new()
+
+# Folder layout
+$null = New-Item -Path $OutputPath -ItemType Directory -Force
+$CsvPath = Join-Path $OutputPath 'CSV'
+$LogPath = Join-Path $OutputPath 'Logs'
+$null = New-Item -Path $CsvPath -ItemType Directory -Force
+$null = New-Item -Path $LogPath -ItemType Directory -Force
+$LogFile = Join-Path $LogPath "SFTB-Comparison-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
+$ExcelFile = Join-Path $OutputPath "SFTB-Comparison-$(Get-Date -Format 'yyyyMMdd-HHmmss').xlsx"
+
+function Write-Log {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Message,
+        [ValidateSet('INFO', 'WARN', 'ERROR', 'SUCCESS')][string]$Level = 'INFO'
+    )
+    $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $line = "[$ts] [$Level] $Message"
+    $line | Out-File -FilePath $LogFile -Append -Encoding utf8
+
+    switch ($Level) {
+        'WARN'    { Write-Warning $Message }
+        'ERROR'   { Write-Host $line -ForegroundColor Red }
+        'SUCCESS' { Write-Host $line -ForegroundColor Green }
+        default   { Write-Host $line -ForegroundColor Gray }
+    }
+
+    $script:ExecutionLog.Add([PSCustomObject]@{ Timestamp = $ts; Level = $Level; Message = $Message })
+}
+
+function Write-ErrorRecord {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Stage,
+        [Parameter(Mandatory = $true)][string]$ObjectName,
+        [Parameter(Mandatory = $true)][string]$ErrorMessage
+    )
+    $script:ErrorLog.Add([PSCustomObject]@{
+        Timestamp    = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        Stage        = $Stage
+        Object       = $ObjectName
+        ErrorMessage = $ErrorMessage
+    })
+    Write-Log -Level ERROR -Message "[$Stage] $ObjectName -> $ErrorMessage"
+}
+
+Write-Log -Level INFO -Message "===== SF vs TB Environment Comparison started ====="
+Write-Log -Level INFO -Message "Output path: $OutputPath"
+
+# Verify PowerCLI + both vCenter connections already exist
+if (-not (Get-Module -ListAvailable -Name VMware.PowerCLI -ErrorAction SilentlyContinue) -and
+    -not (Get-Module -ListAvailable -Name VMware.VimAutomation.Core -ErrorAction SilentlyContinue)) {
+    Write-Log -Level ERROR -Message "VMware PowerCLI module not found. Install-Module VMware.PowerCLI first."
+    throw "PowerCLI not available."
+}
+
+$SFvCenter = $global:DefaultVIServers | Where-Object { $_.Name -eq $SFvCenterServer -and $_.IsConnected }
+$TBvCenter = $global:DefaultVIServers | Where-Object { $_.Name -eq $TBvCenterServer -and $_.IsConnected }
+
+if (-not $SFvCenter) { throw "Not connected to SF vCenter '$SFvCenterServer'. Connect-VIServer first." }
+if (-not $TBvCenter) { throw "Not connected to TB vCenter '$TBvCenterServer'. Connect-VIServer first." }
+
+Write-Log -Level SUCCESS -Message "Confirmed connections: SF=$($SFvCenter.Name) TB=$($TBvCenter.Name)"
+
+# ImportExcel availability (soft dependency)
+$UseExcel = $true
+if (-not (Get-Module -ListAvailable -Name ImportExcel)) {
+    Write-Log -Level WARN -Message "ImportExcel module not found. Will attempt to install from PSGallery; falling back to CSV-only if that fails."
+    try {
+        Install-Module -Name ImportExcel -Scope CurrentUser -Force -ErrorAction Stop
+        Write-Log -Level SUCCESS -Message "ImportExcel installed."
+    }
+    catch {
+        Write-Log -Level WARN -Message "Could not install ImportExcel ($($_.Exception.Message)). Continuing with CSV exports only."
+        $UseExcel = $false
+    }
+}
+if ($UseExcel) { Import-Module ImportExcel -ErrorAction SilentlyContinue }
+
+#endregion
+
+#region ------------------------------- HELPER FUNCTIONS -------------------------------
+
+function Get-SiteLabel {
+    param($Server)
+    if ($Server.Name -eq $SFvCenterServer) { return 'SF' } else { return 'TB' }
+}
+
+function Test-ToolsReady {
+    <# Returns $true only if VMware Tools is installed AND running #>
+    param($VM)
+    try {
+        return ($VM.ExtensionData.Guest.ToolsStatus -in @('toolsOk', 'toolsOld') -and
+                $VM.ExtensionData.Guest.ToolsRunningStatus -eq 'guestToolsRunning')
+    }
+    catch { return $false }
+}
+
+function Invoke-GuestScriptSafe {
+    <# Wraps Invoke-VMScript with error handling; returns $null on failure instead of throwing #>
+    param(
+        [Parameter(Mandatory)]$VM,
+        [Parameter(Mandatory)][string]$ScriptText,
+        [Parameter(Mandatory)][ValidateSet('Bat', 'Powershell', 'Bash')][string]$ScriptType,
+        [Parameter(Mandatory)][System.Management.Automation.PSCredential]$Credential
+    )
+    try {
+        $result = Invoke-VMScript -VM $VM -ScriptText $ScriptText -ScriptType $ScriptType `
+                    -GuestCredential $Credential -ErrorAction Stop
+        return $result.ScriptOutput
+    }
+    catch {
+        Write-ErrorRecord -Stage 'Invoke-VMScript' -ObjectName $VM.Name -ErrorMessage $_.Exception.Message
+        return $null
+    }
+}
+
+function Get-RandomSample {
+    param([array]$Source, [int]$Count)
+    if (-not $Source -or $Source.Count -eq 0) { return @() }
+    $n = [Math]::Min($Count, $Source.Count)
+    return $Source | Get-Random -Count $n
+}
+
+#endregion
+
+#region ------------------------------- 1. INFRASTRUCTURE LEVEL -------------------------------
+
+function Get-InfrastructureSnapshot {
+    param($Server, [string]$Site)
+
+    Write-Log -Level INFO -Message "[$Site] Collecting infrastructure snapshot..."
+    Write-Progress -Activity "Infrastructure Collection" -Status $Site -PercentComplete 10
+
+    try {
+        $svcContent = Get-View ServiceInstance -Server $Server
+        $aboutInfo  = $svcContent.Content.About
+
+        $hosts       = Get-VMHost -Server $Server
+        $datacenters = Get-Datacenter -Server $Server
+        $clusters    = Get-Cluster -Server $Server
+        $respools    = Get-ResourcePool -Server $Server | Where-Object { $_.Name -ne 'Resources' }
+        $datastores  = Get-Datastore -Server $Server
+        $vdswitches  = Get-VDSwitch -Server $Server -ErrorAction SilentlyContinue
+        $stdswitches = Get-VirtualSwitch -Server $Server -Standard -ErrorAction SilentlyContinue
+        $portgroups  = @(Get-VDPortgroup -Server $Server -ErrorAction SilentlyContinue) + @(Get-VirtualPortGroup -Server $Server -Standard -ErrorAction SilentlyContinue)
+        $templates   = Get-Template -Server $Server -ErrorAction SilentlyContinue
+        $allVMs      = Get-VM -Server $Server
+
+        $poweredOn  = @($allVMs | Where-Object { $_.PowerState -eq 'PoweredOn' })
+        $poweredOff = @($allVMs | Where-Object { $_.PowerState -eq 'PoweredOff' })
+
+        $snapshots = Get-VM -Server $Server | Get-Snapshot -ErrorAction SilentlyContinue
+
+        $toolsCurrent = @($allVMs | Where-Object { $_.ExtensionData.Guest.ToolsStatus -eq 'toolsOk' })
+        $toolsOld     = @($allVMs | Where-Object { $_.ExtensionData.Guest.ToolsStatus -eq 'toolsOld' })
+        $toolsNotRun  = @($allVMs | Where-Object { $_.ExtensionData.Guest.ToolsStatus -eq 'toolsNotRunning' })
+        $toolsNotInst = @($allVMs | Where-Object { $_.ExtensionData.Guest.ToolsStatus -eq 'toolsNotInstalled' })
+
+        [PSCustomObject]@{
+            Site                    = $Site
+            vCenterName             = $Server.Name
+            vCenterVersion          = $aboutInfo.Version
+            vCenterBuild            = $aboutInfo.Build
+            ESXiHostCount           = $hosts.Count
+            ESXiVersions            = ($hosts | Select-Object -ExpandProperty Version -Unique) -join ', '
+            ESXiBuilds              = ($hosts | Select-Object -ExpandProperty Build -Unique) -join ', '
+            DatacenterCount         = $datacenters.Count
+            ClusterCount            = $clusters.Count
+            ResourcePoolCount       = $respools.Count
+            DatastoreCount          = $datastores.Count
+            DatastoreTotalCapacityGB= [math]::Round(($datastores | Measure-Object -Property CapacityGB -Sum).Sum, 2)
+            DatastoreFreeSpaceGB    = [math]::Round(($datastores | Measure-Object -Property FreeSpaceGB -Sum).Sum, 2)
+            DistributedSwitchCount  = ($vdswitches | Measure-Object).Count
+            StandardSwitchCount     = ($stdswitches | Measure-Object).Count
+            PortGroupCount          = ($portgroups | Measure-Object).Count
+            TemplateCount           = ($templates | Measure-Object).Count
+            TotalVMCount            = $allVMs.Count
+            PoweredOnCount          = $poweredOn.Count
+            PoweredOffCount         = $poweredOff.Count
+            SnapshotCount           = ($snapshots | Measure-Object).Count
+            ToolsOK                 = $toolsCurrent.Count
+            ToolsOutOfDate          = $toolsOld.Count
+            ToolsNotRunning         = $toolsNotRun.Count
+            ToolsNotInstalled       = $toolsNotInst.Count
+        }
+    }
+    catch {
+        Write-ErrorRecord -Stage 'Infrastructure' -ObjectName $Site -ErrorMessage $_.Exception.Message
+        return $null
+    }
+}
+
+function Compare-Infrastructure {
+    param($SFData, $TBData)
+
+    $props = $SFData.PSObject.Properties.Name | Where-Object { $_ -notin @('Site', 'vCenterName') }
+    foreach ($p in $props) {
+        [PSCustomObject]@{
+            Metric      = $p
+            SF          = $SFData.$p
+            TB          = $TBData.$p
+            Difference  = if ($SFData.$p -is [ValueType] -and $TBData.$p -is [ValueType]) { $SFData.$p - $TBData.$p } else { 'N/A' }
+            Mismatch    = ($SFData.$p -ne $TBData.$p)
+        }
+    }
+}
+
+#endregion
+
+#region ------------------------------- 2. CLUSTER LEVEL -------------------------------
+
+function Get-ClusterSnapshot {
+    param($Server, [string]$Site)
+
+    Write-Log -Level INFO -Message "[$Site] Collecting cluster configuration..."
+    $clusters = Get-Cluster -Server $Server
+    $results = foreach ($cl in $clusters) {
+        try {
+            $clView = $cl | Get-View
+            $hostsInCluster = $cl | Get-VMHost
+            $vmsInCluster = $cl | Get-VM
+
+            $cpuUsageSum = ($hostsInCluster | Measure-Object -Property CpuUsageMhz -Sum).Sum
+            $cpuTotalSum = ($hostsInCluster | Measure-Object -Property CpuTotalMhz -Sum).Sum
+            $memUsageSum = ($hostsInCluster | Measure-Object -Property MemoryUsageGB -Sum).Sum
+            $memTotalSum = ($hostsInCluster | Measure-Object -Property MemoryTotalGB -Sum).Sum
+
+            $vsanEnabled = $false
+            try { $vsanEnabled = [bool]$clView.ConfigurationEx.VsanConfigInfo.Enabled } catch {}
+
+            [PSCustomObject]@{
+                Site               = $Site
+                ClusterName        = $cl.Name
+                HAEnabled          = $cl.HAEnabled
+                HAAdmissionControl = $cl.HAAdmissionControlEnabled
+                DRSEnabled         = $cl.DrsEnabled
+                DRSAutomationLevel = $cl.DrsAutomationLevel
+                EVCMode            = $cl.EVCMode
+                vSANEnabled        = $vsanEnabled
+                HostCount          = $hostsInCluster.Count
+                VMCount            = $vmsInCluster.Count
+                CpuUsagePct        = if ($cpuTotalSum -gt 0) { [math]::Round(($cpuUsageSum / $cpuTotalSum) * 100, 1) } else { 0 }
+                MemUsagePct        = if ($memTotalSum -gt 0) { [math]::Round(($memUsageSum / $memTotalSum) * 100, 1) } else { 0 }
+            }
+        }
+        catch {
+            Write-ErrorRecord -Stage 'Cluster' -ObjectName $cl.Name -ErrorMessage $_.Exception.Message
+        }
+    }
+    return $results
+}
+
+function Compare-Clusters {
+    param($SFClusters, $TBClusters)
+
+    # Match by normalized name (strip site prefix/suffix like "SF-", "-TB")
+    $sfNorm = $SFClusters | ForEach-Object { $_ | Add-Member -NotePropertyName NormName -NotePropertyValue ($_.ClusterName -replace '(?i)^(sf|tb)[-_]|[-_](sf|tb)$', '') -PassThru -Force }
+    $tbNorm = $TBClusters | ForEach-Object { $_ | Add-Member -NotePropertyName NormName -NotePropertyValue ($_.ClusterName -replace '(?i)^(sf|tb)[-_]|[-_](sf|tb)$', '') -PassThru -Force }
+
+    $allNames = ($sfNorm.NormName + $tbNorm.NormName) | Sort-Object -Unique
+    foreach ($name in $allNames) {
+        $sfC = $sfNorm | Where-Object { $_.NormName -eq $name } | Select-Object -First 1
+        $tbC = $tbNorm | Where-Object { $_.NormName -eq $name } | Select-Object -First 1
+
+        [PSCustomObject]@{
+            MatchedClusterKey = $name
+            SF_ClusterName    = $sfC.ClusterName
+            TB_ClusterName    = $tbC.ClusterName
+            SF_HA             = $sfC.HAEnabled
+            TB_HA             = $tbC.HAEnabled
+            HA_Mismatch       = ($sfC.HAEnabled -ne $tbC.HAEnabled)
+            SF_DRS            = $sfC.DRSEnabled
+            TB_DRS            = $tbC.DRSEnabled
+            SF_DRSLevel       = $sfC.DRSAutomationLevel
+            TB_DRSLevel       = $tbC.DRSAutomationLevel
+            DRS_Mismatch      = ($sfC.DRSAutomationLevel -ne $tbC.DRSAutomationLevel)
+            SF_EVC            = $sfC.EVCMode
+            TB_EVC            = $tbC.EVCMode
+            EVC_Mismatch      = ($sfC.EVCMode -ne $tbC.EVCMode)
+            SF_vSAN           = $sfC.vSANEnabled
+            TB_vSAN           = $tbC.vSANEnabled
+            SF_Hosts          = $sfC.HostCount
+            TB_Hosts          = $tbC.HostCount
+            SF_CpuUsagePct    = $sfC.CpuUsagePct
+            TB_CpuUsagePct    = $tbC.CpuUsagePct
+            SF_MemUsagePct    = $sfC.MemUsagePct
+            TB_MemUsagePct    = $tbC.MemUsagePct
+            PresentInBoth     = ($null -ne $sfC -and $null -ne $tbC)
+        }
+    }
+}
+
+#endregion
+
+#region ------------------------------- 3. VM CONFIGURATION LEVEL -------------------------------
+
+function Get-VMConfigInventory {
+    param($Server, [string]$Site)
+
+    Write-Log -Level INFO -Message "[$Site] Collecting VM configuration inventory..."
+    $vms = Get-VM -Server $Server
+    $total = $vms.Count
+    $i = 0
+    $results = foreach ($vm in $vms) {
+        $i++
+        if ($i % 25 -eq 0) {
+            Write-Progress -Activity "VM Config Inventory ($Site)" -Status "$i / $total" -PercentComplete (($i / $total) * 100)
+        }
+        try {
+            $disks = Get-HardDisk -VM $vm -ErrorAction SilentlyContinue
+            $nics  = Get-NetworkAdapter -VM $vm -ErrorAction SilentlyContinue
+            $scsi  = Get-ScsiController -VM $vm -ErrorAction SilentlyContinue
+            $tags  = try { (Get-TagAssignment -Entity $vm -ErrorAction SilentlyContinue).Tag.Name -join ';' } catch { '' }
+            $custAttrs = try { ($vm | Get-Annotation -ErrorAction SilentlyContinue | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ';' } catch { '' }
+
+            [PSCustomObject]@{
+                Site              = $Site
+                VMName            = $vm.Name
+                PowerState        = $vm.PowerState
+                HardwareVersion   = $vm.HardwareVersion -as [string]
+                GuestOSFullName   = $vm.ExtensionData.Guest.GuestFullName
+                GuestOSId         = $vm.ExtensionData.Config.GuestId
+                NumCpu            = $vm.NumCpu
+                MemoryGB          = $vm.MemoryGB
+                DiskCount         = ($disks | Measure-Object).Count
+                TotalDiskGB       = [math]::Round(($disks | Measure-Object -Property CapacityGB -Sum).Sum, 2)
+                ScsiControllers   = (($scsi | Select-Object -ExpandProperty Type) -join ';')
+                NetworkAdapters   = (($nics | ForEach-Object { "$($_.Type):$($_.NetworkName)" }) -join ';')
+                ToolsStatus       = $vm.ExtensionData.Guest.ToolsStatus
+                ToolsVersion      = $vm.ExtensionData.Guest.ToolsVersion
+                Tags              = $tags
+                CustomAttributes  = $custAttrs
+            }
+        }
+        catch {
+            Write-ErrorRecord -Stage 'VMConfig' -ObjectName $vm.Name -ErrorMessage $_.Exception.Message
+        }
+    }
+    Write-Progress -Activity "VM Config Inventory ($Site)" -Completed
+    return $results
+}
+
+function Compare-VMConfigurations {
+    param($SFInventory, $TBInventory)
+
+    # Match VMs by base name (strip trailing/leading site tokens) — falls back to exact name match
+    function Get-BaseName($n) { ($n -replace '(?i)^(sf|tb)[-_]|[-_](sf|tb)$', '') }
+
+    $sfByBase = $SFInventory | Group-Object { Get-BaseName $_.VMName }
+    $tbByBase = $TBInventory | Group-Object { Get-BaseName $_.VMName }
+    $tbLookup = @{}
+    foreach ($g in $tbByBase) { $tbLookup[$g.Name] = $g.Group[0] }
+
+    $rows = foreach ($g in $sfByBase) {
+        $sf = $g.Group[0]
+        $tb = $tbLookup[$g.Name]
+        if (-not $tb) { continue }
+
+        $fieldsToCompare = @('HardwareVersion', 'GuestOSId', 'NumCpu', 'MemoryGB', 'DiskCount', 'TotalDiskGB', 'ScsiControllers', 'ToolsVersion', 'PowerState')
+        $mismatches = @()
+        foreach ($f in $fieldsToCompare) {
+            if ($sf.$f -ne $tb.$f) { $mismatches += $f }
+        }
+
+        [PSCustomObject]@{
+            MatchKey           = $g.Name
+            SF_VMName          = $sf.VMName
+            TB_VMName          = $tb.VMName
+            SF_HWVersion       = $sf.HardwareVersion
+            TB_HWVersion       = $tb.HardwareVersion
+            SF_GuestOS         = $sf.GuestOSId
+            TB_GuestOS         = $tb.GuestOSId
+            SF_vCPU            = $sf.NumCpu
+            TB_vCPU            = $tb.NumCpu
+            SF_MemoryGB        = $sf.MemoryGB
+            TB_MemoryGB        = $tb.MemoryGB
+            SF_DiskCount       = $sf.DiskCount
+            TB_DiskCount       = $tb.DiskCount
+            SF_ToolsVersion    = $sf.ToolsVersion
+            TB_ToolsVersion    = $tb.ToolsVersion
+            MismatchedFields   = ($mismatches -join ';')
+            HasMismatch        = ($mismatches.Count -gt 0)
+        }
+    }
+
+    $unmatchedSF = $SFInventory | Where-Object { (Get-BaseName $_.VMName) -notin $tbLookup.Keys }
+    $unmatchedTB = $TBInventory | Where-Object {
+        $base = Get-BaseName $_.VMName
+        -not ($SFInventory | Where-Object { (Get-BaseName $_.VMName) -eq $base })
+    }
+
+    [PSCustomObject]@{
+        Matched      = $rows
+        OnlyInSF     = $unmatchedSF
+        OnlyInTB     = $unmatchedTB
+    }
+}
+
+#endregion
+
+#region ------------------------------- 4. OS INVENTORY LEVEL -------------------------------
+
+function Get-OSInventorySummary {
+    param($VMConfigInventory, [string]$Site)
+
+    $VMConfigInventory |
+        Where-Object { $_.GuestOSFullName } |
+        Group-Object GuestOSFullName |
+        ForEach-Object {
+            [PSCustomObject]@{
+                Site         = $Site
+                OSName       = $_.Name
+                Count        = $_.Count
+                ToolsVersions= (($_.Group | Select-Object -ExpandProperty ToolsVersion -Unique) -join ';')
+            }
+        }
+}
+
+function Compare-OSDistribution {
+    param($SFOS, $TBOS)
+
+    $allOS = ($SFOS.OSName + $TBOS.OSName) | Sort-Object -Unique
+    foreach ($os in $allOS) {
+        $sfEntry = $SFOS | Where-Object { $_.OSName -eq $os }
+        $tbEntry = $TBOS | Where-Object { $_.OSName -eq $os }
+        [PSCustomObject]@{
+            OSName        = $os
+            SF_Count      = if ($sfEntry) { $sfEntry.Count } else { 0 }
+            TB_Count      = if ($tbEntry) { $tbEntry.Count } else { 0 }
+            MissingInSF   = (-not $sfEntry)
+            MissingInTB   = (-not $tbEntry)
+            CountMismatch = ($(if ($sfEntry) { $sfEntry.Count } else { 0 }) -ne $(if ($tbEntry) { $tbEntry.Count } else { 0 }))
+        }
+    }
+}
+
+#endregion
+
+#region ------------------------------- 5. SOFTWARE & AGENT COMPARISON -------------------------------
+
+# Known agent/product keyword map -> category, used to tag results for the Agents worksheet
+$script:AgentKeywords = @{
+    'Defender'                = 'AV/EDR'
+    'CrowdStrike'             = 'AV/EDR'
+    'SentinelOne'             = 'AV/EDR'
+    'Symantec'                = 'AV/EDR'
+    'McAfee'                  = 'AV/EDR'
+    'Trend Micro'             = 'AV/EDR'
+    'Qualys'                  = 'Vulnerability/Monitoring'
+    'Splunk'                  = 'Monitoring'
+    'Binalyze'                = 'DFIR'
+    'SCOM'                    = 'Monitoring'
+    'Nagios'                  = 'Monitoring'
+    'Zabbix'                  = 'Monitoring'
+    'Veeam'                   = 'Backup'
+    'Commvault'                = 'Backup'
+    'Azure Connected Machine' = 'Azure Arc'
+    'ManageEngine'            = 'Endpoint Management'
+    'BeyondTrust'             = 'PAM'
+}
+
+function Get-AgentCategory {
+    param([string]$Name)
+    foreach ($kw in $script:AgentKeywords.Keys) {
+        if ($Name -match [regex]::Escape($kw)) { return $script:AgentKeywords[$kw] }
+    }
+    return $null
+}
+
+function Get-WindowsGuestSoftware {
+    param($VM, [System.Management.Automation.PSCredential]$Credential, [string]$Site)
+
+    $script = @'
+$paths = @(
+  "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
+  "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
+)
+$sw = Get-ItemProperty $paths -ErrorAction SilentlyContinue |
+  Where-Object { $_.DisplayName } |
+  Select-Object DisplayName, DisplayVersion, Publisher |
+  Sort-Object DisplayName -Unique
+$tools = (Get-CimInstance -ClassName Win32_Product -Filter "Name='VMware Tools'" -ErrorAction SilentlyContinue).Version
+$kernel = (Get-CimInstance Win32_OperatingSystem).Version
+$out = [PSCustomObject]@{
+  Software = $sw
+  ToolsVersion = $tools
+  OSVersion = $kernel
+}
+$out | ConvertTo-Json -Depth 4 -Compress
+'@
+
+    $raw = Invoke-GuestScriptSafe -VM $VM -ScriptText $script -ScriptType Powershell -Credential $Credential
+    if (-not $raw) { return $null }
+
+    try {
+        $parsed = $raw | ConvertFrom-Json
+        $swList = @($parsed.Software)
+        $agents = $swList | Where-Object { Get-AgentCategory $_.DisplayName } | ForEach-Object {
+            [PSCustomObject]@{
+                VMName   = $VM.Name
+                Site     = $Site
+                Agent    = $_.DisplayName
+                Version  = $_.DisplayVersion
+                Category = Get-AgentCategory $_.DisplayName
+            }
+        }
+        [PSCustomObject]@{
+            VMName       = $VM.Name
+            Site         = $Site
+            OSFamily     = 'Windows'
+            ToolsVersion = $parsed.ToolsVersion
+            OSVersion    = $parsed.OSVersion
+            SoftwareList = $swList
+            AgentsFound  = $agents
+        }
+    }
+    catch {
+        Write-ErrorRecord -Stage 'WindowsSoftware' -ObjectName $VM.Name -ErrorMessage $_.Exception.Message
+        return $null
+    }
+}
+
+function Get-LinuxGuestSoftware {
+    param($VM, [System.Management.Automation.PSCredential]$Credential, [string]$Site)
+
+    $script = @'
+KERNEL=$(uname -r)
+TOOLS=$(vmware-toolbox-cmd -v 2>/dev/null || echo "open-vm-tools:$(dpkg -l open-vm-tools 2>/dev/null | grep ^ii | awk '{print $3}')")
+if command -v dpkg >/dev/null 2>&1; then
+  PKGS=$(dpkg-query -W -f='${Package}|${Version}\n' 2>/dev/null)
+elif command -v rpm >/dev/null 2>&1; then
+  PKGS=$(rpm -qa --qf '%{NAME}|%{VERSION}\n' 2>/dev/null)
+else
+  PKGS=""
+fi
+echo "KERNEL_START"
+echo "$KERNEL"
+echo "TOOLS_START"
+echo "$TOOLS"
+echo "PKGS_START"
+echo "$PKGS"
+'@
+
+    $raw = Invoke-GuestScriptSafe -VM $VM -ScriptText $script -ScriptType Bash -Credential $Credential
+    if (-not $raw) { return $null }
+
+    try {
+        $lines = $raw -split "`n"
+        $kernelIdx = [array]::IndexOf($lines, 'KERNEL_START')
+        $toolsIdx  = [array]::IndexOf($lines, 'TOOLS_START')
+        $pkgsIdx   = [array]::IndexOf($lines, 'PKGS_START')
+
+        $kernel = $lines[$kernelIdx + 1]
+        $tools  = $lines[$toolsIdx + 1]
+        $pkgLines = $lines[($pkgsIdx + 1)..($lines.Count - 1)] | Where-Object { $_ -match '\|' }
+
+        $pkgList = $pkgLines | ForEach-Object {
+            $parts = $_ -split '\|', 2
+            [PSCustomObject]@{ DisplayName = $parts[0]; DisplayVersion = $parts[1] }
+        }
+
+        $agents = $pkgList | Where-Object { Get-AgentCategory $_.DisplayName } | ForEach-Object {
+            [PSCustomObject]@{
+                VMName   = $VM.Name
+                Site     = $Site
+                Agent    = $_.DisplayName
+                Version  = $_.DisplayVersion
+                Category = Get-AgentCategory $_.DisplayName
+            }
+        }
+
+        [PSCustomObject]@{
+            VMName       = $VM.Name
+            Site         = $Site
+            OSFamily     = 'Linux'
+            ToolsVersion = $tools
+            OSVersion    = $kernel
+            SoftwareList = $pkgList
+            AgentsFound  = $agents
+        }
+    }
+    catch {
+        Write-ErrorRecord -Stage 'LinuxSoftware' -ObjectName $VM.Name -ErrorMessage $_.Exception.Message
+        return $null
+    }
+}
+
+function Get-SoftwareInventoryForSite {
+    param($Server, [string]$Site, $VMConfigInventory)
+
+    if (-not $WindowsGuestCredential -and -not $LinuxGuestCredential) {
+        Write-Log -Level WARN -Message "[$Site] No guest credentials supplied — skipping software/agent inventory."
+        return @()
+    }
+
+    $eligible = $VMConfigInventory | Where-Object { $_.PowerState -eq 'PoweredOn' -and $_.ToolsStatus -in @('toolsOk', 'toolsOld') }
+    $winVMs = $eligible | Where-Object { $_.GuestOSFullName -match '(?i)windows' }
+    $linVMs = $eligible | Where-Object { $_.GuestOSFullName -match '(?i)linux|ubuntu|centos|rhel|debian|suse' }
+
+    $winSample = Get-RandomSample -Source $winVMs -Count $SampleSize
+    $linSample = Get-RandomSample -Source $linVMs -Count $SampleSize
+
+    Write-Log -Level INFO -Message "[$Site] Sampled $($winSample.Count) Windows / $($linSample.Count) Linux VMs for software inventory."
+
+    $results = [System.Collections.Generic.List[PSObject]]::new()
+
+    foreach ($entry in $winSample) {
+        if (-not $WindowsGuestCredential) { continue }
+        $vm = Get-VM -Server $Server -Name $entry.VMName -ErrorAction SilentlyContinue
+        if (-not $vm) { continue }
+        Write-Log -Level INFO -Message "[$Site] Collecting Windows software: $($vm.Name)"
+        $r = Get-WindowsGuestSoftware -VM $vm -Credential $WindowsGuestCredential -Site $Site
+        if ($r) { $results.Add($r) }
+    }
+
+    foreach ($entry in $linSample) {
+        if (-not $LinuxGuestCredential) { continue }
+        $vm = Get-VM -Server $Server -Name $entry.VMName -ErrorAction SilentlyContinue
+        if (-not $vm) { continue }
+        Write-Log -Level INFO -Message "[$Site] Collecting Linux packages: $($vm.Name)"
+        $r = Get-LinuxGuestSoftware -VM $vm -Credential $LinuxGuestCredential -Site $Site
+        if ($r) { $results.Add($r) }
+    }
+
+    return $results
+}
+
+function Compare-SoftwareInventory {
+    param($SFResults, $TBResults)
+
+    $sfSoftwareNames = ($SFResults | ForEach-Object { $_.SoftwareList.DisplayName }) | Sort-Object -Unique
+    $tbSoftwareNames = ($TBResults | ForEach-Object { $_.SoftwareList.DisplayName }) | Sort-Object -Unique
+
+    $common   = $sfSoftwareNames | Where-Object { $_ -in $tbSoftwareNames }
+    $onlySF   = $sfSoftwareNames | Where-Object { $_ -notin $tbSoftwareNames }
+    $onlyTB   = $tbSoftwareNames | Where-Object { $_ -notin $sfSoftwareNames }
+
+    $summary = foreach ($name in $common) {
+        $sfVer = ($SFResults | ForEach-Object { $_.SoftwareList } | Where-Object { $_.DisplayName -eq $name } | Select-Object -ExpandProperty DisplayVersion -Unique) -join ';'
+        $tbVer = ($TBResults | ForEach-Object { $_.SoftwareList } | Where-Object { $_.DisplayName -eq $name } | Select-Object -ExpandProperty DisplayVersion -Unique) -join ';'
+        [PSCustomObject]@{
+            SoftwareName    = $name
+            Status          = 'Common'
+            SF_Versions     = $sfVer
+            TB_Versions     = $tbVer
+            VersionMismatch = ($sfVer -ne $tbVer)
+        }
+    }
+    $summary += $onlySF | ForEach-Object { [PSCustomObject]@{ SoftwareName = $_; Status = 'OnlyInSF'; SF_Versions = 'N/A'; TB_Versions = ''; VersionMismatch = $false } }
+    $summary += $onlyTB | ForEach-Object { [PSCustomObject]@{ SoftwareName = $_; Status = 'OnlyInTB'; SF_Versions = ''; TB_Versions = 'N/A'; VersionMismatch = $false } }
+
+    return $summary
+}
+
+#endregion
+
+#region ------------------------------- MAIN EXECUTION -------------------------------
+
+try {
+    # ---- 1. Infrastructure ----
+    $sfInfra = Get-InfrastructureSnapshot -Server $SFvCenter -Site 'SF'
+    $tbInfra = Get-InfrastructureSnapshot -Server $TBvCenter -Site 'TB'
+    $infraComparison = if ($sfInfra -and $tbInfra) { Compare-Infrastructure -SFData $sfInfra -TBData $tbInfra } else { @() }
+
+    # ---- 2. Clusters ----
+    $sfClusters = Get-ClusterSnapshot -Server $SFvCenter -Site 'SF'
+    $tbClusters = Get-ClusterSnapshot -Server $TBvCenter -Site 'TB'
+    $clusterComparison = Compare-Clusters -SFClusters $sfClusters -TBClusters $tbClusters
+
+    # ---- 3. VM Configuration ----
+    $sfVMConfig = Get-VMConfigInventory -Server $SFvCenter -Site 'SF'
+    $tbVMConfig = Get-VMConfigInventory -Server $TBvCenter -Site 'TB'
+    $vmConfigComparison = Compare-VMConfigurations -SFInventory $sfVMConfig -TBInventory $tbVMConfig
+
+    # ---- 4. OS Inventory ----
+    $sfOS = Get-OSInventorySummary -VMConfigInventory $sfVMConfig -Site 'SF'
+    $tbOS = Get-OSInventorySummary -VMConfigInventory $tbVMConfig -Site 'TB'
+    $osComparison = Compare-OSDistribution -SFOS $sfOS -TBOS $tbOS
+
+    # ---- 5. Software & Agents ----
+    $winSoftwareComparison = @()
+    $linuxSoftwareComparison = @()
+    $agentsComparison = @()
+    if (-not $SkipSoftwareInventory) {
+        $sfSoftware = Get-SoftwareInventoryForSite -Server $SFvCenter -Site 'SF' -VMConfigInventory $sfVMConfig
+        $tbSoftware = Get-SoftwareInventoryForSite -Server $TBvCenter -Site 'TB' -VMConfigInventory $tbVMConfig
+
+        $sfWin = $sfSoftware | Where-Object { $_.OSFamily -eq 'Windows' }
+        $tbWin = $tbSoftware | Where-Object { $_.OSFamily -eq 'Windows' }
+        $sfLin = $sfSoftware | Where-Object { $_.OSFamily -eq 'Linux' }
+        $tbLin = $tbSoftware | Where-Object { $_.OSFamily -eq 'Linux' }
+
+        $winSoftwareComparison = Compare-SoftwareInventory -SFResults $sfWin -TBResults $tbWin
+        $linuxSoftwareComparison = Compare-SoftwareInventory -SFResults $sfLin -TBResults $tbLin
+        $agentsComparison = ($sfSoftware + $tbSoftware) | ForEach-Object { $_.AgentsFound } | Where-Object { $_ }
+    }
+    else {
+        Write-Log -Level WARN -Message "SkipSoftwareInventory set — software/agent comparison skipped."
+    }
+
+    # ---- Differences Summary ----
+    $diffSummary = [System.Collections.Generic.List[PSObject]]::new()
+    foreach ($row in ($infraComparison | Where-Object Mismatch)) {
+        $diffSummary.Add([PSCustomObject]@{ Category = 'Infrastructure'; Item = $row.Metric; SF = $row.SF; TB = $row.TB })
+    }
+    foreach ($row in ($clusterComparison | Where-Object { $_.HA_Mismatch -or $_.DRS_Mismatch -or $_.EVC_Mismatch -or -not $_.PresentInBoth })) {
+        $diffSummary.Add([PSCustomObject]@{ Category = 'Cluster'; Item = $row.MatchedClusterKey; SF = "HA:$($row.SF_HA) DRS:$($row.SF_DRSLevel) EVC:$($row.SF_EVC)"; TB = "HA:$($row.TB_HA) DRS:$($row.TB_DRSLevel) EVC:$($row.TB_EVC)" })
+    }
+    foreach ($row in ($vmConfigComparison.Matched | Where-Object HasMismatch)) {
+        $diffSummary.Add([PSCustomObject]@{ Category = 'VM Config'; Item = $row.MatchKey; SF = $row.MismatchedFields; TB = '' })
+    }
+    foreach ($row in ($osComparison | Where-Object { $_.MissingInSF -or $_.MissingInTB -or $_.CountMismatch })) {
+        $diffSummary.Add([PSCustomObject]@{ Category = 'OS Inventory'; Item = $row.OSName; SF = $row.SF_Count; TB = $row.TB_Count })
+    }
+
+    # ---- Execution Summary ----
+    $endTime = Get-Date
+    $execSummary = [PSCustomObject]@{
+        StartTime           = $script:StartTime
+        EndTime              = $endTime
+        DurationMinutes      = [math]::Round(($endTime - $script:StartTime).TotalMinutes, 2)
+        SFvCenter            = $SFvCenterServer
+        TBvCenter            = $TBvCenterServer
+        SFVMCount            = $sfVMConfig.Count
+        TBVMCount            = $tbVMConfig.Count
+        TotalErrors          = $script:ErrorLog.Count
+        SoftwareInventorySkipped = [bool]$SkipSoftwareInventory
+        SampleSizeUsed       = $SampleSize
+    }
+
+    # ---- Executive Summary (narrative) ----
+    $execNarrative = [System.Collections.Generic.List[string]]::new()
+    $execNarrative.Add("SF vs TB Environment Comparison — Executive Summary")
+    $execNarrative.Add("Generated: $endTime")
+    $execNarrative.Add("")
+    $execNarrative.Add("Scope: SF vCenter '$SFvCenterServer' ($($sfVMConfig.Count) VMs) vs TB vCenter '$TBvCenterServer' ($($tbVMConfig.Count) VMs).")
+    $execNarrative.Add("")
+    $execNarrative.Add("Key differences identified: $($diffSummary.Count)")
+    $haMismatch = ($clusterComparison | Where-Object HA_Mismatch).Count
+    $drsMismatch = ($clusterComparison | Where-Object DRS_Mismatch).Count
+    $evcMismatch = ($clusterComparison | Where-Object EVC_Mismatch).Count
+    if ($haMismatch -gt 0) { $execNarrative.Add("- RISK: $haMismatch cluster(s) have mismatched HA configuration between sites.") }
+    if ($drsMismatch -gt 0) { $execNarrative.Add("- RISK: $drsMismatch cluster(s) have mismatched DRS automation level.") }
+    if ($evcMismatch -gt 0) { $execNarrative.Add("- RISK: $evcMismatch cluster(s) have mismatched EVC mode — live migration/compatibility risk.") }
+    $vmMismatchCount = ($vmConfigComparison.Matched | Where-Object HasMismatch).Count
+    if ($vmMismatchCount -gt 0) { $execNarrative.Add("- $vmMismatchCount matched VM pair(s) show configuration drift (hardware version, vCPU, memory, tools, etc.).") }
+    $missingOSCount = ($osComparison | Where-Object { $_.MissingInSF -or $_.MissingInTB }).Count
+    if ($missingOSCount -gt 0) { $execNarrative.Add("- $missingOSCount OS version(s) exist in one site but not the other — patch/build baseline drift.") }
+    $toolsGap = ($sfInfra.ToolsNotInstalled + $sfInfra.ToolsNotRunning + $tbInfra.ToolsNotInstalled + $tbInfra.ToolsNotRunning)
+    if ($toolsGap -gt 0) { $execNarrative.Add("- $toolsGap VM(s) across both sites have VMware Tools not installed/not running — reduces automation and monitoring coverage.") }
+    if ($script:ErrorLog.Count -gt 0) { $execNarrative.Add("- $($script:ErrorLog.Count) collection error(s) occurred; see Errors sheet/log for detail — treat affected objects as unverified.") }
+    $execNarrative.Add("")
+    $execNarrative.Add("Recommendations:")
+    $execNarrative.Add("1. Reconcile cluster HA/DRS/EVC settings to a common baseline across SF and TB.")
+    $execNarrative.Add("2. Remediate VM Tools not-running/not-installed gaps to restore full guest visibility.")
+    $execNarrative.Add("3. Align OS/patch baselines where version drift was found.")
+    $execNarrative.Add("4. Investigate and re-run collection for any objects listed in the Errors sheet.")
+
+    $execSummaryText = $execNarrative -join "`r`n"
+    $execSummaryText | Out-File -FilePath (Join-Path $OutputPath 'ExecutiveSummary.txt') -Encoding utf8
+
+    #region --- Exports ---
+    Write-Log -Level INFO -Message "Writing CSV exports..."
+    $csvMap = @{
+        'Infrastructure_Comparison.csv' = $infraComparison
+        'Cluster_Comparison.csv'        = $clusterComparison
+        'VMConfig_Matched.csv'          = $vmConfigComparison.Matched
+        'VMConfig_OnlyInSF.csv'         = $vmConfigComparison.OnlyInSF
+        'VMConfig_OnlyInTB.csv'         = $vmConfigComparison.OnlyInTB
+        'OS_Inventory_Comparison.csv'   = $osComparison
+        'Windows_Software_Comparison.csv' = $winSoftwareComparison
+        'Linux_Package_Comparison.csv'  = $linuxSoftwareComparison
+        'Agents_Comparison.csv'         = $agentsComparison
+        'Differences_Summary.csv'       = $diffSummary
+        'Errors.csv'                    = $script:ErrorLog
+        'Execution_Summary.csv'         = @($execSummary)
+    }
+    foreach ($kvp in $csvMap.GetEnumerator()) {
+        try {
+            if ($kvp.Value -and $kvp.Value.Count -gt 0) {
+                $kvp.Value | Export-Csv -Path (Join-Path $CsvPath $kvp.Key) -NoTypeInformation -Encoding UTF8
+            }
+        }
+        catch { Write-ErrorRecord -Stage 'CSV Export' -ObjectName $kvp.Key -ErrorMessage $_.Exception.Message }
+    }
+    Write-Log -Level SUCCESS -Message "CSV exports written to $CsvPath"
+
+    if ($UseExcel) {
+        Write-Log -Level INFO -Message "Writing Excel workbook..."
+        try {
+            if (Test-Path $ExcelFile) { Remove-Item $ExcelFile -Force }
+            $sheetMap = [ordered]@{
+                'Infrastructure'      = $infraComparison
+                'Cluster Comparison'  = $clusterComparison
+                'VM Config Matched'   = $vmConfigComparison.Matched
+                'VM Only In SF'       = $vmConfigComparison.OnlyInSF
+                'VM Only In TB'       = $vmConfigComparison.OnlyInTB
+                'OS Inventory'        = $osComparison
+                'Windows Software'    = $winSoftwareComparison
+                'Linux Packages'      = $linuxSoftwareComparison
+                'Agents Comparison'   = $agentsComparison
+                'Differences Summary' = $diffSummary
+                'Errors'              = $script:ErrorLog
+                'Execution Summary'   = @($execSummary)
+            }
+            foreach ($kvp in $sheetMap.GetEnumerator()) {
+                if ($kvp.Value -and $kvp.Value.Count -gt 0) {
+                    $kvp.Value | Export-Excel -Path $ExcelFile -WorksheetName $kvp.Key -AutoSize -FreezeTopRow -BoldTopRow -TableStyle Medium6
+                }
+            }
+            Write-Log -Level SUCCESS -Message "Excel workbook written to $ExcelFile"
+        }
+        catch {
+            Write-ErrorRecord -Stage 'Excel Export' -ObjectName 'Workbook' -ErrorMessage $_.Exception.Message
+        }
+    }
+    #endregion
+
+    Write-Log -Level SUCCESS -Message "===== Comparison complete. Duration: $($execSummary.DurationMinutes) min. Errors: $($script:ErrorLog.Count) ====="
+    Write-Host "`nReports:  $OutputPath" -ForegroundColor Cyan
+    Write-Host "Log file: $LogFile" -ForegroundColor Cyan
+}
+catch {
+    Write-Log -Level ERROR -Message "FATAL: $($_.Exception.Message)"
+    Write-Log -Level ERROR -Message $_.ScriptStackTrace
+    throw
+}
+finally {
+    $script:ExecutionLog | Export-Csv -Path (Join-Path $LogPath 'ExecutionLog.csv') -NoTypeInformation -Encoding UTF8 -ErrorAction SilentlyContinue
+}
+
+#endregion
+```
