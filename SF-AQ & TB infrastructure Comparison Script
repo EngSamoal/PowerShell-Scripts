@@ -26,7 +26,14 @@
     PSCredential used for Invoke-VMScript against Windows guests.
 
 .PARAMETER LinuxGuestCredential
-    PSCredential used for Invoke-VMScript against Linux guests.
+    Fallback PSCredential for Invoke-VMScript against Linux guests, used only if
+    -SFLinuxGuestCredential / -TBLinuxGuestCredential aren't supplied.
+
+.PARAMETER SFLinuxGuestCredential
+    PSCredential for SF Linux guests (SF and TB Linux creds often differ).
+
+.PARAMETER TBLinuxGuestCredential
+    PSCredential for TB Linux guests.
 
 .PARAMETER OutputPath
     Root folder for reports/logs. Defaults to .\SFTB-Comparison-<timestamp>.
@@ -76,6 +83,12 @@ param(
     [System.Management.Automation.PSCredential]$LinuxGuestCredential,
 
     [Parameter(Mandatory = $false)]
+    [System.Management.Automation.PSCredential]$SFLinuxGuestCredential,
+
+    [Parameter(Mandatory = $false)]
+    [System.Management.Automation.PSCredential]$TBLinuxGuestCredential,
+
+    [Parameter(Mandatory = $false)]
     [string]$OutputPath = (Join-Path -Path (Get-Location) -ChildPath "SFTB-Comparison-$(Get-Date -Format 'yyyyMMdd-HHmmss')"),
 
     [Parameter(Mandatory = $false)]
@@ -95,7 +108,13 @@ param(
     [string[]]$TBWindowsVMs = @(),
 
     [Parameter(Mandatory = $false)]
-    [string[]]$TBLinuxVMs = @()
+    [string[]]$TBLinuxVMs = @(),
+
+    [Parameter(Mandatory = $false)]
+    [string]$WindowsVMListFile,
+
+    [Parameter(Mandatory = $false)]
+    [string]$LinuxVMListFile
 )
 
 #region ------------------------------- INITIALIZATION -------------------------------
@@ -693,9 +712,9 @@ echo "$PKGS"
 }
 
 function Get-SoftwareInventoryForSite {
-    param($Server, [string]$Site, $VMConfigInventory, [string[]]$TargetWinNames, [string[]]$TargetLinNames)
+    param($Server, [string]$Site, $VMConfigInventory, [string[]]$TargetWinNames, [string[]]$TargetLinNames, [System.Management.Automation.PSCredential]$SiteLinuxCredential)
 
-    if (-not $WindowsGuestCredential -and -not $LinuxGuestCredential) {
+    if (-not $WindowsGuestCredential -and -not $SiteLinuxCredential) {
         Write-Log -Level WARN -Message "[$Site] No guest credentials supplied — skipping software/agent inventory."
         return @()
     }
@@ -732,11 +751,11 @@ function Get-SoftwareInventoryForSite {
     }
 
     foreach ($entry in $linSample) {
-        if (-not $LinuxGuestCredential) { continue }
+        if (-not $SiteLinuxCredential) { continue }
         $vm = Get-VM -Server $Server -Name $entry.VMName -ErrorAction SilentlyContinue
         if (-not $vm) { continue }
         Write-Log -Level INFO -Message "[$Site] Collecting Linux packages: $($vm.Name)"
-        $r = Get-LinuxGuestSoftware -VM $vm -Credential $LinuxGuestCredential -Site $Site
+        $r = Get-LinuxGuestSoftware -VM $vm -Credential $SiteLinuxCredential -Site $Site
         if ($r) { $results.Add($r) }
     }
 
@@ -796,12 +815,42 @@ try {
     $osComparison = Compare-OSDistribution -SFOS $sfOS -TBOS $tbOS
 
     # ---- 5. Software & Agents ----
+    # If list files were supplied, read them and auto-assign each VM name to SF or TB
+    # based on which site's inventory actually contains it.
+    if ($WindowsVMListFile -or $LinuxVMListFile) {
+        function Import-VMListFile {
+            param([string]$Path)
+            if (-not $Path) { return @() }
+            if (-not (Test-Path $Path)) {
+                Write-ErrorRecord -Stage 'VM List File' -ObjectName $Path -ErrorMessage "File not found."
+                return @()
+            }
+            Get-Content -Path $Path | ForEach-Object { $_.Trim() } | Where-Object { $_ -and $_ -notmatch '^\s*#' }
+        }
+
+        $winNames = Import-VMListFile -Path $WindowsVMListFile
+        foreach ($n in $winNames) {
+            if ($n -in $sfVMConfig.VMName) { $SFWindowsVMs += $n }
+            elseif ($n -in $tbVMConfig.VMName) { $TBWindowsVMs += $n }
+            else { Write-ErrorRecord -Stage 'VM List File' -ObjectName $n -ErrorMessage "Not found in either site's VM inventory — check the name in $WindowsVMListFile." }
+        }
+
+        $linNames = Import-VMListFile -Path $LinuxVMListFile
+        foreach ($n in $linNames) {
+            if ($n -in $sfVMConfig.VMName) { $SFLinuxVMs += $n }
+            elseif ($n -in $tbVMConfig.VMName) { $TBLinuxVMs += $n }
+            else { Write-ErrorRecord -Stage 'VM List File' -ObjectName $n -ErrorMessage "Not found in either site's VM inventory — check the name in $LinuxVMListFile." }
+        }
+
+        Write-Log -Level INFO -Message "Loaded from list files -> SF Win:$($SFWindowsVMs.Count) SF Lin:$($SFLinuxVMs.Count) TB Win:$($TBWindowsVMs.Count) TB Lin:$($TBLinuxVMs.Count)"
+    }
+
     $winSoftwareComparison = @()
     $linuxSoftwareComparison = @()
     $agentsComparison = @()
     if (-not $SkipSoftwareInventory) {
-        $sfSoftware = Get-SoftwareInventoryForSite -Server $SFvCenter -Site 'SF' -VMConfigInventory $sfVMConfig -TargetWinNames $SFWindowsVMs -TargetLinNames $SFLinuxVMs
-        $tbSoftware = Get-SoftwareInventoryForSite -Server $TBvCenter -Site 'TB' -VMConfigInventory $tbVMConfig -TargetWinNames $TBWindowsVMs -TargetLinNames $TBLinuxVMs
+        $sfSoftware = Get-SoftwareInventoryForSite -Server $SFvCenter -Site 'SF' -VMConfigInventory $sfVMConfig -TargetWinNames $SFWindowsVMs -TargetLinNames $SFLinuxVMs -SiteLinuxCredential $(if ($SFLinuxGuestCredential) { $SFLinuxGuestCredential } else { $LinuxGuestCredential })
+        $tbSoftware = Get-SoftwareInventoryForSite -Server $TBvCenter -Site 'TB' -VMConfigInventory $tbVMConfig -TargetWinNames $TBWindowsVMs -TargetLinNames $TBLinuxVMs -SiteLinuxCredential $(if ($TBLinuxGuestCredential) { $TBLinuxGuestCredential } else { $LinuxGuestCredential })
 
         $sfWin = $sfSoftware | Where-Object { $_.OSFamily -eq 'Windows' }
         $tbWin = $tbSoftware | Where-Object { $_.OSFamily -eq 'Windows' }
