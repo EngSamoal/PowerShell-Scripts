@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     Comprehensive comparison of two VMware vSphere environments (SF vs TB) across
@@ -7,7 +7,7 @@
 .DESCRIPTION
     Connects to two already-connected vCenter Servers (via PowerCLI), collects and
     compares infrastructure, cluster, VM configuration, and guest OS/software data
-    using VMware Tools (Invoke-VMScript) only — no WinRM required. Produces an
+    using VMware Tools (Invoke-VMScript) only " no WinRM required. Produces an
     Excel workbook (multi-sheet), CSV exports per report, a detailed log file, and
     an executive summary.
 
@@ -469,7 +469,7 @@ function Get-VMConfigInventory {
 function Compare-VMConfigurations {
     param($SFInventory, $TBInventory)
 
-    # Match VMs by base name (strip trailing/leading site tokens) — falls back to exact name match
+    # Match VMs by base name (strip trailing/leading site tokens) " falls back to exact name match
     function Get-BaseName($n) { ($n -replace '(?i)^(sf|tb)[-_]|[-_](sf|tb)$', '') }
 
     $sfByBase = $SFInventory | Group-Object { Get-BaseName $_.VMName }
@@ -715,12 +715,12 @@ function Get-SoftwareInventoryForSite {
     param($Server, [string]$Site, $VMConfigInventory, [string[]]$TargetWinNames, [string[]]$TargetLinNames, [System.Management.Automation.PSCredential]$SiteLinuxCredential)
 
     if (-not $WindowsGuestCredential -and -not $SiteLinuxCredential) {
-        Write-Log -Level WARN -Message "[$Site] No guest credentials supplied — skipping software/agent inventory."
+        Write-Log -Level WARN -Message "[$Site] No guest credentials supplied " skipping software/agent inventory."
         return @()
     }
 
     if (-not $TargetWinNames -and -not $TargetLinNames) {
-        Write-Log -Level WARN -Message "[$Site] No target VM list supplied (-SFWindowsVMs/-SFLinuxVMs or -TBWindowsVMs/-TBLinuxVMs) — skipping software/agent inventory for this site."
+        Write-Log -Level WARN -Message "[$Site] No target VM list supplied (-SFWindowsVMs/-SFLinuxVMs or -TBWindowsVMs/-TBLinuxVMs) " skipping software/agent inventory for this site."
         return @()
     }
 
@@ -731,10 +731,10 @@ function Get-SoftwareInventoryForSite {
 
     # Flag any requested VM that couldn't be used (not found, powered off, or Tools not ready)
     foreach ($n in $TargetWinNames) {
-        if ($n -notin $winSample.VMName) { Write-ErrorRecord -Stage 'Software Target' -ObjectName $n -ErrorMessage "Not found, powered off, or VMware Tools not ready — skipped." }
+        if ($n -notin $winSample.VMName) { Write-ErrorRecord -Stage 'Software Target' -ObjectName $n -ErrorMessage "Not found, powered off, or VMware Tools not ready " skipped." }
     }
     foreach ($n in $TargetLinNames) {
-        if ($n -notin $linSample.VMName) { Write-ErrorRecord -Stage 'Software Target' -ObjectName $n -ErrorMessage "Not found, powered off, or VMware Tools not ready — skipped." }
+        if ($n -notin $linSample.VMName) { Write-ErrorRecord -Stage 'Software Target' -ObjectName $n -ErrorMessage "Not found, powered off, or VMware Tools not ready " skipped." }
     }
 
     Write-Log -Level INFO -Message "[$Site] Using fixed target list: $($winSample.Count) Windows / $($linSample.Count) Linux VMs for software inventory."
@@ -832,14 +832,14 @@ try {
         foreach ($n in $winNames) {
             if ($n -in $sfVMConfig.VMName) { $SFWindowsVMs += $n }
             elseif ($n -in $tbVMConfig.VMName) { $TBWindowsVMs += $n }
-            else { Write-ErrorRecord -Stage 'VM List File' -ObjectName $n -ErrorMessage "Not found in either site's VM inventory — check the name in $WindowsVMListFile." }
+            else { Write-ErrorRecord -Stage 'VM List File' -ObjectName $n -ErrorMessage "Not found in either site's VM inventory " check the name in $WindowsVMListFile." }
         }
 
         $linNames = Import-VMListFile -Path $LinuxVMListFile
         foreach ($n in $linNames) {
             if ($n -in $sfVMConfig.VMName) { $SFLinuxVMs += $n }
             elseif ($n -in $tbVMConfig.VMName) { $TBLinuxVMs += $n }
-            else { Write-ErrorRecord -Stage 'VM List File' -ObjectName $n -ErrorMessage "Not found in either site's VM inventory — check the name in $LinuxVMListFile." }
+            else { Write-ErrorRecord -Stage 'VM List File' -ObjectName $n -ErrorMessage "Not found in either site's VM inventory " check the name in $LinuxVMListFile." }
         }
 
         Write-Log -Level INFO -Message "Loaded from list files -> SF Win:$($SFWindowsVMs.Count) SF Lin:$($SFLinuxVMs.Count) TB Win:$($TBWindowsVMs.Count) TB Lin:$($TBLinuxVMs.Count)"
@@ -862,7 +862,7 @@ try {
         $agentsComparison = ($sfSoftware + $tbSoftware) | ForEach-Object { $_.AgentsFound } | Where-Object { $_ }
     }
     else {
-        Write-Log -Level WARN -Message "SkipSoftwareInventory set — software/agent comparison skipped."
+        Write-Log -Level WARN -Message "SkipSoftwareInventory set " software/agent comparison skipped."
     }
 
     # ---- Differences Summary ----
@@ -897,7 +897,7 @@ try {
 
     # ---- Executive Summary (narrative) ----
     $execNarrative = [System.Collections.Generic.List[string]]::new()
-    $execNarrative.Add("SF vs TB Environment Comparison — Executive Summary")
+    $execNarrative.Add("SF vs TB Environment Comparison " Executive Summary")
     $execNarrative.Add("Generated: $endTime")
     $execNarrative.Add("")
     $execNarrative.Add("Scope: SF vCenter '$SFvCenterServer' ($($sfVMConfig.Count) VMs) vs TB vCenter '$TBvCenterServer' ($($tbVMConfig.Count) VMs).")
@@ -908,14 +908,14 @@ try {
     $evcMismatch = ($clusterComparison | Where-Object EVC_Mismatch).Count
     if ($haMismatch -gt 0) { $execNarrative.Add("- RISK: $haMismatch cluster(s) have mismatched HA configuration between sites.") }
     if ($drsMismatch -gt 0) { $execNarrative.Add("- RISK: $drsMismatch cluster(s) have mismatched DRS automation level.") }
-    if ($evcMismatch -gt 0) { $execNarrative.Add("- RISK: $evcMismatch cluster(s) have mismatched EVC mode — live migration/compatibility risk.") }
+    if ($evcMismatch -gt 0) { $execNarrative.Add("- RISK: $evcMismatch cluster(s) have mismatched EVC mode " live migration/compatibility risk.") }
     $vmMismatchCount = ($vmConfigComparison.Matched | Where-Object HasMismatch).Count
     if ($vmMismatchCount -gt 0) { $execNarrative.Add("- $vmMismatchCount matched VM pair(s) show configuration drift (hardware version, vCPU, memory, tools, etc.).") }
     $missingOSCount = ($osComparison | Where-Object { $_.MissingInSF -or $_.MissingInTB }).Count
-    if ($missingOSCount -gt 0) { $execNarrative.Add("- $missingOSCount OS version(s) exist in one site but not the other — patch/build baseline drift.") }
+    if ($missingOSCount -gt 0) { $execNarrative.Add("- $missingOSCount OS version(s) exist in one site but not the other " patch/build baseline drift.") }
     $toolsGap = ($sfInfra.ToolsNotInstalled + $sfInfra.ToolsNotRunning + $tbInfra.ToolsNotInstalled + $tbInfra.ToolsNotRunning)
-    if ($toolsGap -gt 0) { $execNarrative.Add("- $toolsGap VM(s) across both sites have VMware Tools not installed/not running — reduces automation and monitoring coverage.") }
-    if ($script:ErrorLog.Count -gt 0) { $execNarrative.Add("- $($script:ErrorLog.Count) collection error(s) occurred; see Errors sheet/log for detail — treat affected objects as unverified.") }
+    if ($toolsGap -gt 0) { $execNarrative.Add("- $toolsGap VM(s) across both sites have VMware Tools not installed/not running " reduces automation and monitoring coverage.") }
+    if ($script:ErrorLog.Count -gt 0) { $execNarrative.Add("- $($script:ErrorLog.Count) collection error(s) occurred; see Errors sheet/log for detail " treat affected objects as unverified.") }
     $execNarrative.Add("")
     $execNarrative.Add("Recommendations:")
     $execNarrative.Add("1. Reconcile cluster HA/DRS/EVC settings to a common baseline across SF and TB.")
@@ -993,7 +993,8 @@ catch {
     throw
 }
 finally {
-    $script:ExecutionLog | Export-Csv -Path (Join-Path $LogPath 'ExecutionLog.csv') -NoTypeInformation -Encoding UTF8 -ErrorAction SilentlyContinue
+    $script:ExecutionLog | Export-Csv -Path (CJoin-Path $LogPath 'ExecutionLog.csv')) -NoTypeInformation -Encoding UTF8 -ErrorAction SilentlyContinue
 }
 
 #endregion
+
