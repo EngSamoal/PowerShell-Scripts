@@ -33,7 +33,7 @@ param(
     # name is used as the label - nothing is hard-coded or required.
     [hashtable]$SiteMap = @{},
 
-    [string]$OutputPath = ".\VMware_HealthCheck_Reports",
+    [string]$OutputPath = (Join-Path $PSScriptRoot "VMware_HealthCheck_Reports"),
 
     # Configurable thresholds - NOT vendor/company-defined standards. Raw values are always
     # shown regardless of these; these only drive the Warning/Critical flag shown alongside them.
