@@ -516,24 +516,271 @@ foreach ($VC in $Connections) {
 } # end per-vCenter
 
 # ============================================================================
-# 3. REPORT GENERATION HELPERS
-#    One report per site, laid out the same way as the original manual reports
-#    (Executive Summary -> vCenter Health -> per-cluster sections -> Global Notes
-#    -> Conclusion), with simple colored-dot status indicators instead of tables
-#    of raw data. Manual/physical-only items are never collected in the first
-#    place, so there is nothing to filter out here.
 # ============================================================================
-function Get-Dot {
+# 3. REPORT GENERATION HELPERS
+#    Each site's .docx is built DIRECTLY in Word via COM automation - typing text,
+#    applying styles/colors, and inserting native Word tables. There is no HTML
+#    step anywhere in this pipeline (opening an HTML file in Word and re-saving
+#    it is what caused the earlier failures - Word treats that as a web/compat
+#    document and SaveAs on it is unreliable). This is slower to write but far
+#    more reliable, and gives real Word styles/colors instead of an HTML import.
+# ============================================================================
+$StatusColors = @{
+    'Healthy'         = @(22,163,74)
+    'Warning'         = @(245,158,11)
+    'Critical'        = @(220,38,38)
+    'Information'     = @(37,99,235)
+    'Unable to Check' = @(156,163,175)
+}
+function Get-WordColorLong {
+    param([int[]]$Rgb)
+    # Word/COLORREF packs color as R + G*256 + B*65536 (same packing Windows uses)
+    return $Rgb[0] + ($Rgb[1] * 256) + ($Rgb[2] * 65536)
+}
+function Get-StatusColorLong {
     param([string]$Status)
-    $color = switch ($Status) {
-        'Healthy'          { '#16a34a' }
-        'Warning'          { '#f59e0b' }
-        'Critical'         { '#dc2626' }
-        'Information'      { '#2563eb' }
-        'Unable to Check'  { '#9ca3af' }
-        default            { '#9ca3af' }
+    $rgb = $StatusColors[$Status]
+    if (-not $rgb) { $rgb = @(156,163,175) }
+    return Get-WordColorLong $rgb
+}
+
+function Write-Heading {
+    param($Selection, [string]$Text, [int]$Level = 1)
+    $Selection.Style = "Heading $Level"
+    $Selection.TypeText($Text)
+    $Selection.TypeParagraph()
+    $Selection.Style = 'Normal'
+}
+
+function Write-Para {
+    param($Selection, [string]$Text, [switch]$Bold, [switch]$Italic, [switch]$Gray)
+    $Selection.Font.Bold = [bool]$Bold
+    $Selection.Font.Italic = [bool]$Italic
+    if ($Gray) { $Selection.Font.Color = Get-WordColorLong @(107,114,128) }
+    $Selection.TypeText($Text)
+    $Selection.TypeParagraph()
+    $Selection.Font.Bold = $false
+    $Selection.Font.Italic = $false
+    $Selection.Font.Color = -16777216   # wdColorAutomatic
+}
+
+function Write-DotLine {
+    param($Selection, [string]$Status, [string]$Text)
+    $Selection.Font.Color = Get-StatusColorLong $Status
+    $Selection.TypeText([char]0x25CF)
+    $Selection.Font.Color = -16777216
+    $Selection.TypeText(" $Text")
+    $Selection.TypeParagraph()
+}
+
+function Write-BulletList {
+    param($Selection, [string[]]$Lines, [switch]$Red)
+    foreach ($line in $Lines) {
+        if ($Red) { $Selection.Font.Color = Get-WordColorLong @(220,38,38) }
+        $Selection.TypeText("-  $line")
+        $Selection.TypeParagraph()
+        if ($Red) { $Selection.Font.Color = -16777216 }
     }
-    return "<span style='color:$color;'>&#9679;</span> $Status"
+}
+
+function Add-Table {
+    param($Doc, $Selection, [string[]]$Headers, [array]$Rows, [int]$StatusColumnIndex = -1)
+    $rowCount = $Rows.Count + 1
+    $colCount = $Headers.Count
+    $table = $Doc.Tables.Add($Selection.Range, $rowCount, $colCount)
+    $table.Borders.InsideLineStyle = 1
+    $table.Borders.OutsideLineStyle = 1
+    for ($c = 0; $c -lt $colCount; $c++) {
+        $cell = $table.Cell(1, $c + 1)
+        $cell.Range.Text = $Headers[$c]
+        $cell.Range.Font.Bold = $true
+        $cell.Range.Font.Color = Get-WordColorLong @(255,255,255)
+        $cell.Shading.BackgroundPatternColor = Get-WordColorLong @(30,58,95)
+    }
+    for ($r = 0; $r -lt $Rows.Count; $r++) {
+        for ($c = 0; $c -lt $colCount; $c++) {
+            $cellRange = $table.Cell($r + 2, $c + 1).Range
+            $cellText = [string]$Rows[$r][$c]
+            $cellRange.Text = $cellText
+            if ($c -eq $StatusColumnIndex) {
+                $cellRange.Font.Color = Get-StatusColorLong $cellText
+                $cellRange.Font.Bold = $true
+            }
+        }
+    }
+    $Selection.SetRange($table.Range.End, $table.Range.End)
+    $Selection.TypeParagraph()
+}
+
+function Write-SiteReportDocx {
+    param($Word, [string]$SiteLabel, [string]$OutputPath, [string]$RunDate)
+
+    $SiteFindings = $Global:AllResults | Where-Object { $_.Site -eq $SiteLabel -and $_.Status -ne 'Manual/External Required' }
+    if (-not $SiteFindings) { return }
+
+    $VCenterName  = $SiteFindings | Select-Object -First 1 -ExpandProperty VCenter
+    $ClusterNames = $SiteFindings | Where-Object { $_.Area -eq 'Cluster Configuration' } | Select-Object -ExpandProperty Object -Unique
+    $HostObjects  = $SiteFindings | Where-Object { $_.Area -eq 'ESXi Host Health' -and $_.Item -eq 'ESXi Version/Build' } | Select-Object -ExpandProperty Object -Unique
+    $CritCount = ($SiteFindings | Where-Object { $_.Status -eq 'Critical' }).Count
+    $WarnCount = ($SiteFindings | Where-Object { $_.Status -eq 'Warning' }).Count
+    $OverallHealth = if ($CritCount -gt 0) { 'Critical' } elseif ($WarnCount -gt 0) { 'Warning' } else { 'Healthy' }
+    $VcVersionItem = $SiteFindings | Where-Object { $_.Item -eq 'vCenter Version/Build' } | Select-Object -First 1
+
+    $doc = $Word.Documents.Add()
+    $sel = $Word.Selection
+
+    Write-Heading $sel "$SiteLabel vCenter & ESXi Health Check Report" 1
+    Write-Para $sel "Report Date: $RunDate" -Gray
+
+    Write-Heading $sel "1. Executive Summary" 2
+    Write-Para $sel "Environment: 1 vCenter ($VCenterName) | $($ClusterNames.Count) Cluster(s)/Site(s) | $($HostObjects.Count) ESXi Host(s)"
+    if ($VcVersionItem) { Write-Para $sel "vCenter Version: $($VcVersionItem.Value)" }
+    Write-DotLine $sel $OverallHealth "Overall Environment Health: $OverallHealth"
+    Write-Para $sel "High Risk Issue: $(if ($CritCount -gt 0) {'YES'} else {'NO'})"
+
+    Write-Heading $sel "2. vCenter Server Health" 2
+    $ApplianceRows = $SiteFindings | Where-Object { $_.Area -in 'vCenter Overview','vCenter Appliance' -and $_.Item -ne 'vCenter Version/Build' }
+    if ($ApplianceRows) {
+        $tableRows = @()
+        foreach ($r in $ApplianceRows) { $tableRows += ,@($r.Item, $r.Value, $r.Status) }
+        Add-Table $doc $sel @('Item','Value','Status') $tableRows -StatusColumnIndex 2
+    } else {
+        Write-Para $sel "No appliance-level data collected this run." -Italic
+    }
+
+    $clusterIdx = 2
+    foreach ($ClusterName in $ClusterNames) {
+        $clusterIdx++
+        Write-Heading $sel "$clusterIdx. $ClusterName" 2
+        $HostsHere = $HostObjects | Where-Object { $Global:ObjectClusterMap[$_] -eq $ClusterName }
+
+        Write-Heading $sel "ESXi Host Versions" 3
+        $hostTableRows = @()
+        foreach ($h in $HostsHere) {
+            $verItem  = $SiteFindings | Where-Object { $_.Object -eq $h -and $_.Item -eq 'ESXi Version/Build' } | Select-Object -First 1
+            $hostRows = $SiteFindings | Where-Object { $_.Object -eq $h }
+            $hostStatus = Get-WorstStatus ($hostRows | Select-Object -ExpandProperty Status)
+            $hostIssues = $hostRows | Where-Object { $_.Status -in 'Critical','Warning' } | Select-Object -First 2
+            $notes = ($hostIssues | ForEach-Object { "$($_.Item): $($_.Value)" }) -join '; '
+            $hostTableRows += ,@($h, $verItem.Value, $hostStatus, $notes)
+        }
+        if ($hostTableRows.Count -gt 0) {
+            Add-Table $doc $sel @('Host','ESXi Version/Build','Status','Notes') $hostTableRows -StatusColumnIndex 2
+        } else {
+            Write-Para $sel "No hosts discovered for this cluster." -Italic
+        }
+
+        Write-Heading $sel "CPU & Memory Capacity" 3
+        $capRows = $SiteFindings | Where-Object { $_.Area -eq 'CPU/Memory Capacity' -and $_.Object -eq $ClusterName }
+        if ($capRows) {
+            $capTableRows = @()
+            foreach ($r in $capRows) { $capTableRows += ,@($r.Item, $r.Value, $r.Status) }
+            Add-Table $doc $sel @('Metric','Value','Status') $capTableRows -StatusColumnIndex 2
+        } else {
+            Write-Para $sel "No capacity data collected." -Italic
+        }
+
+        Write-Heading $sel "Storage" 3
+        $vsanRow = $SiteFindings | Where-Object { $_.Area -eq 'Storage/vSAN' -and $_.Object -eq $ClusterName -and $_.Item -like 'vSAN Capacity*' } | Select-Object -First 1
+        $dsRows  = $SiteFindings | Where-Object { $_.Area -eq 'Storage/Datastore' -and $Global:ObjectClusterMap[$_.Object] -eq $ClusterName }
+        if ($vsanRow) {
+            Write-DotLine $sel $vsanRow.Status "vSAN - $($vsanRow.Value)"
+            $vsanIssues = $SiteFindings | Where-Object { $_.Area -eq 'Storage/vSAN' -and $_.Object -eq $ClusterName -and $_.Item -like 'vSAN Health:*' -and $_.Status -in 'Critical','Warning' }
+            foreach ($vi in $vsanIssues) { Write-DotLine $sel $vi.Status "$($vi.Item): $($vi.Value)" }
+        }
+        if ($dsRows) {
+            $dsHealthy = ($dsRows | Where-Object { $_.Status -eq 'Healthy' }).Count
+            Write-Para $sel "$($dsRows.Count) datastore(s) - $dsHealthy healthy"
+            $dsIssues = $dsRows | Where-Object { $_.Status -in 'Critical','Warning' }
+            foreach ($di in $dsIssues) { Write-DotLine $sel $di.Status "$($di.Object): $($di.Value)" }
+        }
+        if (-not $vsanRow -and -not $dsRows) { Write-Para $sel "No storage data collected." -Italic }
+
+        Write-Heading $sel "Virtual Machine Inventory" 3
+        $vmCountRow = $SiteFindings | Where-Object { $_.Area -eq 'VM Inventory' -and $_.Object -eq $ClusterName -and $_.Item -eq 'VM Count' } | Select-Object -First 1
+        if ($vmCountRow) { Write-Para $sel $vmCountRow.Value }
+        $osRows = $SiteFindings | Where-Object { $_.Area -eq 'VM Inventory' -and $_.Object -eq $ClusterName -and $_.Item -like 'Guest OS:*' } | Select-Object -First 6
+        if ($osRows) {
+            $osTableRows = @()
+            foreach ($o in $osRows) { $osTableRows += ,@(($o.Item -replace 'Guest OS: ',''), $o.Value) }
+            Add-Table $doc $sel @('Guest OS','Count') $osTableRows
+        }
+
+        $netRows = $SiteFindings | Where-Object { $_.Area -eq 'Networking' -and $_.Object -eq $ClusterName }
+        if ($netRows) {
+            Write-Heading $sel "Networking" 3
+            foreach ($n in $netRows) { Write-DotLine $sel $n.Status "$($n.Item): $($n.Value)" }
+        }
+
+        $secRows = $SiteFindings | Where-Object { $_.Area -eq 'Security & Compliance' -and $HostsHere -contains $_.Object }
+        if ($secRows) {
+            Write-Heading $sel "Security & Compliance" 3
+            $secStatus = Get-WorstStatus ($secRows | Select-Object -ExpandProperty Status)
+            Write-DotLine $sel $secStatus "Overall: $secStatus"
+            $secIssues = $secRows | Where-Object { $_.Status -in 'Critical','Warning' }
+            if ($secIssues) {
+                foreach ($si in $secIssues) { Write-Para $sel "$($si.Object) - $($si.Item): $($si.Value)" }
+            } else {
+                Write-Para $sel "No compliance issues found."
+            }
+        }
+
+        Write-Heading $sel "Issues and Alarms" 3
+        $alarmRows = $SiteFindings | Where-Object { $_.Area -eq 'Alarms' -and $_.Item -ne 'Triggered Alarms' -and ($_.Object -eq $ClusterName -or $HostsHere -contains $_.Object) }
+        if ($alarmRows) {
+            $alarmLines = $alarmRows | ForEach-Object { "$($_.Object) - $($_.Item) ($($_.Value))" }
+            Write-BulletList $sel $alarmLines -Red
+        } else {
+            Write-Para $sel "No active alarms."
+        }
+    }
+
+    Write-Heading $sel "Global Notes & Observations" 2
+    $keyIssues = $SiteFindings | Where-Object {
+        $_.Status -in 'Critical','Warning' -and (
+            $_.Item -like 'License:*' -or $_.Item -eq 'ESXi Version Consistency' -or
+            $_.Item -in 'vSphere HA','vSphere DRS' -or $_.Area -eq 'Alarms' -or
+            $_.Area -in 'Storage/vSAN','Storage/Datastore'
+        )
+    }
+    if ($keyIssues) {
+        foreach ($k in $keyIssues) { Write-DotLine $sel $k.Status "$($k.Object) - $($k.Item): $($k.Value)" }
+    } else {
+        Write-Para $sel "No short-term action items identified this run."
+    }
+
+    Write-Heading $sel "Conclusion" 2
+    $concl = if ($CritCount -gt 0) {
+        "The $SiteLabel VMware environment has $CritCount critical item(s) requiring prompt attention, alongside $WarnCount warning item(s). See Global Notes above."
+    } elseif ($WarnCount -gt 0) {
+        "The $SiteLabel VMware environment is stable with $WarnCount warning item(s) to track. No critical issues were identified during this automated check."
+    } else {
+        "The $SiteLabel VMware environment is stable and healthy. No critical or warning issues were identified during this automated check."
+    }
+    Write-Para $sel $concl
+    Write-Para $sel "Prepared By: VMware Weekly Health Check Automation" -Bold
+    Write-Para $sel "Report Date: $RunDate" -Bold
+
+    $siteFailures = $Global:FailureLog | Where-Object { $_.Site -eq $SiteLabel }
+    if ($siteFailures) {
+        Write-Para $sel "$($siteFailures.Count) item(s) could not be automatically verified this run - see the .log file for detail." -Italic -Gray
+    }
+
+    $safeLabel = ($SiteLabel -replace '[\\/\?\*\[\]:<>\|]', '_')
+    $DocxPath = Join-Path $OutputPath "$safeLabel`_VMware_HealthCheck_$RunDate.docx"
+    try {
+        # InvokeMember avoids the [ref]-parameter marshalling bug some PowerShell/.NET
+        # combinations hit on a direct $doc.SaveAs(...) call.
+        $null = $doc.GetType().InvokeMember('SaveAs', [System.Reflection.BindingFlags]::InvokeMethod, $null, $doc, @([string]$DocxPath, 16))
+        Write-Host "Report written: $DocxPath" -ForegroundColor Cyan
+    } catch {
+        Write-CheckLog -VCenter 'n/a' -Site $SiteLabel -Object 'DOCX export' -CheckName 'Word COM automation' -ErrorMessage $_.Exception.Message
+        Write-Warning "Could not save .docx for $SiteLabel : $($_.Exception.Message)"
+    }
+    # Close without prompting regardless of whether SaveAs succeeded (0 = wdDoNotSaveChanges) -
+    # avoids any invisible "save changes?" prompt hanging the run.
+    $null = $doc.GetType().InvokeMember('Close', [System.Reflection.BindingFlags]::InvokeMethod, $null, $doc, @(0))
+    [System.Runtime.Interopservices.Marshal]::ReleaseComObject($doc) | Out-Null
 }
 
 function Get-WorstStatus {
@@ -543,242 +790,28 @@ function Get-WorstStatus {
     return ($Statuses | Sort-Object { $order[$_] } -Descending | Select-Object -First 1)
 }
 
-$SiteReportStyle = @"
-<style>
-body { font-family: Segoe UI, Arial, sans-serif; margin: 30px; color:#1f2937; font-size:13.5px; }
-h1 { color:#1e3a5f; margin-bottom:2px; }
-.subtitle { color:#6b7280; margin-top:0; }
-h2 { color:#1e3a5f; border-bottom:2px solid #1e3a5f; padding-bottom:4px; margin-top:30px; font-size:17px; }
-h3 { color:#1e3a5f; margin-top:18px; font-size:14.5px; }
-table { border-collapse:collapse; width:100%; margin:8px 0 16px 0; }
-th, td { border:1px solid #d1d5db; padding:5px 9px; text-align:left; font-size:13px; }
-th { background:#1e3a5f; color:#fff; }
-tr:nth-child(even) { background:#f3f4f6; }
-.exec-box { background:#f3f4f6; border-radius:8px; padding:12px 16px; margin:10px 0 18px 0; }
-ul.notes { margin:6px 0; padding-left:20px; }
-ul.notes li { margin:3px 0; }
-.alarm { color:#dc2626; }
-.small-note { color:#6b7280; font-size:12px; margin-top:30px; }
-</style>
-"@
-
-function Build-SiteReportHtml {
-    param([string]$SiteLabel)
-
-    # Manual/External Required items are never surfaced in the report - they're only ever
-    # produced when an optional dependency (e.g. Connect-CisServer) wasn't connected this run.
-    $SiteFindings = $Global:AllResults | Where-Object { $_.Site -eq $SiteLabel -and $_.Status -ne 'Manual/External Required' }
-    if (-not $SiteFindings) { return $null }
-
-    $VCenterName  = $SiteFindings | Select-Object -First 1 -ExpandProperty VCenter
-    $ClusterNames = $SiteFindings | Where-Object { $_.Area -eq 'Cluster Configuration' } | Select-Object -ExpandProperty Object -Unique
-    $HostObjects  = $SiteFindings | Where-Object { $_.Area -eq 'ESXi Host Health' -and $_.Item -eq 'ESXi Version/Build' } | Select-Object -ExpandProperty Object -Unique
-
-    $CritCount = ($SiteFindings | Where-Object { $_.Status -eq 'Critical' }).Count
-    $WarnCount = ($SiteFindings | Where-Object { $_.Status -eq 'Warning' }).Count
-    $OverallHealth = if ($CritCount -gt 0) { 'Critical' } elseif ($WarnCount -gt 0) { 'Warning' } else { 'Healthy' }
-    $VcVersionItem = $SiteFindings | Where-Object { $_.Item -eq 'vCenter Version/Build' } | Select-Object -First 1
-
-    $sb = New-Object System.Text.StringBuilder
-    [void]$sb.Append("<!DOCTYPE html><html><head><meta charset='utf-8'><title>$SiteLabel vCenter &amp; ESXi Health Check Report</title>$SiteReportStyle</head><body>")
-    [void]$sb.Append("<h1>$SiteLabel vCenter &amp; ESXi Health Check Report</h1>")
-    [void]$sb.Append("<p class='subtitle'>Report Date: $RunDate</p>")
-
-    # ---- 1. Executive Summary ----
-    [void]$sb.Append("<h2>1. Executive Summary</h2><div class='exec-box'>")
-    [void]$sb.Append("<p><b>Environment:</b> 1 vCenter ($VCenterName) | $($ClusterNames.Count) Cluster(s)/Site(s) | $($HostObjects.Count) ESXi Host(s)</p>")
-    if ($VcVersionItem) { [void]$sb.Append("<p><b>vCenter Version:</b> $($VcVersionItem.Value)</p>") }
-    [void]$sb.Append("<p><b>Overall Environment Health:</b> $(Get-Dot $OverallHealth)</p>")
-    [void]$sb.Append("<p><b>High Risk Issue:</b> $(if ($CritCount -gt 0) {'YES'} else {'NO'})</p>")
-    [void]$sb.Append("</div>")
-
-    # ---- 2. vCenter Server Health ----
-    [void]$sb.Append("<h2>2. vCenter Server Health</h2><table><tr><th>Item</th><th>Status</th></tr>")
-    $ApplianceRows = $SiteFindings | Where-Object { $_.Area -in 'vCenter Overview','vCenter Appliance' -and $_.Item -ne 'vCenter Version/Build' }
-    foreach ($r in $ApplianceRows) {
-        [void]$sb.Append("<tr><td>$($r.Item)</td><td>$(Get-Dot $r.Status) $($r.Value)</td></tr>")
-    }
-    if (-not $ApplianceRows) { [void]$sb.Append("<tr><td colspan='2'><em>No appliance-level data collected this run.</em></td></tr>") }
-    [void]$sb.Append("</table>")
-
-    # ---- 3. Per-Cluster Sections (naturally becomes 4 sections for AMC, 1 for SF/TB) ----
-    $clusterIdx = 2
-    foreach ($ClusterName in $ClusterNames) {
-        $clusterIdx++
-        [void]$sb.Append("<h2>$clusterIdx. $ClusterName</h2>")
-
-        $HostsHere = $HostObjects | Where-Object { $Global:ObjectClusterMap[$_] -eq $ClusterName }
-
-        [void]$sb.Append("<h3>ESXi Host Versions</h3><table><tr><th>Host</th><th>ESXi Version/Build</th><th>Status</th><th>Notes</th></tr>")
-        foreach ($h in $HostsHere) {
-            $verItem  = $SiteFindings | Where-Object { $_.Object -eq $h -and $_.Item -eq 'ESXi Version/Build' } | Select-Object -First 1
-            $hostRows = $SiteFindings | Where-Object { $_.Object -eq $h }
-            $hostStatus = Get-WorstStatus ($hostRows | Select-Object -ExpandProperty Status)
-            $hostIssues = $hostRows | Where-Object { $_.Status -in 'Critical','Warning' } | Select-Object -First 2
-            $notes = ($hostIssues | ForEach-Object { "$($_.Item): $($_.Value)" }) -join '; '
-            [void]$sb.Append("<tr><td>$h</td><td>$($verItem.Value)</td><td>$(Get-Dot $hostStatus)</td><td>$notes</td></tr>")
-        }
-        [void]$sb.Append("</table>")
-
-        [void]$sb.Append("<h3>CPU &amp; Memory Capacity</h3><table><tr><th>Metric</th><th>Value</th><th>Status</th></tr>")
-        $capRows = $SiteFindings | Where-Object { $_.Area -eq 'CPU/Memory Capacity' -and $_.Object -eq $ClusterName }
-        foreach ($r in $capRows) { [void]$sb.Append("<tr><td>$($r.Item)</td><td>$($r.Value)</td><td>$(Get-Dot $r.Status)</td></tr>") }
-        if (-not $capRows) { [void]$sb.Append("<tr><td colspan='3'><em>No capacity data collected.</em></td></tr>") }
-        [void]$sb.Append("</table>")
-
-        [void]$sb.Append("<h3>Storage</h3>")
-        $vsanRow = $SiteFindings | Where-Object { $_.Area -eq 'Storage/vSAN' -and $_.Object -eq $ClusterName -and $_.Item -like 'vSAN Capacity*' } | Select-Object -First 1
-        if ($vsanRow) {
-            [void]$sb.Append("<p>$(Get-Dot $vsanRow.Status) vSAN - $($vsanRow.Value)</p>")
-            $vsanIssues = $SiteFindings | Where-Object { $_.Area -eq 'Storage/vSAN' -and $_.Object -eq $ClusterName -and $_.Item -like 'vSAN Health:*' -and $_.Status -in 'Critical','Warning' }
-            if ($vsanIssues) {
-                [void]$sb.Append("<ul class='notes'>")
-                foreach ($vi in $vsanIssues) { [void]$sb.Append("<li>$(Get-Dot $vi.Status) $($vi.Item): $($vi.Value)</li>") }
-                [void]$sb.Append("</ul>")
-            }
-        }
-        $dsRows = $SiteFindings | Where-Object { $_.Area -eq 'Storage/Datastore' -and $Global:ObjectClusterMap[$_.Object] -eq $ClusterName }
-        if ($dsRows) {
-            $dsHealthy = ($dsRows | Where-Object { $_.Status -eq 'Healthy' }).Count
-            [void]$sb.Append("<p>$($dsRows.Count) datastore(s) - $dsHealthy healthy</p>")
-            $dsIssues = $dsRows | Where-Object { $_.Status -in 'Critical','Warning' }
-            if ($dsIssues) {
-                [void]$sb.Append("<ul class='notes'>")
-                foreach ($di in $dsIssues) { [void]$sb.Append("<li>$(Get-Dot $di.Status) $($di.Object): $($di.Value)</li>") }
-                [void]$sb.Append("</ul>")
-            }
-        }
-        if (-not $vsanRow -and -not $dsRows) { [void]$sb.Append("<p><em>No storage data collected.</em></p>") }
-
-        [void]$sb.Append("<h3>Virtual Machine Inventory</h3>")
-        $vmCountRow = $SiteFindings | Where-Object { $_.Area -eq 'VM Inventory' -and $_.Object -eq $ClusterName -and $_.Item -eq 'VM Count' } | Select-Object -First 1
-        if ($vmCountRow) { [void]$sb.Append("<p>$($vmCountRow.Value)</p>") }
-        $osRows = $SiteFindings | Where-Object { $_.Area -eq 'VM Inventory' -and $_.Object -eq $ClusterName -and $_.Item -like 'Guest OS:*' } | Select-Object -First 6
-        if ($osRows) {
-            [void]$sb.Append("<table><tr><th>Guest OS</th><th>Count</th></tr>")
-            foreach ($o in $osRows) { [void]$sb.Append("<tr><td>$($o.Item -replace 'Guest OS: ','')</td><td>$($o.Value)</td></tr>") }
-            [void]$sb.Append("</table>")
-        }
-
-        $netRows = $SiteFindings | Where-Object { $_.Area -eq 'Networking' -and $_.Object -eq $ClusterName }
-        if ($netRows) {
-            [void]$sb.Append("<h3>Networking</h3><ul class='notes'>")
-            foreach ($n in $netRows) { [void]$sb.Append("<li>$(Get-Dot $n.Status) $($n.Item): $($n.Value)</li>") }
-            [void]$sb.Append("</ul>")
-        }
-
-        $secRows = $SiteFindings | Where-Object { $_.Area -eq 'Security & Compliance' -and $HostsHere -contains $_.Object }
-        if ($secRows) {
-            $secStatus = Get-WorstStatus ($secRows | Select-Object -ExpandProperty Status)
-            [void]$sb.Append("<h3>Security &amp; Compliance</h3><p>$(Get-Dot $secStatus)</p>")
-            $secIssues = $secRows | Where-Object { $_.Status -in 'Critical','Warning' }
-            if ($secIssues) {
-                [void]$sb.Append("<ul class='notes'>")
-                foreach ($si in $secIssues) { [void]$sb.Append("<li>$($si.Object) - $($si.Item): $($si.Value)</li>") }
-                [void]$sb.Append("</ul>")
-            } else {
-                [void]$sb.Append("<p>No compliance issues found.</p>")
-            }
-        }
-
-        [void]$sb.Append("<h3>Issues and Alarms</h3>")
-        $alarmRows = $SiteFindings | Where-Object { $_.Area -eq 'Alarms' -and $_.Item -ne 'Triggered Alarms' -and ($_.Object -eq $ClusterName -or $HostsHere -contains $_.Object) }
-        if ($alarmRows) {
-            [void]$sb.Append("<ul class='notes'>")
-            foreach ($a in $alarmRows) { [void]$sb.Append("<li class='alarm'>$($a.Object) - $($a.Item) ($($a.Value))</li>") }
-            [void]$sb.Append("</ul>")
-        } else {
-            [void]$sb.Append("<p>No active alarms.</p>")
-        }
-    }
-
-    # ---- Global Notes & Observations (short, prioritized - not every finding) ----
-    [void]$sb.Append("<h2>Global Notes &amp; Observations</h2>")
-    $keyIssues = $SiteFindings | Where-Object {
-        $_.Status -in 'Critical','Warning' -and (
-            $_.Item -like 'License:*' -or $_.Item -eq 'ESXi Version Consistency' -or
-            $_.Item -in 'vSphere HA','vSphere DRS' -or $_.Area -eq 'Alarms' -or
-            $_.Area -in 'Storage/vSAN','Storage/Datastore'
-        )
-    }
-    if ($keyIssues) {
-        [void]$sb.Append("<ul class='notes'>")
-        foreach ($k in $keyIssues) { [void]$sb.Append("<li>$(Get-Dot $k.Status) $($k.Object) - $($k.Item): $($k.Value)</li>") }
-        [void]$sb.Append("</ul>")
-    } else {
-        [void]$sb.Append("<p>No short-term action items identified this run.</p>")
-    }
-
-    # ---- Conclusion ----
-    [void]$sb.Append("<h2>Conclusion</h2>")
-    $concl = if ($CritCount -gt 0) {
-        "The $SiteLabel VMware environment has $CritCount critical item(s) requiring prompt attention, alongside $WarnCount warning item(s). See Global Notes above."
-    } elseif ($WarnCount -gt 0) {
-        "The $SiteLabel VMware environment is stable with $WarnCount warning item(s) to track. No critical issues were identified during this automated check."
-    } else {
-        "The $SiteLabel VMware environment is stable and healthy. No critical or warning issues were identified during this automated check."
-    }
-    [void]$sb.Append("<p>$concl</p>")
-    [void]$sb.Append("<p><b>Prepared By:</b> VMware Weekly Health Check Automation</p><p><b>Report Date:</b> $RunDate</p>")
-
-    $siteFailures = $Global:FailureLog | Where-Object { $_.Site -eq $SiteLabel }
-    if ($siteFailures) {
-        [void]$sb.Append("<p class='small-note'>$($siteFailures.Count) item(s) could not be automatically verified this run - see VMware_Weekly_HealthCheck_$RunDate.log for detail.</p>")
-    }
-
-    [void]$sb.Append("</body></html>")
-    return $sb.ToString()
-}
-
 # ============================================================================
-# 4. OUTPUT: ONE DOCX PER SITE
-#    Each site's HTML is a scratch/intermediate file only, deleted after conversion -
-#    the deliverable per site is a single Word document.
+# 4. OUTPUT: ONE DOCX PER SITE - built natively, no HTML step
 # ============================================================================
 $SiteLabels = $Global:AllResults | Select-Object -ExpandProperty Site -Unique
 $WordAvailable = $true
 try {
-    $word = New-Object -ComObject Word.Application
-    $word.Visible = $false
+    $Word = New-Object -ComObject Word.Application
+    $Word.Visible = $false
 } catch {
     $WordAvailable = $false
     Write-CheckLog -VCenter 'n/a' -Site 'n/a' -Object 'DOCX export' -CheckName 'Word COM automation' -ErrorMessage $_.Exception.Message
-    Write-Warning "Microsoft Word is not available on this machine - cannot generate .docx reports. Scratch HTML reports will be left in $env:TEMP instead."
-}
-
-foreach ($SiteLabel in $SiteLabels) {
-    $SiteHtml = Build-SiteReportHtml -SiteLabel $SiteLabel
-    if (-not $SiteHtml) { continue }
-
-    $safeLabel = ($SiteLabel -replace '[\\/\?\*\[\]:<>\|]', '_')
-    $HtmlPath  = Join-Path $env:TEMP "VMware_HealthCheck_$safeLabel`_scratch_$RunDate`_$PID.html"
-    $SiteHtml | Out-File -FilePath $HtmlPath -Encoding UTF8
-
-    $DocxPath = Join-Path $OutputPath "$safeLabel`_VMware_HealthCheck_$RunDate.docx"
-    if ($WordAvailable) {
-        try {
-            $doc = $word.Documents.Open((Resolve-Path $HtmlPath).Path)
-            # SaveAs called via InvokeMember rather than a direct method call - PowerShell's COM
-            # late-binding can fail to marshal SaveAs's [ref] parameters ("Cannot convert ... psobject
-            # to Object") on some PowerShell/.NET combinations. InvokeMember avoids that entirely.
-            $null = $doc.GetType().InvokeMember('SaveAs', [System.Reflection.BindingFlags]::InvokeMethod, $null, $doc, @([string]$DocxPath, 17))
-            $doc.Close()
-            [System.Runtime.Interopservices.Marshal]::ReleaseComObject($doc) | Out-Null
-            Remove-Item $HtmlPath -Force -ErrorAction SilentlyContinue
-            Write-Host "Report written: $DocxPath" -ForegroundColor Cyan
-        } catch {
-            Write-CheckLog -VCenter 'n/a' -Site $SiteLabel -Object 'DOCX export' -CheckName 'Word COM automation' -ErrorMessage $_.Exception.Message
-            Write-Warning "Could not generate .docx for $SiteLabel - scratch HTML left at $HtmlPath"
-        }
-    }
+    Write-Warning "Microsoft Word is not available on this machine - cannot generate .docx reports."
 }
 
 if ($WordAvailable) {
-    $word.Quit()
-    [System.Runtime.Interopservices.Marshal]::ReleaseComObject($word) | Out-Null
+    foreach ($SiteLabel in $SiteLabels) {
+        Write-SiteReportDocx -Word $Word -SiteLabel $SiteLabel -OutputPath $OutputPath -RunDate $RunDate
+    }
+    $Word.Quit()
+    [System.Runtime.Interopservices.Marshal]::ReleaseComObject($Word) | Out-Null
 }
 
-# ============================================================================
 # 5. OUTPUT: LOG FILE (written last so it also captures any DOCX export failures)
 # ============================================================================
 $LogPath = Join-Path $OutputPath "VMware_Weekly_HealthCheck_$RunDate.log"
