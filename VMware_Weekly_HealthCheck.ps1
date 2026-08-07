@@ -758,7 +758,10 @@ foreach ($SiteLabel in $SiteLabels) {
     if ($WordAvailable) {
         try {
             $doc = $word.Documents.Open((Resolve-Path $HtmlPath).Path)
-            $doc.SaveAs([ref]$DocxPath, [ref]17)   # 17 = wdFormatDocumentDefault (.docx)
+            # SaveAs called via InvokeMember rather than a direct method call - PowerShell's COM
+            # late-binding can fail to marshal SaveAs's [ref] parameters ("Cannot convert ... psobject
+            # to Object") on some PowerShell/.NET combinations. InvokeMember avoids that entirely.
+            $null = $doc.GetType().InvokeMember('SaveAs', [System.Reflection.BindingFlags]::InvokeMethod, $null, $doc, @([string]$DocxPath, 17))
             $doc.Close()
             [System.Runtime.Interopservices.Marshal]::ReleaseComObject($doc) | Out-Null
             Remove-Item $HtmlPath -Force -ErrorAction SilentlyContinue
