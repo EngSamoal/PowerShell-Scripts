@@ -304,39 +304,70 @@ foreach ($VC in $Connections) {
     # --- vCenter appliance CPU/Mem/Disk/Services/NTP/Certificate (VAMI/CIS) ------------------
     $CisSession = $global:DefaultCisServers | Where-Object { $_.Name -eq $VCName -and $_.IsConnected }
     if ($CisSession) {
+        # Each item below has its OWN try/catch that always produces a finding, even on failure -
+        # rather than one failed VAMI call silently dropping that item (or, worse, all of them)
+        # from section 3.1 entirely. VAMI/appliance-level APIs commonly need broader permissions
+        # than the regular vSphere inventory API the rest of this report runs on (e.g. a plain
+        # vCenter admin account can be "unauthorized" here even though it can read every host/VM
+        # fine) - a real permission gap shows up as 'Unable to Check' with the actual server error
+        # message, not as a blank/missing row.
         Invoke-SafeCheck -CheckName 'Appliance health (VAMI)' -VCenter $VCName -Site $Site -ObjectName $VCName -Script {
             foreach ($comp in 'cpu','mem','storage') {
-                $svc = Get-CisService -Name "com.vmware.appliance.health.$comp" -Server $CisSession
-                $val = $svc.get()
                 $label = @{ cpu = 'CPU'; mem = 'Memory'; storage = 'Disk Usage' }[$comp]
-                New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName `
-                    -Item $label -Value $(if ($val -eq 'green') { 'Normal' } else { $val }) -Status $(if ($val -eq 'green') {'Healthy'} else {'Warning'})
+                try {
+                    $svc = Get-CisService -Name "com.vmware.appliance.health.$comp" -Server $CisSession
+                    $val = $svc.get()
+                    New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName `
+                        -Item $label -Value $(if ($val -eq 'green') { 'Normal' } else { $val }) -Status $(if ($val -eq 'green') {'Healthy'} else {'Warning'})
+                } catch {
+                    New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item $label `
+                        -Value 'n/a' -Status 'Unable to Check' -Notes "VAMI call failed: $($_.Exception.Message)"
+                }
             }
         }
         Invoke-SafeCheck -CheckName 'Appliance services (VAMI)' -VCenter $VCName -Site $Site -ObjectName $VCName -Script {
-            $svcListSvc = Get-CisService -Name 'com.vmware.appliance.services' -Server $CisSession
-            $services = $svcListSvc.list()
-            $notRunning = $services.GetEnumerator() | Where-Object { $_.Value.state -ne 'STARTED' }
-            New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item 'Services' `
-                -Value $(if ($notRunning) { ($notRunning | ForEach-Object { "$($_.Key): $($_.Value.state)" }) -join '; ' } else { 'All Running' }) `
-                -Status $(if ($notRunning) { 'Warning' } else { 'Healthy' })
+            try {
+                $svcListSvc = Get-CisService -Name 'com.vmware.appliance.services' -Server $CisSession
+                $services = $svcListSvc.list()
+                $notRunning = $services.GetEnumerator() | Where-Object { $_.Value.state -ne 'STARTED' }
+                New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item 'Services' `
+                    -Value $(if ($notRunning) { ($notRunning | ForEach-Object { "$($_.Key): $($_.Value.state)" }) -join '; ' } else { 'All Running' }) `
+                    -Status $(if ($notRunning) { 'Warning' } else { 'Healthy' })
+            } catch {
+                New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item 'Services' `
+                    -Value 'n/a' -Status 'Unable to Check' -Notes "VAMI call failed: $($_.Exception.Message)"
+            }
         }
         Invoke-SafeCheck -CheckName 'Appliance NTP (VAMI)' -VCenter $VCName -Site $Site -ObjectName $VCName -Script {
-            $ntpSvc = Get-CisService -Name 'com.vmware.appliance.ntp' -Server $CisSession
-            $ntpStatus = $ntpSvc.test()
-            $synced = ($ntpStatus | Out-String) -match 'Server .* is reachable and clock is synchronized|success'
-            New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item 'NTP' `
-                -Value $(if ($synced) { 'Configured & Synchronized' } else { ($ntpStatus | Out-String).Trim() }) `
-                -Status $(if ($synced) { 'Healthy' } else { 'Warning' })
+            try {
+                # .get() (read-only, no required arguments) rather than .test(), which on some
+                # vCenter versions requires an explicit list of servers to test - calling it with
+                # none throws "missing a field 'servers'" instead of testing the configured ones.
+                $ntpSvc = Get-CisService -Name 'com.vmware.appliance.ntp' -Server $CisSession
+                $ntpConfig = $ntpSvc.get()
+                $servers = @($ntpConfig.servers)
+                $configured = $servers.Count -gt 0
+                New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item 'NTP' `
+                    -Value $(if ($configured) { "Servers: $($servers -join ', ') (mode: $($ntpConfig.mode))" } else { "No NTP servers configured (mode: $($ntpConfig.mode))" }) `
+                    -Status $(if ($configured) { 'Healthy' } else { 'Warning' })
+            } catch {
+                New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item 'NTP' `
+                    -Value 'n/a' -Status 'Unable to Check' -Notes "VAMI call failed: $($_.Exception.Message)"
+            }
         }
         Invoke-SafeCheck -CheckName 'Appliance certificate (VAMI)' -VCenter $VCName -Site $Site -ObjectName $VCName -Script {
-            $certSvc = Get-CisService -Name 'com.vmware.appliance.certificate_management.vcenter.tls' -Server $CisSession
-            $cert = $certSvc.get()
-            $expDate = [datetime]$cert.valid_to
-            $daysLeft = ($expDate - (Get-Date)).Days
-            $status = if ($daysLeft -le 0) { 'Critical' } elseif ($daysLeft -le $CertExpiryWarningDays) { 'Warning' } else { 'Healthy' }
-            New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item 'Certificates' `
-                -Value "Valid - until ($($expDate.ToString('MMM d, yyyy')))" -Status $status
+            try {
+                $certSvc = Get-CisService -Name 'com.vmware.appliance.certificate_management.vcenter.tls' -Server $CisSession
+                $cert = $certSvc.get()
+                $expDate = [datetime]$cert.valid_to
+                $daysLeft = ($expDate - (Get-Date)).Days
+                $status = if ($daysLeft -le 0) { 'Critical' } elseif ($daysLeft -le $CertExpiryWarningDays) { 'Warning' } else { 'Healthy' }
+                New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item 'Certificates' `
+                    -Value "Valid - until ($($expDate.ToString('MMM d, yyyy')))" -Status $status
+            } catch {
+                New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item 'Certificates' `
+                    -Value 'n/a' -Status 'Unable to Check' -Notes "VAMI call failed: $($_.Exception.Message)"
+            }
         }
     } else {
         foreach ($item in 'CPU','Memory','Disk Usage','Services','NTP','Certificates') {
