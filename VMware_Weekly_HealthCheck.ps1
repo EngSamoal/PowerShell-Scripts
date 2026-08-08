@@ -222,9 +222,16 @@ foreach ($VC in $Connections) {
                 $expDate = [datetime]$expProp.Value
                 $expStr  = $expDate.ToString('yyyy-MM-dd')
                 $daysLeft = ($expDate - (Get-Date)).Days
-                if ($daysLeft -le 0) { $status = 'Critical' }
-                elseif ($daysLeft -le $LicenseExpiryWarningDays) { $status = 'Warning' }
-                else { $status = 'Healthy' }
+                # Only treat expiry as an operational risk if the license key is actually in use
+                # (Used > 0). vCenter License Manager commonly retains old/replaced keys with
+                # Used=0 - flagging those as Critical would be a false alarm, not a real finding.
+                if ($lic.Used -gt 0) {
+                    if ($daysLeft -le 0) { $status = 'Critical' }
+                    elseif ($daysLeft -le $LicenseExpiryWarningDays) { $status = 'Warning' }
+                    else { $status = 'Healthy' }
+                } else {
+                    $status = 'Information'
+                }
             }
             New-Finding -Site $Site -VCenter $VCName -Area 'Overview' -Object $VCName `
                 -Item "License: $($lic.Name)" -Value "Used $($lic.Used)/$($lic.Total) - Expires $expStr" -Status $status
@@ -409,8 +416,8 @@ foreach ($VC in $Connections) {
 
             # Physical NICs / redundancy
             Invoke-SafeCheck -CheckName 'Physical NICs' -VCenter $VCName -Site $Site -ObjectName $HName -Script {
-                $pnics = Get-VMHostNetworkAdapter -Server $VC -VMHost $VMHost -Physical
-                $up = $pnics | Where-Object { $_.BitRatePerSec -gt 0 }
+                $pnics = @(Get-VMHostNetworkAdapter -Server $VC -VMHost $VMHost -Physical)
+                $up = @($pnics | Where-Object { $_.BitRatePerSec -gt 0 })
                 New-Finding -Site $Site -VCenter $VCName -Area 'Networking' -Cluster $ClusterName -Object $HName `
                     -Item 'Physical NIC Redundancy' -Value "$($pnics.Count) total, $($up.Count) linked up" `
                     -Status $(if ($pnics.Count -ge 2 -and $up.Count -ge 2) {'Healthy'} else {'Warning'})
@@ -428,7 +435,7 @@ foreach ($VC in $Connections) {
         } # end per-host
 
         # ESXi version consistency across the cluster
-        $DistinctVersions = $HostVersions | Select-Object -Unique
+        $DistinctVersions = @($HostVersions | Select-Object -Unique)
         New-Finding -Site $Site -VCenter $VCName -Area 'Host' -Cluster $ClusterName -Object $ClusterName `
             -Item 'Version Consistency' -Value ($DistinctVersions -join ' | ') -Status $(if ($DistinctVersions.Count -le 1) {'Healthy'} else {'Warning'})
 
@@ -489,10 +496,15 @@ foreach ($VC in $Connections) {
 
         # VM inventory / guest OS distribution
         Invoke-SafeCheck -CheckName 'VM inventory' -VCenter $VCName -Site $Site -ObjectName $ClusterName -Script {
-            $vms = Get-VM -Server $VC -Location $Cluster
+            $vms = @(Get-VM -Server $VC -Location $Cluster)
             New-Finding -Site $Site -VCenter $VCName -Area 'VM' -Cluster $ClusterName -Object $ClusterName `
                 -Item 'VM Count' -Value $vms.Count -Status 'Information'
-            $osDist = $vms | Group-Object { if ($_.Guest.OSFullName) { $_.Guest.OSFullName } else { $_.ExtensionData.Config.GuestFullName } }
+            # Config.GuestFullName (the "Guest OS" type configured on the VM) is what vCenter's own
+            # UI displays and what a human cross-checking the inventory will see - preferred over
+            # Guest.OSFullName (the live value VMware Tools currently reports), which can disagree
+            # with the configured type when a VM's guest OS was upgraded in place without updating
+            # its VM settings, or when Tools is outdated/stopped.
+            $osDist = $vms | Group-Object { if ($_.ExtensionData.Config.GuestFullName) { $_.ExtensionData.Config.GuestFullName } else { $_.Guest.OSFullName } }
             foreach ($g in $osDist) {
                 New-Finding -Site $Site -VCenter $VCName -Area 'VM' -Cluster $ClusterName -Object $g.Name `
                     -Item 'Guest OS' -Value $g.Count -Status 'Information'
@@ -507,11 +519,25 @@ foreach ($VC in $Connections) {
                     -Item 'vDS' -Value $vds.Mtu -Status 'Information'
                 $pgs = Get-VDPortgroup -Server $VC -VDSwitch $vds
                 foreach ($pg in $pgs) {
-                    $vlan = $pg.ExtensionData.Config.DefaultPortConfig.Vlan.VlanId
+                    # Regular port groups expose .VlanId as a plain int. Private VLAN port groups
+                    # use a different config type with .PvlanId instead, and trunk port groups
+                    # expose a range array - without handling those, their VLAN silently reads as
+                    # $null and drops out of the distinct-VLAN count below.
+                    $vlanCfg = $pg.ExtensionData.Config.DefaultPortConfig.Vlan
+                    $vlan = if ($null -ne $vlanCfg.VlanId -and $vlanCfg.VlanId -is [int]) { $vlanCfg.VlanId }
+                        elseif ($vlanCfg.PvlanId) { "PVLAN $($vlanCfg.PvlanId)" }
+                        elseif ($vlanCfg.VlanId) { ($vlanCfg.VlanId | ForEach-Object { "$($_.Start)-$($_.End)" }) -join ',' }
+                        else { $null }
                     $teaming = $pg.ExtensionData.Config.DefaultPortConfig.UplinkTeamingPolicy.Policy.Value
                     New-Finding -Site $Site -VCenter $VCName -Area 'Networking' -Cluster $ClusterName -Object $pg.Name `
                         -Item 'Port Group' -Value "$vlan|$teaming" -Status 'Information'
                 }
+            }
+            $distinctMtu = @($vdSwitches | Select-Object -ExpandProperty Mtu -Unique)
+            if ($distinctMtu.Count -gt 1) {
+                New-Finding -Site $Site -VCenter $VCName -Area 'Networking' -Cluster $ClusterName -Object $ClusterName `
+                    -Item 'MTU Consistency' -Value ($distinctMtu -join ' vs ') -Status 'Warning' `
+                    -Notes 'Distributed switches in this cluster are not configured with matching MTU - verify this is intentional.'
             }
         }
 
@@ -683,9 +709,12 @@ function Write-SiteReportDocx {
     $VCenterName  = $SiteFindings | Select-Object -First 1 -ExpandProperty VCenter
     $ClusterNames = if ($Global:SiteClusterMap.ContainsKey($SiteLabel)) { $Global:SiteClusterMap[$SiteLabel] } else { @() }
 
-    $CritCount   = ($SiteFindings | Where-Object { $_.Status -eq 'Critical' }).Count
-    $WarnCount   = ($SiteFindings | Where-Object { $_.Status -eq 'Warning' }).Count
-    $UnableCount = ($SiteFindings | Where-Object { $_.Status -in 'Unable to Check','Manual/External Required' }).Count
+    # @(...) forces array context so .Count is always reliable, including when exactly one
+    # finding matches - without it, a single-match pipeline result can report Count as $null
+    # instead of 1, silently blanking the number and mis-tallying the overall health status.
+    $CritCount   = @($SiteFindings | Where-Object { $_.Status -eq 'Critical' }).Count
+    $WarnCount   = @($SiteFindings | Where-Object { $_.Status -eq 'Warning' }).Count
+    $UnableCount = @($SiteFindings | Where-Object { $_.Status -in 'Unable to Check','Manual/External Required' }).Count
     $OverallHealth = if ($CritCount -gt 0) { 'Critical' } elseif ($WarnCount -gt 0) { 'Warning' } else { 'Healthy' }
     $OverallLabel  = if ($OverallHealth -eq 'Healthy') { 'Healthy - No Issues Detected' } elseif ($OverallHealth -eq 'Warning') { 'Healthy - Minor Issues Detected' } else { 'Attention Required - Critical Issues Detected' }
 
@@ -709,8 +738,8 @@ function Write-SiteReportDocx {
 
     $VdsFindings = $SiteFindings | Where-Object { $_.Item -eq 'vDS' }
     $PgFindings  = $SiteFindings | Where-Object { $_.Item -eq 'Port Group' }
-    $VdsCount = ($VdsFindings | Select-Object -ExpandProperty Object -Unique).Count
-    $VlanCount = ($PgFindings | ForEach-Object { ($_.Value -split '\|')[0] } | Where-Object { $_ } | Select-Object -Unique).Count
+    $VdsCount = @($VdsFindings | Select-Object -ExpandProperty Object -Unique).Count
+    $VlanCount = @($PgFindings | ForEach-Object { ($_.Value -split '\|')[0] } | Where-Object { $_ } | Select-Object -Unique).Count
 
     $doc = $Word.Documents.Add()
     $sel = $Word.Selection
@@ -817,8 +846,9 @@ function Write-SiteReportDocx {
     Write-Heading $sel "5.2 Network Configuration Status" 3
     $nicRedundancy = $SiteFindings | Where-Object { $_.Item -eq 'Physical NIC Redundancy' }
     $nicErrors = $SiteFindings | Where-Object { $_.Item -eq 'NIC Errors/Drops' }
-    $teamingVals = ($PgFindings | ForEach-Object { ($_.Value -split '\|')[1] } | Where-Object { $_ } | Select-Object -Unique)
-    $mtuVals = ($VdsFindings | Select-Object -ExpandProperty Value -Unique)
+    $teamingVals = @($PgFindings | ForEach-Object { ($_.Value -split '\|')[1] } | Where-Object { $_ } | Select-Object -Unique)
+    $mtuVals = @($VdsFindings | Select-Object -ExpandProperty Value -Unique)
+    $mtuConsistent = $mtuVals.Count -le 1
 
     $redundancyOk = -not ($nicRedundancy | Where-Object { $_.Status -ne 'Healthy' })
     Write-Bullet $sel "Redundant physical NICs configured on all hosts$(if (-not $redundancyOk) { ' - EXCEPTIONS FOUND, see log' })"
@@ -826,9 +856,14 @@ function Write-SiteReportDocx {
     Write-Bullet $sel "NIC teaming and failover configured correctly$(if ($teamingVals) { " ($($teamingVals -join ', '))" })"
     $errorsOk = -not ($nicErrors | Where-Object { $_.Status -ne 'Healthy' })
     Write-Bullet $sel $(if ($errorsOk) { "No NIC errors or packet drops observed" } else { "NIC errors or packet drops observed - see log for affected hosts" })
-    Write-Bullet $sel "MTU $(if ($mtuVals.Count -eq 1) { $mtuVals[0] } else { $mtuVals -join '/' }) configured consistently across hosts and switches"
+    if ($mtuConsistent) {
+        Write-Bullet $sel "MTU $(if ($mtuVals.Count -eq 1) { $mtuVals[0] } else { 'n/a' }) configured consistently across hosts and switches"
+    } else {
+        Write-Bullet $sel "MTU is NOT consistent across switches ($($mtuVals -join ' vs ')) - review vDS MTU settings"
+    }
 
-    $netWorst = Get-WorstStatus (@($nicRedundancy; $nicErrors) | Select-Object -ExpandProperty Status)
+    $mtuStatus = if ($mtuConsistent) { 'Healthy' } else { 'Warning' }
+    $netWorst = Get-WorstStatus (@(@($nicRedundancy; $nicErrors) | Select-Object -ExpandProperty Status) + @($mtuStatus))
     Write-StatusLine $sel "Status: " $netWorst
 
     # ---------------- 6. Performance & Capacity Summary ----------------
