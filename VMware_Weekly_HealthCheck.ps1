@@ -905,20 +905,26 @@ function Write-SiteReportDocx {
     # ---------------- 3. vCenter Server Health ----------------
     Write-Heading $sel "3. vCenter Server Health" 2
     Write-Heading $sel "3.1 Appliance Health" 3
+    # Built as separate Rows/Statuses arrays (rather than piping a 3-column row through
+    # ForEach-Object to drop the Status column at the call site) because that transform
+    # silently flattened down to a bare 2-element array whenever exactly one appliance item
+    # was collected - Add-Table's row/column indexing then read individual CHARACTERS of the
+    # two strings instead of the two strings themselves (e.g. "Backup" rendered as "B" / "a").
     $applianceRows = @()
+    $applianceStatuses = @()
     foreach ($item in 'CPU','Memory','Disk Usage','Services','NTP') {
         $f = $SiteFindings | Where-Object { $_.Area -eq 'Appliance' -and $_.Item -eq $item } | Select-Object -First 1
-        if ($f) { $applianceRows += ,@($item, $f.Value, $f.Status) }
+        if ($f) { $applianceRows += ,@($item, $f.Value); $applianceStatuses += $f.Status }
     }
     if ($BackupInfo.ContainsKey($SiteLabel)) {
-        $applianceRows += ,@('Backup', $BackupInfo[$SiteLabel].DeviceLabel, 'Healthy')
+        $applianceRows += ,@('Backup', $BackupInfo[$SiteLabel].DeviceLabel); $applianceStatuses += 'Healthy'
     } else {
-        $applianceRows += ,@('Backup', 'Not supplied (-BackupInfo)', 'Manual/External Required')
+        $applianceRows += ,@('Backup', 'Not supplied (-BackupInfo)'); $applianceStatuses += 'Manual/External Required'
     }
     $certF = $SiteFindings | Where-Object { $_.Area -eq 'Appliance' -and $_.Item -eq 'Certificates' } | Select-Object -First 1
-    if ($certF) { $applianceRows += ,@('Certificates', $certF.Value, $certF.Status) }
-    Add-Table $doc $sel @('Item','Status') ($applianceRows | ForEach-Object { ,@($_[0], $_[1]) })
-    $applianceWorst = Get-WorstStatus ($applianceRows | ForEach-Object { $_[2] })
+    if ($certF) { $applianceRows += ,@('Certificates', $certF.Value); $applianceStatuses += $certF.Status }
+    Add-Table $doc $sel @('Item','Status') $applianceRows
+    $applianceWorst = Get-WorstStatus $applianceStatuses
     $applianceText = if ($applianceWorst -eq 'Healthy') { "vCenter Server appliance is healthy with no warnings or operational concerns." } else { "vCenter Server appliance has item(s) requiring attention - see table above." }
     Write-Para $sel "Status: $applianceText" -Bold
 
