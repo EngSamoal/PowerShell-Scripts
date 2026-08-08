@@ -528,7 +528,11 @@ foreach ($VC in $Connections) {
             foreach ($vds in $vdSwitches) {
                 New-Finding -Site $Site -VCenter $VCName -Area 'Networking' -Cluster $ClusterName -Object $vds.Name `
                     -Item 'vDS' -Value $vds.Mtu -Status 'Information'
-                $pgs = Get-VDPortgroup -Server $VC -VDSwitch $vds
+                # Excludes the auto-generated uplink port group every vDS gets (e.g. "...-DVUplinks-...").
+                # It's switch infrastructure carrying a full VLAN trunk range for the physical NICs,
+                # not an application/server VLAN - counting it as one inflated the VLAN total. Filtered
+                # by the actual IsUplink flag, not by name pattern, so this can't miss a renamed one.
+                $pgs = Get-VDPortgroup -Server $VC -VDSwitch $vds | Where-Object { -not $_.IsUplink }
                 foreach ($pg in $pgs) {
                     # Regular port groups expose .VlanId as a plain int. Private VLAN port groups
                     # use a different config type with .PvlanId instead, and trunk port groups
