@@ -122,7 +122,7 @@ param(
 # Bump this on every change. Printed first thing at startup and written into the log file, so
 # it's always possible to confirm exactly which script version produced a given run/report
 # instead of guessing whether an old cached copy is being executed somewhere.
-$ScriptBuild = '2026-08-08-09-services-oneshot-filter'
+$ScriptBuild = '2026-08-08-10-services-count-ntp-defensive'
 Write-Host "VMware_Weekly_HealthCheck.ps1 - build $ScriptBuild" -ForegroundColor Magenta
 
 $ErrorActionPreference = 'Stop'
@@ -335,30 +335,17 @@ foreach ($VC in $Connections) {
             try {
                 $svcListSvc = Get-CisService -Name 'com.vmware.appliance.services' -Server $CisSession
                 $services = $svcListSvc.list()
-                # Many appliance-listed "services" are one-shot boot-time systemd units
-                # (dracut-*, initrd-*, modprobe@*, sysstat-*, and most systemd-* internals) that
-                # correctly show Stopped once they've run at boot - they are not a health signal
-                # and flagging them produced a multi-dozen-line wall of false positives. Only
-                # long-running services are checked here; the handful of systemd-* units that
-                # SHOULD stay running (journald/logind/networkd/resolved/timesyncd) are still checked.
-                $oneShotExact = @('appliance-shutdown','afftpd','cloud-init-local','cloud-init','dm-event',
-                    'emergency','udevadm-cleanup-db','loadmodules','logrotate','rc-local','rescue',
-                    'rpmdb-rebuild','sshd-keygen','userdbd','vmon_2_systemd','vmware-expectctls',
-                    'vmware-firewall','vmware-pit')
-                $oneShotPatterns = '^dracut','^initrd','^modprobe@','^sysstat-','^systemd-(?!journald|logind|networkd|resolved|timesyncd)'
-                $notRunning = @($services.GetEnumerator() | Where-Object {
-                    $svcId = $_.Key
-                    $_.Value.state -ne 'STARTED' -and $svcId -notin $oneShotExact -and
-                    -not ($oneShotPatterns | Where-Object { $svcId -match $_ })
-                })
-                $displayCount = 8
-                $statusText = if ($notRunning.Count -eq 0) { 'All Running' } else {
-                    $shown = ($notRunning | Select-Object -First $displayCount | ForEach-Object { "$($_.Key): $($_.Value.state)" }) -join '; '
-                    if ($notRunning.Count -gt $displayCount) { "$shown; and $($notRunning.Count - $displayCount) more - see log" } else { $shown }
-                }
+                # Deliberately NOT trying to name-match/exclude specific one-shot boot-time units
+                # here anymore - a hand-built exclusion list turned out to be unreliable (exact
+                # service IDs vary enough between appliances that some still fell through, and a
+                # miss there produces a misleading "Warning" on an appliance that's actually fine).
+                # A plain count is always accurate, never risks a false alarm, and pushes the
+                # judgment call on any specific service to a human looking directly at vCenter/VAMI.
+                $total = $services.Count
+                $started = @($services.GetEnumerator() | Where-Object { $_.Value.state -eq 'STARTED' }).Count
                 New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item 'Services' `
-                    -Value $statusText -Status $(if ($notRunning.Count -gt 0) { 'Warning' } else { 'Healthy' }) `
-                    -Notes 'Boot-time/one-shot systemd units are expected to show Stopped and are excluded from this check.'
+                    -Value "$started of $total services Started" -Status 'Information' `
+                    -Notes 'Many appliance services are expected one-shot/boot-time units that normally show Stopped once they finish running - this count is informational only, not a pass/fail check. Review a specific service directly in vCenter/VAMI if needed.'
             } catch {
                 New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item 'Services' `
                     -Value 'n/a' -Status 'Unable to Check' -Notes "VAMI call failed: $($_.Exception.Message)"
@@ -372,10 +359,21 @@ foreach ($VC in $Connections) {
                 $ntpSvc = Get-CisService -Name 'com.vmware.appliance.ntp' -Server $CisSession
                 $ntpConfig = $ntpSvc.get()
                 $servers = @($ntpConfig.servers)
-                $configured = $servers.Count -gt 0
-                New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item 'NTP' `
-                    -Value $(if ($configured) { "Servers: $($servers -join ', ') (mode: $($ntpConfig.mode))" } else { "No NTP servers configured (mode: $($ntpConfig.mode))" }) `
-                    -Status $(if ($configured) { 'Healthy' } else { 'Warning' })
+                $mode = $ntpConfig.mode
+                if ($servers.Count -gt 0) {
+                    New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item 'NTP' `
+                        -Value "Servers: $($servers -join ', ') (mode: $mode)" -Status 'Healthy'
+                } elseif ($mode) {
+                    # A real, parseable response with a mode but no servers is a genuine state worth
+                    # flagging (e.g. NTP disabled, or host-based time sync instead).
+                    New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item 'NTP' `
+                        -Value "No NTP servers configured (mode: $mode)" -Status 'Warning'
+                } else {
+                    # servers AND mode both empty means the response didn't look like the expected
+                    # shape for this vCenter's API version - report the gap honestly instead of
+                    # asserting "no NTP servers configured", which wouldn't be a trustworthy reading.
+                    throw "NTP response did not contain the expected servers/mode fields (raw: $($ntpConfig | ConvertTo-Json -Compress -Depth 3 -ErrorAction SilentlyContinue))"
+                }
             } catch {
                 New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item 'NTP' `
                     -Value 'n/a' -Status 'Unable to Check' -Notes "VAMI call failed: $($_.Exception.Message)"
