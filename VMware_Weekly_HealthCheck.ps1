@@ -119,6 +119,12 @@ param(
     [int]$PerfHistoryHours = 24
 )
 
+# Bump this on every change. Printed first thing at startup and written into the log file, so
+# it's always possible to confirm exactly which script version produced a given run/report
+# instead of guessing whether an old cached copy is being executed somewhere.
+$ScriptBuild = '2026-08-08-09-services-oneshot-filter'
+Write-Host "VMware_Weekly_HealthCheck.ps1 - build $ScriptBuild" -ForegroundColor Magenta
+
 $ErrorActionPreference = 'Stop'
 $ScriptStart = Get-Date
 $RunDate     = $ScriptStart.ToString('yyyy-MM-dd')
@@ -329,10 +335,30 @@ foreach ($VC in $Connections) {
             try {
                 $svcListSvc = Get-CisService -Name 'com.vmware.appliance.services' -Server $CisSession
                 $services = $svcListSvc.list()
-                $notRunning = $services.GetEnumerator() | Where-Object { $_.Value.state -ne 'STARTED' }
+                # Many appliance-listed "services" are one-shot boot-time systemd units
+                # (dracut-*, initrd-*, modprobe@*, sysstat-*, and most systemd-* internals) that
+                # correctly show Stopped once they've run at boot - they are not a health signal
+                # and flagging them produced a multi-dozen-line wall of false positives. Only
+                # long-running services are checked here; the handful of systemd-* units that
+                # SHOULD stay running (journald/logind/networkd/resolved/timesyncd) are still checked.
+                $oneShotExact = @('appliance-shutdown','afftpd','cloud-init-local','cloud-init','dm-event',
+                    'emergency','udevadm-cleanup-db','loadmodules','logrotate','rc-local','rescue',
+                    'rpmdb-rebuild','sshd-keygen','userdbd','vmon_2_systemd','vmware-expectctls',
+                    'vmware-firewall','vmware-pit')
+                $oneShotPatterns = '^dracut','^initrd','^modprobe@','^sysstat-','^systemd-(?!journald|logind|networkd|resolved|timesyncd)'
+                $notRunning = @($services.GetEnumerator() | Where-Object {
+                    $svcId = $_.Key
+                    $_.Value.state -ne 'STARTED' -and $svcId -notin $oneShotExact -and
+                    -not ($oneShotPatterns | Where-Object { $svcId -match $_ })
+                })
+                $displayCount = 8
+                $statusText = if ($notRunning.Count -eq 0) { 'All Running' } else {
+                    $shown = ($notRunning | Select-Object -First $displayCount | ForEach-Object { "$($_.Key): $($_.Value.state)" }) -join '; '
+                    if ($notRunning.Count -gt $displayCount) { "$shown; and $($notRunning.Count - $displayCount) more - see log" } else { $shown }
+                }
                 New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item 'Services' `
-                    -Value $(if ($notRunning) { ($notRunning | ForEach-Object { "$($_.Key): $($_.Value.state)" }) -join '; ' } else { 'All Running' }) `
-                    -Status $(if ($notRunning) { 'Warning' } else { 'Healthy' })
+                    -Value $statusText -Status $(if ($notRunning.Count -gt 0) { 'Warning' } else { 'Healthy' }) `
+                    -Notes 'Boot-time/one-shot systemd units are expected to show Stopped and are excluded from this check.'
             } catch {
                 New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item 'Services' `
                     -Value 'n/a' -Status 'Unable to Check' -Notes "VAMI call failed: $($_.Exception.Message)"
@@ -1233,7 +1259,7 @@ if ($WordAvailable) {
 # ============================================================================
 $LogPath = Join-Path $OutputPath "VMware_Weekly_HealthCheck_$RunDate.log"
 $LogLines = @()
-$LogLines += "VMware Weekly Health Check run - $($ScriptStart.ToString('u'))"
+$LogLines += "VMware Weekly Health Check run - $($ScriptStart.ToString('u')) - build $ScriptBuild"
 $LogLines += "Sites processed: $($SiteLabels -join ', ')"
 $LogLines += "Total findings collected: $($Global:AllResults.Count)"
 $LogLines += "Total collection failures: $($Global:FailureLog.Count)"
