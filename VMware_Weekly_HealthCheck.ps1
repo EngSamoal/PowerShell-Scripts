@@ -47,6 +47,17 @@
     If not supplied for a given site, those sections are rendered as "Manual/External Required"
     rather than fabricated.
 
+    -SiteMapPath (default C:\temp\SiteMap.xml) is loaded automatically if the file exists, so you
+    don't have to retype -SiteMap on every run. Expected shape - one <Site> element per vCenter:
+        <SiteMap>
+          <Site vCenter="tb-dhci-vc01.seventb.local" Name="Tabuk" />
+          <Site vCenter="sf-vc.sixflags.local" Name="SF" />
+          <Site vCenter="amc-vc.amc.local" Name="AMC" />
+        </SiteMap>
+    "vCenter" must match the server name exactly as it appears when connected (the same string
+    shown in "Connected vCenter sessions: ..." when the script starts). Missing/unreadable file is
+    not an error - the script just falls back to -SiteMap / the automatic name detection below.
+
 .EXAMPLE
     # Already connected: Connect-VIServer tb-vc.aq.local
     .\VMware_Weekly_HealthCheck.ps1 -SiteMap @{'tb-vc.aq.local'='Tabuk'} `
@@ -65,8 +76,14 @@
 param(
     # Maps a connected vCenter server (Name as shown in $global:DefaultVIServers) to a friendly
     # site label used in the report title/filename. If a connected vCenter isn't in this map,
-    # its own server name is used as the label - nothing is hard-coded or required.
+    # its own server name is used as the label - nothing is hard-coded or required. Entries here
+    # always take precedence over -SiteMapPath below for the same vCenter.
     [hashtable]$SiteMap = @{},
+
+    # Optional XML file of the same vCenter->site-label mappings, so you don't have to retype
+    # -SiteMap on every run. Loaded automatically if present - see the XML shape in .NOTES.
+    # Entries in -SiteMap above override a matching entry here.
+    [string]$SiteMapPath = 'C:\temp\SiteMap.xml',
 
     [string]$OutputPath = (Join-Path $PSScriptRoot "VMware_HealthCheck_Reports"),
 
@@ -107,6 +124,22 @@ $ScriptStart = Get-Date
 $RunDate     = $ScriptStart.ToString('yyyy-MM-dd')
 $RunDateDisplay = $ScriptStart.ToString('d-MMMM-yyyy', [System.Globalization.CultureInfo]::InvariantCulture)
 if (-not (Test-Path $OutputPath)) { New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null }
+
+# Load site-name mappings from -SiteMapPath, if present, so -SiteMap doesn't need retyping every
+# run. An explicit -SiteMap entry for the same vCenter still wins - only fills in what's missing.
+if (Test-Path $SiteMapPath) {
+    try {
+        [xml]$SiteMapXml = Get-Content -Path $SiteMapPath -Raw
+        foreach ($entry in @($SiteMapXml.SiteMap.Site)) {
+            if ($entry.vCenter -and $entry.Name -and -not $SiteMap.ContainsKey($entry.vCenter)) {
+                $SiteMap[$entry.vCenter] = $entry.Name
+            }
+        }
+        Write-Host "Loaded site names from $SiteMapPath" -ForegroundColor Cyan
+    } catch {
+        Write-Warning "Could not read -SiteMapPath '$SiteMapPath': $($_.Exception.Message) - continuing without it."
+    }
+}
 
 # ============================================================================
 # 0. LOGGING / SAFE-EXECUTION HELPERS
