@@ -211,7 +211,16 @@ foreach ($VC in $Connections) {
         try {
             $instanceName = (Get-AdvancedSetting -Entity $VC -Name 'VirtualCenter.InstanceName' -ErrorAction Stop).Value
         } catch { }
-        $Site = if ($instanceName) { $instanceName } else { $VCName }
+        if ($instanceName) {
+            $Site = $instanceName
+        } elseif ($VCName -match '^\d{1,3}(\.\d{1,3}){3}$') {
+            # Raw IP address - nothing shorter/friendlier to derive from it.
+            $Site = $VCName
+        } else {
+            # No InstanceName set either - use just the short hostname (before the first dot)
+            # instead of the full FQDN, e.g. "tb-dhci-vc01.seventb.local" -> "tb-dhci-vc01".
+            $Site = ($VCName -split '\.')[0]
+        }
     }
 
     Write-Host "`n=== Collecting: $Site ($VCName) ===" -ForegroundColor Green
@@ -530,22 +539,26 @@ foreach ($VC in $Connections) {
                     -Item 'vDS' -Value $vds.Mtu -Status 'Information'
                 # Excludes the auto-generated uplink port group every vDS gets (e.g. "...-DVUplinks-...").
                 # It's switch infrastructure carrying a full VLAN trunk range for the physical NICs,
-                # not an application/server VLAN - counting it as one inflated the VLAN total. Filtered
-                # by the actual IsUplink flag, not by name pattern, so this can't miss a renamed one.
-                $pgs = Get-VDPortgroup -Server $VC -VDSwitch $vds | Where-Object { -not $_.IsUplink }
+                # not an application/server VLAN - counting it inflated the VLAN total. Belt-and-braces:
+                # check both the IsUplink flag AND the standard DVUplinks naming, since IsUplink has
+                # been observed unreliable on at least one third-party-managed vDS (e.g. Apstra).
+                $pgs = Get-VDPortgroup -Server $VC -VDSwitch $vds | Where-Object { -not $_.IsUplink -and $_.Name -notmatch '-DVUplinks-' }
                 foreach ($pg in $pgs) {
-                    # Regular port groups expose .VlanId as a plain int. Private VLAN port groups
-                    # use a different config type with .PvlanId instead, and trunk port groups
-                    # expose a range array - without handling those, their VLAN silently reads as
-                    # $null and drops out of the distinct-VLAN count below.
+                    # Regular port groups expose .VlanId as a plain int - only these count as one
+                    # "configured VLAN" below. Private VLAN port groups use .PvlanId instead, and
+                    # trunk port groups expose a range - both are shown per-port-group for visibility
+                    # but deliberately excluded from the VLAN count itself, since a trunk range isn't
+                    # one countable VLAN (this is also a second, independent guard against any
+                    # remaining uplink-like port group that slips past the IsUplink/name filter above).
                     $vlanCfg = $pg.ExtensionData.Config.DefaultPortConfig.Vlan
-                    $vlan = if ($null -ne $vlanCfg.VlanId -and $vlanCfg.VlanId -is [int]) { $vlanCfg.VlanId }
+                    $isSingleVlan = $null -ne $vlanCfg.VlanId -and $vlanCfg.VlanId -is [int]
+                    $vlan = if ($isSingleVlan) { $vlanCfg.VlanId }
                         elseif ($vlanCfg.PvlanId) { "PVLAN $($vlanCfg.PvlanId)" }
-                        elseif ($vlanCfg.VlanId) { ($vlanCfg.VlanId | ForEach-Object { "$($_.Start)-$($_.End)" }) -join ',' }
+                        elseif ($vlanCfg.VlanId) { "Trunk " + (($vlanCfg.VlanId | ForEach-Object { "$($_.Start)-$($_.End)" }) -join ',') }
                         else { $null }
                     $teaming = $pg.ExtensionData.Config.DefaultPortConfig.UplinkTeamingPolicy.Policy.Value
                     New-Finding -Site $Site -VCenter $VCName -Area 'Networking' -Cluster $ClusterName -Object $pg.Name `
-                        -Item 'Port Group' -Value "$vlan|$teaming" -Status 'Information'
+                        -Item 'Port Group' -Value "$vlan|$teaming|$isSingleVlan" -Status 'Information'
                 }
             }
             $distinctMtu = @($vdSwitches | Select-Object -ExpandProperty Mtu -Unique)
@@ -796,7 +809,9 @@ function Write-SiteReportDocx {
     $VdsFindings = $SiteFindings | Where-Object { $_.Item -eq 'vDS' }
     $PgFindings  = $SiteFindings | Where-Object { $_.Item -eq 'Port Group' }
     $VdsCount = @($VdsFindings | Select-Object -ExpandProperty Object -Unique).Count
-    $VlanCount = @($PgFindings | ForEach-Object { ($_.Value -split '\|')[0] } | Where-Object { $_ } | Select-Object -Unique).Count
+    # Only port groups flagged as a genuine single VLAN (3rd field = 'True') count toward the VLAN
+    # total - trunk/PVLAN port groups are shown in the per-port-group detail but aren't one countable VLAN.
+    $VlanCount = @($PgFindings | Where-Object { ($_.Value -split '\|')[2] -eq 'True' } | ForEach-Object { ($_.Value -split '\|')[0] } | Select-Object -Unique).Count
 
     $doc = $Word.Documents.Add()
     $sel = $Word.Selection
