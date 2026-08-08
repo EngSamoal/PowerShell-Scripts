@@ -47,7 +47,7 @@
     If not supplied for a given site, those sections are rendered as "Manual/External Required"
     rather than fabricated.
 
-    -SiteMapPath (default C:\temp\Weekly_Health_Check_SitMap.xml) is loaded automatically if the file exists, so you
+    -SiteMapPath (default C:\temp\VMware_Weekly_Health_Check_SiteMap.xml) is loaded automatically if the file exists, so you
     don't have to retype -SiteMap on every run. Expected shape - one <Site> element per vCenter:
         <SiteMap>
           <Site vCenter="tb-dhci-vc01.seventb.local" Name="Tabuk" />
@@ -83,7 +83,7 @@ param(
     # Optional XML file of the same vCenter->site-label mappings, so you don't have to retype
     # -SiteMap on every run. Loaded automatically if present - see the XML shape in .NOTES.
     # Entries in -SiteMap above override a matching entry here.
-    [string]$SiteMapPath = 'C:\temp\Weekly_Health_Check_SitMap.xml',
+    [string]$SiteMapPath = 'C:\temp\VMware_Weekly_Health_Check_SiteMap.xml',
 
     [string]$OutputPath = (Join-Path $PSScriptRoot "VMware_HealthCheck_Reports"),
 
@@ -127,6 +127,8 @@ if (-not (Test-Path $OutputPath)) { New-Item -ItemType Directory -Path $OutputPa
 
 # Load site-name mappings from -SiteMapPath, if present, so -SiteMap doesn't need retyping every
 # run. An explicit -SiteMap entry for the same vCenter still wins - only fills in what's missing.
+# Deliberately noisy either way (found/not found/loaded-what) so a filename or path mismatch shows
+# up immediately here instead of only being noticeable later in the report filenames.
 if (Test-Path $SiteMapPath) {
     try {
         [xml]$SiteMapXml = Get-Content -Path $SiteMapPath -Raw
@@ -139,6 +141,14 @@ if (Test-Path $SiteMapPath) {
     } catch {
         Write-Warning "Could not read -SiteMapPath '$SiteMapPath': $($_.Exception.Message) - continuing without it."
     }
+} else {
+    Write-Host "No site-map file found at '$SiteMapPath' - reports will use automatic/raw vCenter names unless -SiteMap is passed." -ForegroundColor Yellow
+}
+if ($SiteMap.Count -gt 0) {
+    Write-Host "Site name mapping in effect:" -ForegroundColor Cyan
+    $SiteMap.GetEnumerator() | ForEach-Object { Write-Host "  $($_.Key)  ->  $($_.Value)" -ForegroundColor Cyan }
+} else {
+    Write-Host "No site name mapping in effect - every report will be named after its raw vCenter connection string." -ForegroundColor Yellow
 }
 
 # ============================================================================
