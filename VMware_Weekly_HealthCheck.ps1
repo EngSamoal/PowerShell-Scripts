@@ -1087,13 +1087,25 @@ function Write-SiteReportDocx {
     Write-Para $sel "Report Date: $RunDateDisplay" -Bold
 
     $safeLabel = ($SiteLabel -replace '[\\/\?\*\[\]:<>\|]', '_')
-    $DocxPath = Join-Path $OutputPath "$safeLabel`_VMware_HealthCheck_$RunDate.docx"
-    try {
-        $null = $doc.GetType().InvokeMember('SaveAs', [System.Reflection.BindingFlags]::InvokeMethod, $null, $doc, @([string]$DocxPath, 16))
-        Write-Host "Report written: $DocxPath" -ForegroundColor Cyan
-    } catch {
-        Write-CheckLog -VCenter 'n/a' -Site $SiteLabel -Object 'DOCX export' -CheckName 'Word COM automation' -ErrorMessage $_.Exception.Message
-        Write-Warning "Could not save .docx for $SiteLabel : $($_.Exception.Message)"
+    $baseName = "$safeLabel`_VMware_HealthCheck_$RunDate"
+    # If today's report file is still open in another Word window (e.g. someone reviewing the
+    # last run while this one executes), SaveAs fails outright with a locked-file error. Rather
+    # than lose the run, fall back to an incrementing suffix (_2, _3, ...) until one saves.
+    $saved = $false
+    for ($attempt = 1; $attempt -le 20 -and -not $saved; $attempt++) {
+        $DocxPath = if ($attempt -eq 1) { Join-Path $OutputPath "$baseName.docx" } else { Join-Path $OutputPath "$baseName`_$attempt.docx" }
+        try {
+            $null = $doc.GetType().InvokeMember('SaveAs', [System.Reflection.BindingFlags]::InvokeMethod, $null, $doc, @([string]$DocxPath, 16))
+            Write-Host "Report written: $DocxPath" -ForegroundColor Cyan
+            $saved = $true
+        } catch {
+            $lastError = $_.Exception.Message
+            if ($lastError -notmatch 'already open elsewhere') { break }
+        }
+    }
+    if (-not $saved) {
+        Write-CheckLog -VCenter 'n/a' -Site $SiteLabel -Object 'DOCX export' -CheckName 'Word COM automation' -ErrorMessage $lastError
+        Write-Warning "Could not save .docx for $SiteLabel : $lastError"
     }
     $null = $doc.GetType().InvokeMember('Close', [System.Reflection.BindingFlags]::InvokeMethod, $null, $doc, @(0))
     [System.Runtime.Interopservices.Marshal]::ReleaseComObject($doc) | Out-Null
