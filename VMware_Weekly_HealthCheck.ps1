@@ -201,7 +201,18 @@ Write-Host "Connected vCenter sessions: $($Connections.Name -join ', ')" -Foregr
 foreach ($VC in $Connections) {
 
     $VCName = $VC.Name
-    $Site   = if ($SiteMap.ContainsKey($VCName)) { $SiteMap[$VCName] } else { $VCName }
+    if ($SiteMap.ContainsKey($VCName)) {
+        $Site = $SiteMap[$VCName]
+    } else {
+        # No explicit -SiteMap entry - fall back to the friendly name configured in vCenter itself
+        # (Configure > Advanced Settings > VirtualCenter.InstanceName) rather than the raw
+        # connection string/IP, when one is set. -SiteMap always wins if you provide it.
+        $instanceName = $null
+        try {
+            $instanceName = (Get-AdvancedSetting -Entity $VC -Name 'VirtualCenter.InstanceName' -ErrorAction Stop).Value
+        } catch { }
+        $Site = if ($instanceName) { $instanceName } else { $VCName }
+    }
 
     Write-Host "`n=== Collecting: $Site ($VCName) ===" -ForegroundColor Green
 
@@ -664,40 +675,82 @@ function Get-WorstStatus {
 # Adds the two-column letterhead (logos, or site/company text if no logo file given) plus the
 # bold report date to a Word Section's header, and the classification text to its footer -
 # both then repeat automatically on every page of that document.
+# Gives the document a deliberate, consistent look (font + heading colors/sizes) instead of
+# Word's plain default Normal.dotm styling, which is what made the generated report read as
+# less polished than the hand-built reference report.
+function Set-DocumentBaseStyle {
+    param($Doc)
+    $wdStyleNormal = -1
+    $normal = $Doc.Styles.Item($wdStyleNormal)
+    $normal.Font.Name = 'Calibri'
+    $normal.Font.Size = 11
+
+    $headingColor = Get-WordColorLong @(30,58,95)
+    $sizes = @{ 'Heading 1' = 20; 'Heading 2' = 15; 'Heading 3' = 12; 'Heading 4' = 11 }
+    foreach ($levelName in $sizes.Keys) {
+        $style = $Doc.Styles.Item($levelName)
+        $style.Font.Name = 'Calibri'
+        $style.Font.Color = $headingColor
+        $style.Font.Size = $sizes[$levelName]
+    }
+}
+
+# Inserts a fixed-height picture (preserving aspect ratio) at the given (collapsed) range and
+# leaves the range collapsed just after it - keeps oversized source images (e.g. a raw 500x500px
+# logo export) from blowing out the header's height and pushing into/overlapping the body text.
+function Add-ScaledPicture {
+    param($Range, [string]$Path, [double]$HeightPoints = 26)
+    $shape = $Range.InlineShapes.AddPicture($Path, $false, $true, $Range)
+    $shape.LockAspectRatio = -1   # msoTrue
+    $shape.Height = $HeightPoints
+    $Range.Collapse(0)   # wdCollapseEnd
+}
+
 function Add-HeaderFooter {
     param($Doc, [string]$SiteLabel)
     $wdHeaderFooterPrimary = 1
     $section = $Doc.Sections.Item(1)
 
+    # A single header paragraph with a right-aligned tab stop, not a table - tables inserted into
+    # a Word header via COM automation can get silently wrapped in a floating/anchored frame,
+    # which is what was causing the header to visually overlap the first lines of body text.
     $header = $section.Headers.Item($wdHeaderFooterPrimary)
     $header.LinkToPrevious = $false
-    $hTable = $Doc.Tables.Add($header.Range, 1, 2)
-    $hTable.Borders.Enable = $false
-    $leftCell  = $hTable.Cell(1,1).Range
-    $rightCell = $hTable.Cell(1,2).Range
+    $usableWidth = $Doc.PageSetup.PageWidth - $Doc.PageSetup.LeftMargin - $Doc.PageSetup.RightMargin
+    $hRange = $header.Range
+    $hRange.Text = ''
+    $null = $hRange.ParagraphFormat.TabStops.Add($usableWidth, 2)   # 2 = wdAlignTabRight
+
     if ($LogoLeftPath -and (Test-Path $LogoLeftPath)) {
-        $null = $leftCell.InlineShapes.AddPicture($LogoLeftPath, $false, $true, $leftCell)
+        Add-ScaledPicture -Range $hRange -Path $LogoLeftPath -HeightPoints 30
     } else {
-        $leftCell.Font.Bold = $true
-        $leftCell.Text = $SiteLabel
+        $hRange.Font.Bold = $true
+        $hRange.Font.Size = 13
+        $hRange.InsertAfter($SiteLabel)
+        $hRange.Collapse(0)
+        $hRange.Font.Size = 10
+        $hRange.Font.Bold = $false
     }
+
     if ($LogoRightPath -and (Test-Path $LogoRightPath)) {
-        $rightCell.ParagraphFormat.Alignment = 2   # wdAlignParagraphRight
-        $null = $rightCell.InlineShapes.AddPicture($LogoRightPath, $false, $true, $rightCell)
+        $hRange.InsertAfter("`t")
+        $hRange.Collapse(0)
+        Add-ScaledPicture -Range $hRange -Path $LogoRightPath -HeightPoints 30
     }
-    $dateRange = $header.Range
-    $dateRange.Collapse(0)   # wdCollapseEnd
-    $dateRange.Font.Bold = $true
-    $dateRange.InsertParagraphAfter()
-    $dateRange.Collapse(0)
-    $dateRange.Text = $RunDateDisplay
+
+    $hRange.InsertParagraphAfter()
+    $hRange.Collapse(0)
+    $hRange.Font.Bold = $true
+    $hRange.Font.Size = 11
+    $hRange.InsertAfter($RunDateDisplay)
 
     $footer = $section.Footers.Item($wdHeaderFooterPrimary)
     $footer.LinkToPrevious = $false
+    $footer.Range.Text = ''
     $footer.Range.ParagraphFormat.Alignment = 1   # wdAlignParagraphCenter
     $footer.Range.Font.Size = 9
     $footer.Range.Font.Color = Get-WordColorLong @(107,114,128)
-    $footer.Range.Text = $FooterText
+    $footer.Range.InsertAfter($FooterText)
 }
 
 function Write-SiteReportDocx {
@@ -743,6 +796,7 @@ function Write-SiteReportDocx {
 
     $doc = $Word.Documents.Add()
     $sel = $Word.Selection
+    Set-DocumentBaseStyle -Doc $doc
     Add-HeaderFooter -Doc $doc -SiteLabel $SiteLabel
 
     # ---------------- Title ----------------
@@ -954,7 +1008,7 @@ function Write-SiteReportDocx {
     # ---------------- 8. Virtual Machine Inventory Summary ----------------
     Write-Heading $sel "8. Virtual Machine Inventory Summary" 2
     Write-Heading $sel "8.1 VM Operating System Distribution" 3
-    $osGroups = $SiteFindings | Where-Object { $_.Area -eq 'VM' -and $_.Item -eq 'Guest OS' } | Group-Object Object
+    $osGroups = $SiteFindings | Where-Object { $_.Area -eq 'VM' -and $_.Item -eq 'Guest OS' } | Group-Object Object | Sort-Object Name
     $osRows = @()
     $totalVMs = 0
     foreach ($g in $osGroups) {
