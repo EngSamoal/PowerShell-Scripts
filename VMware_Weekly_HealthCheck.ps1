@@ -47,7 +47,7 @@
     If not supplied for a given site, those sections are rendered as "Manual/External Required"
     rather than fabricated.
 
-    -SiteMapPath (default C:\temp\SiteMap.xml) is loaded automatically if the file exists, so you
+    -SiteMapPath (default C:\temp\Weekly_Health_Check_SitMap.xml) is loaded automatically if the file exists, so you
     don't have to retype -SiteMap on every run. Expected shape - one <Site> element per vCenter:
         <SiteMap>
           <Site vCenter="tb-dhci-vc01.seventb.local" Name="Tabuk" />
@@ -83,7 +83,7 @@ param(
     # Optional XML file of the same vCenter->site-label mappings, so you don't have to retype
     # -SiteMap on every run. Loaded automatically if present - see the XML shape in .NOTES.
     # Entries in -SiteMap above override a matching entry here.
-    [string]$SiteMapPath = 'C:\temp\SiteMap.xml',
+    [string]$SiteMapPath = 'C:\temp\Weekly_Health_Check_SitMap.xml',
 
     [string]$OutputPath = (Join-Path $PSScriptRoot "VMware_HealthCheck_Reports"),
 
