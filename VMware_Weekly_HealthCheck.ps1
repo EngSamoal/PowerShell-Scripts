@@ -122,7 +122,7 @@ param(
 # Bump this on every change. Printed first thing at startup and written into the log file, so
 # it's always possible to confirm exactly which script version produced a given run/report
 # instead of guessing whether an old cached copy is being executed somewhere.
-$ScriptBuild = '2026-08-08-10-services-count-ntp-defensive'
+$ScriptBuild = '2026-08-09-11-vami-reason-and-logging'
 Write-Host "VMware_Weekly_HealthCheck.ps1 - build $ScriptBuild" -ForegroundColor Magenta
 
 $ErrorActionPreference = 'Stop'
@@ -223,6 +223,18 @@ function Get-PctStatus {
     if ($Pct -ge $CapacityCriticalPct) { return 'Critical' }
     elseif ($Pct -ge $CapacityWarningPct) { return 'Warning' }
     else { return 'Healthy' }
+}
+
+# Turns a raw VAMI/CIS exception message into a short label the Appliance Health table can
+# actually show - the table only ever renders an item's Value, never its Status or Notes, so a
+# generic 'n/a' made "session never connected", "connected but no permission", and "wrong API
+# call for this vCenter version" all look identical in the report with no way to tell them apart.
+function Get-VamiFailureReason {
+    param([string]$ErrorMessage)
+    if ($ErrorMessage -match 'unauthorized') { return 'Unauthorized (permission denied)' }
+    elseif ($ErrorMessage -match 'was not found using the specified filter') { return 'Not Found (API mismatch)' }
+    elseif ($ErrorMessage -match 'time(d)? ?out') { return 'Timed Out' }
+    else { return 'Unable to Check' }
 }
 
 # ============================================================================
@@ -326,8 +338,9 @@ foreach ($VC in $Connections) {
                     New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName `
                         -Item $label -Value $(if ($val -eq 'green') { 'Normal' } else { $val }) -Status $(if ($val -eq 'green') {'Healthy'} else {'Warning'})
                 } catch {
+                    Write-CheckLog -VCenter $VCName -Site $Site -Object $VCName -CheckName "Appliance $label (VAMI)" -ErrorMessage $_.Exception.Message
                     New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item $label `
-                        -Value 'n/a' -Status 'Unable to Check' -Notes "VAMI call failed: $($_.Exception.Message)"
+                        -Value (Get-VamiFailureReason $_.Exception.Message) -Status 'Unable to Check' -Notes "VAMI call failed: $($_.Exception.Message)"
                 }
             }
         }
@@ -347,8 +360,9 @@ foreach ($VC in $Connections) {
                     -Value "$started of $total services Started" -Status 'Information' `
                     -Notes 'Many appliance services are expected one-shot/boot-time units that normally show Stopped once they finish running - this count is informational only, not a pass/fail check. Review a specific service directly in vCenter/VAMI if needed.'
             } catch {
+                Write-CheckLog -VCenter $VCName -Site $Site -Object $VCName -CheckName 'Appliance Services (VAMI)' -ErrorMessage $_.Exception.Message
                 New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item 'Services' `
-                    -Value 'n/a' -Status 'Unable to Check' -Notes "VAMI call failed: $($_.Exception.Message)"
+                    -Value (Get-VamiFailureReason $_.Exception.Message) -Status 'Unable to Check' -Notes "VAMI call failed: $($_.Exception.Message)"
             }
         }
         Invoke-SafeCheck -CheckName 'Appliance NTP (VAMI)' -VCenter $VCName -Site $Site -ObjectName $VCName -Script {
@@ -375,8 +389,9 @@ foreach ($VC in $Connections) {
                     throw "NTP response did not contain the expected servers/mode fields (raw: $($ntpConfig | ConvertTo-Json -Compress -Depth 3 -ErrorAction SilentlyContinue))"
                 }
             } catch {
+                Write-CheckLog -VCenter $VCName -Site $Site -Object $VCName -CheckName 'Appliance NTP (VAMI)' -ErrorMessage $_.Exception.Message
                 New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item 'NTP' `
-                    -Value 'n/a' -Status 'Unable to Check' -Notes "VAMI call failed: $($_.Exception.Message)"
+                    -Value (Get-VamiFailureReason $_.Exception.Message) -Status 'Unable to Check' -Notes "VAMI call failed: $($_.Exception.Message)"
             }
         }
         Invoke-SafeCheck -CheckName 'Appliance certificate (VAMI)' -VCenter $VCName -Site $Site -ObjectName $VCName -Script {
@@ -389,14 +404,15 @@ foreach ($VC in $Connections) {
                 New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item 'Certificates' `
                     -Value "Valid - until ($($expDate.ToString('MMM d, yyyy')))" -Status $status
             } catch {
+                Write-CheckLog -VCenter $VCName -Site $Site -Object $VCName -CheckName 'Appliance Certificates (VAMI)' -ErrorMessage $_.Exception.Message
                 New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item 'Certificates' `
-                    -Value 'n/a' -Status 'Unable to Check' -Notes "VAMI call failed: $($_.Exception.Message)"
+                    -Value (Get-VamiFailureReason $_.Exception.Message) -Status 'Unable to Check' -Notes "VAMI call failed: $($_.Exception.Message)"
             }
         }
     } else {
         foreach ($item in 'CPU','Memory','Disk Usage','Services','NTP','Certificates') {
             New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item $item `
-                -Value 'n/a' -Status 'Manual/External Required' `
+                -Value 'Not Connected (no CIS session)' -Status 'Manual/External Required' `
                 -Notes 'Requires a VAMI/CIS session (Connect-CisServer <vcenter>) in addition to the vSphere API session. Not connected in this run.'
         }
     }
