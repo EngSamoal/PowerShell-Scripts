@@ -1,4 +1,3 @@
-https://rhpds.github.io/ocp-virt-roadshow-2026-showroom/modules/index.html
 #Requires -Version 5.1
 <#
 .SYNOPSIS
