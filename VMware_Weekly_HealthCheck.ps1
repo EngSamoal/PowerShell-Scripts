@@ -1,7 +1,8 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    VMware Weekly Health Check - Read-only automated collection across SF, Tabuk and AMC (AJW/PAN/RGL/STR).
+    VMware Weekly Health Check - Read-only automated collection and DOCX report generation,
+    matching the "<Site> vCenter & ESXi Health Check Report" template (SAMI/Qiddiya format).
 
 .DESCRIPTION
     Replaces the manual weekly vCenter/ESXi health-check reports with a single read-only
@@ -10,55 +11,158 @@
     - Uses whatever vCenter sessions are already connected (Connect-VIServer done beforehand).
     - Auto-discovers clusters, hosts, datastores, vSAN, vDS/port groups and VMs per vCenter -
       nothing about the infrastructure is hard-coded.
-    - AMC is one vCenter with four clusters/sites (AJW, PAN, RGL, STR); each is discovered and
-      reported on separately automatically, no hard-coded cluster list.
+    - Produces ONE .docx per connected vCenter ("site"), matching the exact section layout,
+      wording and table structure of the reference report:
+        1.  Executive Summary
+        2.  Environment Overview
+        3.  vCenter Server Health (3.1 Appliance Health)
+        4.  ESXi Host Health (4.1 Host Configuration Summary, 4.2 Hardware Health)
+        5.  Networking Health (5.1 Network Overview, 5.2 Network Configuration Status)
+        6.  Performance & Capacity Summary (6.1 CPU, 6.2 Memory, 6.3 Storage)
+        7.  Storage Health (array hardware + per-datastore table)
+        8.  Virtual Machine Inventory Summary (8.1 VM OS Distribution)
+        9.  Security & Compliance
+        10. Risks & Recommendations (Backup & Disaster Recovery)
+        11. Action Plan
+        12. Conclusion, Prepared By / Report Date
+      with a company header (logos + date) and classification footer repeated on every page.
+    - When a vCenter has more than one cluster, the per-cluster tables (4.1, 6.1-6.3, 8.1) simply
+      grow one row per cluster instead of collapsing to a single row - the section layout itself
+      does not change.
     - A failure collecting one item is logged and skipped; the script always continues.
     - NEVER writes/modifies anything in vCenter. Every cmdlet used below is read-only
       (Get-*, no Set-*/New-*/Remove-*, no config changes, no SSH enablement).
 
 .NOTES
-    Every threshold below (capacity %, cert/license expiry warning windows) is a CONFIGURABLE
-    PARAMETER, not an assumed company standard - the source reports did not define explicit
-    numeric thresholds, so raw values/status are always shown alongside any computed flag.
+    Every threshold below (capacity %, cert/license expiry windows) is a CONFIGURABLE PARAMETER,
+    not an assumed company standard - raw values/status are always shown alongside any computed
+    flag.
+
+    Two parts of the reference report are NOT available from vCenter/PowerCLI by design:
+      - Section 7's physical storage-array details (software version, compression, controller
+        A/B state, disk count, link/power status) come from the array's own management plane
+        (e.g. NetApp ONTAP System Manager), not vCenter. Supply them via -StorageArrayInfo.
+      - Section 3.1's "Backup" row and Section 10 (Backup & Disaster Recovery) come from the
+        backup product's own console (e.g. Cohesity), not vCenter. Supply them via -BackupInfo.
+    If not supplied for a given site, those sections are rendered as "Manual/External Required"
+    rather than fabricated.
+
+    -SiteMapPath (default C:\temp\VMware_Weekly_Health_Check_SiteMap.xml) is loaded automatically if the file exists, so you
+    don't have to retype -SiteMap on every run. Expected shape - one <Site> element per vCenter:
+        <SiteMap>
+          <Site vCenter="tb-dhci-vc01.seventb.local" Name="Tabuk" />
+          <Site vCenter="sf-vc.sixflags.local" Name="SF" />
+          <Site vCenter="amc-vc.amc.local" Name="AMC" />
+        </SiteMap>
+    "vCenter" must match the server name exactly as it appears when connected (the same string
+    shown in "Connected vCenter sessions: ..." when the script starts). Missing/unreadable file is
+    not an error - the script just falls back to -SiteMap / the automatic name detection below.
 
 .EXAMPLE
-    # Already connected: Connect-VIServer sf-vc.sixflags.local, tb-vc.aq.local, amc-vc.amc.local
-    .\VMware_Weekly_HealthCheck.ps1 -SiteMap @{'sf-vc.sixflags.local'='SF'; 'tb-vc.aq.local'='TB'; 'amc-vc.amc.local'='AMC'}
+    # Already connected: Connect-VIServer tb-vc.aq.local
+    .\VMware_Weekly_HealthCheck.ps1 -SiteMap @{'tb-vc.aq.local'='Tabuk'} `
+        -StorageArrayInfo @{ 'Tabuk' = @{ SoftwareVersion='10.4.20'; CompressionPct=99;
+            ControllerA='Active'; ControllerB='Standby'; DiskCount=28; DiskStatus='Healthy';
+            UtilizationUsedTiB=2.4; UtilizationTotalTiB=152.5;
+            LinksA='eth0a, eth0b is active'; LinksB='eth0a, eth0b is active';
+            PowerA='Power Supply active'; PowerB='Power Supply active' } } `
+        -BackupInfo @{ 'Tabuk' = @{ DeviceLabel='Cohesity Backup Device';
+            SolutionName='Cohesity Backup Solution'; Status='Healthy' } } `
+        -PreparedBy 'Ahmed Khalil' -PreparedByTitle 'Infrastructure Specialist' `
+        -LogoLeftPath 'C:\Logos\SAMI.png' -LogoRightPath 'C:\Logos\Qiddiya.png'
 #>
 
 [CmdletBinding()]
 param(
     # Maps a connected vCenter server (Name as shown in $global:DefaultVIServers) to a friendly
-    # site label used in the report. If a connected vCenter isn't in this map, its own server
-    # name is used as the label - nothing is hard-coded or required.
+    # site label used in the report title/filename. If a connected vCenter isn't in this map,
+    # its own server name is used as the label - nothing is hard-coded or required. Entries here
+    # always take precedence over -SiteMapPath below for the same vCenter.
     [hashtable]$SiteMap = @{},
+
+    # Optional XML file of the same vCenter->site-label mappings, so you don't have to retype
+    # -SiteMap on every run. Loaded automatically if present - see the XML shape in .NOTES.
+    # Entries in -SiteMap above override a matching entry here.
+    [string]$SiteMapPath = 'C:\temp\VMware_Weekly_Health_Check_SiteMap.xml',
 
     [string]$OutputPath = (Join-Path $PSScriptRoot "VMware_HealthCheck_Reports"),
 
+    # ---- Report letterhead / sign-off -----------------------------------------------------
+    [string]$LogoLeftPath = '',
+    [string]$LogoRightPath = '',
+    [string]$FooterText = 'This email \ document has been classified as public',
+    [string]$PreparedBy = 'VMware Weekly Health Check Automation',
+    [string]$PreparedByTitle = '',
+
+    # ---- Data NOT available from vCenter - keyed by Site label (see .NOTES) ---------------
+    # Example: @{ 'Tabuk' = @{ SoftwareVersion='10.4.20'; CompressionPct=99; ControllerA='Active';
+    #   ControllerB='Standby'; DiskCount=28; DiskStatus='Healthy'; UtilizationUsedTiB=2.4;
+    #   UtilizationTotalTiB=152.5; LinksA='eth0a, eth0b is active'; LinksB='eth0a, eth0b is active';
+    #   PowerA='Power Supply active'; PowerB='Power Supply active' } }
+    [hashtable]$StorageArrayInfo = @{},
+    # Example: @{ 'Tabuk' = @{ DeviceLabel='Cohesity Backup Device';
+    #   SolutionName='Cohesity Backup Solution'; Status='Healthy' } }
+    [hashtable]$BackupInfo = @{},
+
+    # Local ESXi accounts considered normal/expected; anything extra found on a host is flagged.
+    [string[]]$ExpectedLocalAccounts = @('root','dcui','vpxuser'),
+
     # Configurable thresholds - NOT vendor/company-defined standards. Raw values are always
     # shown regardless of these; these only drive the Warning/Critical flag shown alongside them.
-    [double]$CapacityWarningPct  = 80,
-    [double]$CapacityCriticalPct = 90,
-    [int]$CertExpiryWarningDays  = 60,
+    [double]$CapacityWarningPct    = 80,
+    [double]$CapacityCriticalPct   = 90,
+    [int]$CertExpiryWarningDays    = 60,
     [int]$LicenseExpiryWarningDays = 30,
 
     # Historical performance window for capacity stats (hours), matches the 24-72h window used
-    # in the manual reports.
+    # in the reference report.
     [int]$PerfHistoryHours = 24
 )
+
+# Bump this on every change. Printed first thing at startup and written into the log file, so
+# it's always possible to confirm exactly which script version produced a given run/report
+# instead of guessing whether an old cached copy is being executed somewhere.
+$ScriptBuild = '2026-08-09-11-vami-reason-and-logging'
+Write-Host "VMware_Weekly_HealthCheck.ps1 - build $ScriptBuild" -ForegroundColor Magenta
 
 $ErrorActionPreference = 'Stop'
 $ScriptStart = Get-Date
 $RunDate     = $ScriptStart.ToString('yyyy-MM-dd')
+$RunDateDisplay = $ScriptStart.ToString('d-MMMM-yyyy', [System.Globalization.CultureInfo]::InvariantCulture)
 if (-not (Test-Path $OutputPath)) { New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null }
+
+# Load site-name mappings from -SiteMapPath, if present, so -SiteMap doesn't need retyping every
+# run. An explicit -SiteMap entry for the same vCenter still wins - only fills in what's missing.
+# Deliberately noisy either way (found/not found/loaded-what) so a filename or path mismatch shows
+# up immediately here instead of only being noticeable later in the report filenames.
+if (Test-Path $SiteMapPath) {
+    try {
+        [xml]$SiteMapXml = Get-Content -Path $SiteMapPath -Raw
+        foreach ($entry in @($SiteMapXml.SiteMap.Site)) {
+            if ($entry.vCenter -and $entry.Name -and -not $SiteMap.ContainsKey($entry.vCenter)) {
+                $SiteMap[$entry.vCenter] = $entry.Name
+            }
+        }
+        Write-Host "Loaded site names from $SiteMapPath" -ForegroundColor Cyan
+    } catch {
+        Write-Warning "Could not read -SiteMapPath '$SiteMapPath': $($_.Exception.Message) - continuing without it."
+    }
+} else {
+    Write-Host "No site-map file found at '$SiteMapPath' - reports will use automatic/raw vCenter names unless -SiteMap is passed." -ForegroundColor Yellow
+}
+if ($SiteMap.Count -gt 0) {
+    Write-Host "Site name mapping in effect:" -ForegroundColor Cyan
+    $SiteMap.GetEnumerator() | ForEach-Object { Write-Host "  $($_.Key)  ->  $($_.Value)" -ForegroundColor Cyan }
+} else {
+    Write-Host "No site name mapping in effect - every report will be named after its raw vCenter connection string." -ForegroundColor Yellow
+}
 
 # ============================================================================
 # 0. LOGGING / SAFE-EXECUTION HELPERS
 # ============================================================================
 $Global:FailureLog = [System.Collections.Generic.List[object]]::new()
 $Global:AllResults = [System.Collections.Generic.List[object]]::new()
-$Global:ObjectClusterMap = @{}   # maps a host/datastore/vDS/port-group name -> the cluster it belongs to,
-                                  # used only when building the per-site report to group findings correctly.
+$Global:SiteClusterMap = @{}   # Site label -> ordered list of cluster names discovered.
 
 function Write-CheckLog {
     param([string]$VCenter, [string]$Site, [string]$Object, [string]$CheckName, [string]$ErrorMessage)
@@ -92,14 +196,18 @@ function Invoke-SafeCheck {
 
 function New-Finding {
     param(
-        [string]$Site, [string]$VCenter, [string]$Area, [string]$Object,
+        [string]$Site, [string]$VCenter, [string]$Area, [string]$Cluster, [string]$Object,
         [string]$Item, [string]$Value, [string]$Status, [string]$Notes = ''
     )
+    # Area is a loose grouping used only to make report-building lookups readable:
+    #   Overview | Appliance | Alarms | Cluster | Host | Hardware | Security | Networking |
+    #   Capacity | Storage | VM
     # Status must be one of: Healthy / Warning / Critical / Information / Unable to Check / Manual/External Required
     $obj = [pscustomobject]@{
         Site    = $Site
         VCenter = $VCenter
         Area    = $Area
+        Cluster = $Cluster
         Object  = $Object
         Item    = $Item
         Value   = $Value
@@ -117,6 +225,18 @@ function Get-PctStatus {
     else { return 'Healthy' }
 }
 
+# Turns a raw VAMI/CIS exception message into a short label the Appliance Health table can
+# actually show - the table only ever renders an item's Value, never its Status or Notes, so a
+# generic 'n/a' made "session never connected", "connected but no permission", and "wrong API
+# call for this vCenter version" all look identical in the report with no way to tell them apart.
+function Get-VamiFailureReason {
+    param([string]$ErrorMessage)
+    if ($ErrorMessage -match 'unauthorized') { return 'Unauthorized (permission denied)' }
+    elseif ($ErrorMessage -match 'was not found using the specified filter') { return 'Not Found (API mismatch)' }
+    elseif ($ErrorMessage -match 'time(d)? ?out') { return 'Timed Out' }
+    else { return 'Unable to Check' }
+}
+
 # ============================================================================
 # 1. PREREQUISITES / CONNECTED SESSION DISCOVERY
 # ============================================================================
@@ -131,7 +251,7 @@ if ($VsanModuleAvailable) { Import-Module VMware.VimAutomation.Vsan -ErrorAction
 
 $Connections = $global:DefaultVIServers | Where-Object { $_.IsConnected }
 if (-not $Connections -or $Connections.Count -eq 0) {
-    throw "No connected vCenter sessions found. Connect first, e.g.:`n  Connect-VIServer sf-vc.sixflags.local, tb-vc.aq.local, amc-vc.amc.local"
+    throw "No connected vCenter sessions found. Connect first, e.g.:`n  Connect-VIServer tb-vc.aq.local"
 }
 
 Write-Host "Connected vCenter sessions: $($Connections.Name -join ', ')" -ForegroundColor Cyan
@@ -142,19 +262,39 @@ Write-Host "Connected vCenter sessions: $($Connections.Name -join ', ')" -Foregr
 foreach ($VC in $Connections) {
 
     $VCName = $VC.Name
-    $Site   = if ($SiteMap.ContainsKey($VCName)) { $SiteMap[$VCName] } else { $VCName }
+    if ($SiteMap.ContainsKey($VCName)) {
+        $Site = $SiteMap[$VCName]
+    } else {
+        # No explicit -SiteMap entry - fall back to the friendly name configured in vCenter itself
+        # (Configure > Advanced Settings > VirtualCenter.InstanceName) rather than the raw
+        # connection string/IP, when one is set. -SiteMap always wins if you provide it.
+        $instanceName = $null
+        try {
+            $instanceName = (Get-AdvancedSetting -Entity $VC -Name 'VirtualCenter.InstanceName' -ErrorAction Stop).Value
+        } catch { }
+        if ($instanceName) {
+            $Site = $instanceName
+        } elseif ($VCName -match '^\d{1,3}(\.\d{1,3}){3}$') {
+            # Raw IP address - nothing shorter/friendlier to derive from it.
+            $Site = $VCName
+        } else {
+            # No InstanceName set either - use just the short hostname (before the first dot)
+            # instead of the full FQDN, e.g. "tb-dhci-vc01.seventb.local" -> "tb-dhci-vc01".
+            $Site = ($VCName -split '\.')[0]
+        }
+    }
 
     Write-Host "`n=== Collecting: $Site ($VCName) ===" -ForegroundColor Green
 
-    # --- 2.1 vCenter appliance / server-level ---------------------------------
+    # --- vCenter version/build --------------------------------------------------------------
     Invoke-SafeCheck -CheckName 'vCenter version/build' -VCenter $VCName -Site $Site -ObjectName $VCName -Script {
-        New-Finding -Site $Site -VCenter $VCName -Area 'vCenter Overview' -Object $VCName `
-            -Item 'vCenter Version/Build' -Value "$($VC.Version) (Build $($VC.Build))" -Status 'Information'
+        New-Finding -Site $Site -VCenter $VCName -Area 'Overview' -Object $VCName `
+            -Item 'vCenter Version/Build' -Value "vCenter Server $($VC.Version) (Build $($VC.Build))" -Status 'Information'
     }
 
-    # Licensing (vCenter/ESXi licenses via LicenseManager - reliably exposed via API, no CIS needed)
+    # --- Licensing -----------------------------------------------------------------------------
     Invoke-SafeCheck -CheckName 'Licensing' -VCenter $VCName -Site $Site -ObjectName $VCName -Script {
-        $lm  = Get-View -Server $VC ($VC.ExtensionData.Content.LicenseManager)
+        $lm = Get-View -Server $VC ($VC.ExtensionData.Content.LicenseManager)
         foreach ($lic in $lm.Licenses) {
             $expProp = $lic.Properties | Where-Object { $_.Key -eq 'expirationDate' }
             $status  = 'Information'
@@ -163,46 +303,121 @@ foreach ($VC in $Connections) {
                 $expDate = [datetime]$expProp.Value
                 $expStr  = $expDate.ToString('yyyy-MM-dd')
                 $daysLeft = ($expDate - (Get-Date)).Days
-                if ($daysLeft -le 0) { $status = 'Critical' }
-                elseif ($daysLeft -le $LicenseExpiryWarningDays) { $status = 'Warning' }
-                else { $status = 'Healthy' }
+                # Only treat expiry as an operational risk if the license key is actually in use
+                # (Used > 0). vCenter License Manager commonly retains old/replaced keys with
+                # Used=0 - flagging those as Critical would be a false alarm, not a real finding.
+                if ($lic.Used -gt 0) {
+                    if ($daysLeft -le 0) { $status = 'Critical' }
+                    elseif ($daysLeft -le $LicenseExpiryWarningDays) { $status = 'Warning' }
+                    else { $status = 'Healthy' }
+                } else {
+                    $status = 'Information'
+                }
             }
-            New-Finding -Site $Site -VCenter $VCName -Area 'vCenter Overview' -Object $VCName `
+            New-Finding -Site $Site -VCenter $VCName -Area 'Overview' -Object $VCName `
                 -Item "License: $($lic.Name)" -Value "Used $($lic.Used)/$($lic.Total) - Expires $expStr" -Status $status
         }
     }
 
-    # vCenter appliance CPU/Mem/Disk/Services/NTP/Certificates require the VAMI/CIS REST API
-    # (Connect-CisServer), which is a separate authenticated session from the vSphere API.
-    # If that session exists it is used; otherwise this is explicitly marked, not fabricated.
+    # --- vCenter appliance CPU/Mem/Disk/Services/NTP/Certificate (VAMI/CIS) ------------------
     $CisSession = $global:DefaultCisServers | Where-Object { $_.Name -eq $VCName -and $_.IsConnected }
     if ($CisSession) {
+        # Each item below has its OWN try/catch that always produces a finding, even on failure -
+        # rather than one failed VAMI call silently dropping that item (or, worse, all of them)
+        # from section 3.1 entirely. VAMI/appliance-level APIs commonly need broader permissions
+        # than the regular vSphere inventory API the rest of this report runs on (e.g. a plain
+        # vCenter admin account can be "unauthorized" here even though it can read every host/VM
+        # fine) - a real permission gap shows up as 'Unable to Check' with the actual server error
+        # message, not as a blank/missing row.
         Invoke-SafeCheck -CheckName 'Appliance health (VAMI)' -VCenter $VCName -Site $Site -ObjectName $VCName -Script {
-            $healthSvc = Get-CisService -Name 'com.vmware.appliance.health.system' -Server $CisSession
-            $overall = $healthSvc.get()
-            New-Finding -Site $Site -VCenter $VCName -Area 'vCenter Appliance' -Object $VCName `
-                -Item 'Overall Appliance Health' -Value $overall -Status $(if ($overall -eq 'green') {'Healthy'} else {'Warning'})
             foreach ($comp in 'cpu','mem','storage') {
-                $svc = Get-CisService -Name "com.vmware.appliance.health.$comp" -Server $CisSession
-                $val = $svc.get()
-                New-Finding -Site $Site -VCenter $VCName -Area 'vCenter Appliance' -Object $VCName `
-                    -Item "$comp Health" -Value $val -Status $(if ($val -eq 'green') {'Healthy'} else {'Warning'})
+                $label = @{ cpu = 'CPU'; mem = 'Memory'; storage = 'Disk Usage' }[$comp]
+                try {
+                    $svc = Get-CisService -Name "com.vmware.appliance.health.$comp" -Server $CisSession
+                    $val = $svc.get()
+                    New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName `
+                        -Item $label -Value $(if ($val -eq 'green') { 'Normal' } else { $val }) -Status $(if ($val -eq 'green') {'Healthy'} else {'Warning'})
+                } catch {
+                    Write-CheckLog -VCenter $VCName -Site $Site -Object $VCName -CheckName "Appliance $label (VAMI)" -ErrorMessage $_.Exception.Message
+                    New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item $label `
+                        -Value (Get-VamiFailureReason $_.Exception.Message) -Status 'Unable to Check' -Notes "VAMI call failed: $($_.Exception.Message)"
+                }
+            }
+        }
+        Invoke-SafeCheck -CheckName 'Appliance services (VAMI)' -VCenter $VCName -Site $Site -ObjectName $VCName -Script {
+            try {
+                $svcListSvc = Get-CisService -Name 'com.vmware.appliance.services' -Server $CisSession
+                $services = $svcListSvc.list()
+                # Deliberately NOT trying to name-match/exclude specific one-shot boot-time units
+                # here anymore - a hand-built exclusion list turned out to be unreliable (exact
+                # service IDs vary enough between appliances that some still fell through, and a
+                # miss there produces a misleading "Warning" on an appliance that's actually fine).
+                # A plain count is always accurate, never risks a false alarm, and pushes the
+                # judgment call on any specific service to a human looking directly at vCenter/VAMI.
+                $total = $services.Count
+                $started = @($services.GetEnumerator() | Where-Object { $_.Value.state -eq 'STARTED' }).Count
+                New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item 'Services' `
+                    -Value "$started of $total services Started" -Status 'Information' `
+                    -Notes 'Many appliance services are expected one-shot/boot-time units that normally show Stopped once they finish running - this count is informational only, not a pass/fail check. Review a specific service directly in vCenter/VAMI if needed.'
+            } catch {
+                Write-CheckLog -VCenter $VCName -Site $Site -Object $VCName -CheckName 'Appliance Services (VAMI)' -ErrorMessage $_.Exception.Message
+                New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item 'Services' `
+                    -Value (Get-VamiFailureReason $_.Exception.Message) -Status 'Unable to Check' -Notes "VAMI call failed: $($_.Exception.Message)"
             }
         }
         Invoke-SafeCheck -CheckName 'Appliance NTP (VAMI)' -VCenter $VCName -Site $Site -ObjectName $VCName -Script {
-            $ntpSvc = Get-CisService -Name 'com.vmware.appliance.ntp' -Server $CisSession
-            $ntpStatus = $ntpSvc.test()
-            New-Finding -Site $Site -VCenter $VCName -Area 'vCenter Appliance' -Object $VCName `
-                -Item 'NTP Sync' -Value ($ntpStatus | Out-String).Trim() -Status 'Information'
+            try {
+                # .get() (read-only, no required arguments) rather than .test(), which on some
+                # vCenter versions requires an explicit list of servers to test - calling it with
+                # none throws "missing a field 'servers'" instead of testing the configured ones.
+                $ntpSvc = Get-CisService -Name 'com.vmware.appliance.ntp' -Server $CisSession
+                $ntpConfig = $ntpSvc.get()
+                $servers = @($ntpConfig.servers)
+                $mode = $ntpConfig.mode
+                if ($servers.Count -gt 0) {
+                    New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item 'NTP' `
+                        -Value "Servers: $($servers -join ', ') (mode: $mode)" -Status 'Healthy'
+                } elseif ($mode) {
+                    # A real, parseable response with a mode but no servers is a genuine state worth
+                    # flagging (e.g. NTP disabled, or host-based time sync instead).
+                    New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item 'NTP' `
+                        -Value "No NTP servers configured (mode: $mode)" -Status 'Warning'
+                } else {
+                    # servers AND mode both empty means the response didn't look like the expected
+                    # shape for this vCenter's API version - report the gap honestly instead of
+                    # asserting "no NTP servers configured", which wouldn't be a trustworthy reading.
+                    throw "NTP response did not contain the expected servers/mode fields (raw: $($ntpConfig | ConvertTo-Json -Compress -Depth 3 -ErrorAction SilentlyContinue))"
+                }
+            } catch {
+                Write-CheckLog -VCenter $VCName -Site $Site -Object $VCName -CheckName 'Appliance NTP (VAMI)' -ErrorMessage $_.Exception.Message
+                New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item 'NTP' `
+                    -Value (Get-VamiFailureReason $_.Exception.Message) -Status 'Unable to Check' -Notes "VAMI call failed: $($_.Exception.Message)"
+            }
+        }
+        Invoke-SafeCheck -CheckName 'Appliance certificate (VAMI)' -VCenter $VCName -Site $Site -ObjectName $VCName -Script {
+            try {
+                $certSvc = Get-CisService -Name 'com.vmware.appliance.certificate_management.vcenter.tls' -Server $CisSession
+                $cert = $certSvc.get()
+                $expDate = [datetime]$cert.valid_to
+                $daysLeft = ($expDate - (Get-Date)).Days
+                $status = if ($daysLeft -le 0) { 'Critical' } elseif ($daysLeft -le $CertExpiryWarningDays) { 'Warning' } else { 'Healthy' }
+                New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item 'Certificates' `
+                    -Value "Valid - until ($($expDate.ToString('MMM d, yyyy')))" -Status $status
+            } catch {
+                Write-CheckLog -VCenter $VCName -Site $Site -Object $VCName -CheckName 'Appliance Certificates (VAMI)' -ErrorMessage $_.Exception.Message
+                New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item 'Certificates' `
+                    -Value (Get-VamiFailureReason $_.Exception.Message) -Status 'Unable to Check' -Notes "VAMI call failed: $($_.Exception.Message)"
+            }
         }
     } else {
-        New-Finding -Site $Site -VCenter $VCName -Area 'vCenter Appliance' -Object $VCName `
-            -Item 'CPU/Memory/Disk/Services/NTP/TLS Certificate' -Value 'n/a' `
-            -Status 'Manual/External Required' `
-            -Notes 'Requires a VAMI/CIS session (Connect-CisServer <vcenter>) in addition to the vSphere API session. Not connected in this run.'
+        foreach ($item in 'CPU','Memory','Disk Usage','Services','NTP','Certificates') {
+            New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item $item `
+                -Value 'Not Connected (no CIS session)' -Status 'Manual/External Required' `
+                -Notes 'Requires a VAMI/CIS session (Connect-CisServer <vcenter>) in addition to the vSphere API session. Not connected in this run.'
+        }
     }
 
-    # Active vCenter-level alarms
+    # --- Active vCenter-level alarms ----------------------------------------------------------
     Invoke-SafeCheck -CheckName 'vCenter-level alarms' -VCenter $VCName -Site $Site -ObjectName $VCName -Script {
         $rootFolder = Get-View -Server $VC $VC.ExtensionData.Content.RootFolder
         $alarms = $rootFolder.TriggeredAlarmState
@@ -212,12 +427,10 @@ foreach ($VC in $Connections) {
                 New-Finding -Site $Site -VCenter $VCName -Area 'Alarms' -Object $VCName `
                     -Item $alarmDef.Info.Name -Value $a.OverallStatus.ToString() -Status ($a.OverallStatus.ToString().Substring(0,1).ToUpper() + $a.OverallStatus.ToString().Substring(1))
             }
-        } else {
-            New-Finding -Site $Site -VCenter $VCName -Area 'Alarms' -Object $VCName -Item 'Triggered Alarms' -Value 'None' -Status 'Healthy'
         }
     }
 
-    # --- 2.2 Discover clusters (AMC's 4 sites/clusters come out of this automatically) --------
+    # --- Discover clusters ---------------------------------------------------------------------
     $Clusters = Invoke-SafeCheck -CheckName 'Cluster discovery' -VCenter $VCName -Site $Site -ObjectName $VCName -Script {
         Get-Cluster -Server $VC
     }
@@ -227,11 +440,14 @@ foreach ($VC in $Connections) {
         $ClusterName = $Cluster.Name
         Write-Host "  - Cluster: $ClusterName"
 
+        if (-not $Global:SiteClusterMap.ContainsKey($Site)) { $Global:SiteClusterMap[$Site] = [System.Collections.Generic.List[string]]::new() }
+        $Global:SiteClusterMap[$Site].Add($ClusterName)
+
         # HA / DRS
         Invoke-SafeCheck -CheckName 'HA/DRS status' -VCenter $VCName -Site $Site -ObjectName $ClusterName -Script {
-            New-Finding -Site $Site -VCenter $VCName -Area 'Cluster Configuration' -Object $ClusterName `
+            New-Finding -Site $Site -VCenter $VCName -Area 'Cluster' -Cluster $ClusterName -Object $ClusterName `
                 -Item 'vSphere HA' -Value $Cluster.HAEnabled -Status $(if ($Cluster.HAEnabled) {'Healthy'} else {'Warning'})
-            New-Finding -Site $Site -VCenter $VCName -Area 'Cluster Configuration' -Object $ClusterName `
+            New-Finding -Site $Site -VCenter $VCName -Area 'Cluster' -Cluster $ClusterName -Object $ClusterName `
                 -Item 'vSphere DRS' -Value $Cluster.DrsEnabled -Status $(if ($Cluster.DrsEnabled) {'Healthy'} else {'Warning'})
         }
 
@@ -241,11 +457,9 @@ foreach ($VC in $Connections) {
             if ($alarms -and $alarms.Count -gt 0) {
                 foreach ($a in $alarms) {
                     $alarmDef = Get-View -Server $VC $a.Alarm
-                    New-Finding -Site $Site -VCenter $VCName -Area 'Alarms' -Object $ClusterName `
+                    New-Finding -Site $Site -VCenter $VCName -Area 'Alarms' -Cluster $ClusterName -Object $ClusterName `
                         -Item $alarmDef.Info.Name -Value $a.OverallStatus.ToString() -Status ($a.OverallStatus.ToString().Substring(0,1).ToUpper() + $a.OverallStatus.ToString().Substring(1))
                 }
-            } else {
-                New-Finding -Site $Site -VCenter $VCName -Area 'Alarms' -Object $ClusterName -Item 'Triggered Alarms' -Value 'None' -Status 'Healthy'
             }
         }
 
@@ -259,61 +473,43 @@ foreach ($VC in $Connections) {
 
         foreach ($VMHost in $Hosts) {
             $HName = $VMHost.Name
-            $Global:ObjectClusterMap[$HName] = $ClusterName
             $HostVersions += "$($VMHost.Version) build $($VMHost.Build)"
 
-            # Connection/power state
             Invoke-SafeCheck -CheckName 'Host connection state' -VCenter $VCName -Site $Site -ObjectName $HName -Script {
                 $ok = $VMHost.ConnectionState -eq 'Connected'
-                New-Finding -Site $Site -VCenter $VCName -Area 'ESXi Host Health' -Object $HName `
+                New-Finding -Site $Site -VCenter $VCName -Area 'Host' -Cluster $ClusterName -Object $HName `
                     -Item 'Connection State' -Value $VMHost.ConnectionState -Status $(if ($ok) {'Healthy'} else {'Critical'})
             }
 
-            # Version/build (for consistency check, per cluster, below)
-            Invoke-SafeCheck -CheckName 'Host version' -VCenter $VCName -Site $Site -ObjectName $HName -Script {
-                New-Finding -Site $Site -VCenter $VCName -Area 'ESXi Host Health' -Object $HName `
-                    -Item 'ESXi Version/Build' -Value "$($VMHost.Version) (Build $($VMHost.Build))" -Status 'Information'
-            }
-
-            # Host-level alarms
             Invoke-SafeCheck -CheckName 'Host alarms' -VCenter $VCName -Site $Site -ObjectName $HName -Script {
                 $alarms = $VMHost.ExtensionData.TriggeredAlarmState
                 if ($alarms -and $alarms.Count -gt 0) {
                     foreach ($a in $alarms) {
                         $alarmDef = Get-View -Server $VC $a.Alarm
-                        New-Finding -Site $Site -VCenter $VCName -Area 'Alarms' -Object $HName `
+                        New-Finding -Site $Site -VCenter $VCName -Area 'Alarms' -Cluster $ClusterName -Object $HName `
                             -Item $alarmDef.Info.Name -Value $a.OverallStatus.ToString() -Status ($a.OverallStatus.ToString().Substring(0,1).ToUpper() + $a.OverallStatus.ToString().Substring(1))
                     }
-                } else {
-                    New-Finding -Site $Site -VCenter $VCName -Area 'Alarms' -Object $HName -Item 'Triggered Alarms' -Value 'None' -Status 'Healthy'
                 }
             }
 
-            # Hardware health via built-in host Health System (numeric sensors) - no SSH required
+            # Hardware health via built-in host Health System (numeric sensors) - no SSH required.
+            # Rolled up site-wide in the report into CPU/Memory/Power Supplies/Fans/RAID/Disks.
             Invoke-SafeCheck -CheckName 'Hardware sensors' -VCenter $VCName -Site $Site -ObjectName $HName -Script {
                 $sensors = $VMHost.ExtensionData.Runtime.HealthSystemRuntime.SystemHealthInfo.NumericSensorInfo
                 if (-not $sensors) {
-                    New-Finding -Site $Site -VCenter $VCName -Area 'Hardware Health' -Object $HName `
-                        -Item 'Hardware Sensors' -Value 'n/a' -Status 'Unable to Check' `
+                    New-Finding -Site $Site -VCenter $VCName -Area 'Hardware' -Cluster $ClusterName -Object $HName `
+                        -Item 'Sensors' -Value 'n/a' -Status 'Unable to Check' `
                         -Notes 'Host does not expose CIM/IPMI sensor data to vCenter (common on some blade/BMC configs).'
                     return
                 }
-                # Group by sensor type so we get one row per component category, matching the manual report layout
                 $groups = $sensors | Group-Object -Property SensorType
                 foreach ($g in $groups) {
                     $bad = $g.Group | Where-Object { $_.HealthState.Key -notin @('green','Green') }
                     $status = if ($bad) { 'Warning' } else { 'Healthy' }
                     $summary = if ($bad) { ($bad | ForEach-Object { "$($_.Name): $($_.HealthState.Label)" }) -join '; ' } else { 'All normal' }
-                    New-Finding -Site $Site -VCenter $VCName -Area 'Hardware Health' -Object $HName `
-                        -Item "$($g.Name) Sensors" -Value $summary -Status $status
+                    New-Finding -Site $Site -VCenter $VCName -Area 'Hardware' -Cluster $ClusterName -Object $HName `
+                        -Item $g.Name -Value $summary -Status $status
                 }
-            }
-
-            # TPM
-            Invoke-SafeCheck -CheckName 'TPM' -VCenter $VCName -Site $Site -ObjectName $HName -Script {
-                $tpmInfo = $VMHost.ExtensionData.Capability.TpmSupported
-                New-Finding -Site $Site -VCenter $VCName -Area 'Security & Compliance' -Object $HName `
-                    -Item 'TPM Present/Supported' -Value $tpmInfo -Status $(if ($tpmInfo) {'Healthy'} else {'Information'})
             }
 
             # Secure Boot (via EsxCli, no SSH required - this is the vSphere API path)
@@ -321,52 +517,43 @@ foreach ($VC in $Connections) {
                 $esxcli = Get-EsxCli -VMHost $VMHost -Server $VC -V2
                 $sb = $esxcli.system.settings.encryption.get.Invoke()
                 $enabled = $sb.RequireSecureBoot
-                New-Finding -Site $Site -VCenter $VCName -Area 'Security & Compliance' -Object $HName `
+                New-Finding -Site $Site -VCenter $VCName -Area 'Security' -Cluster $ClusterName -Object $HName `
                     -Item 'Secure Boot' -Value $enabled -Status $(if ($enabled -eq $true -or $enabled -eq 'true') {'Healthy'} else {'Warning'})
             }
 
             # Lockdown Mode
             Invoke-SafeCheck -CheckName 'Lockdown mode' -VCenter $VCName -Site $Site -ObjectName $HName -Script {
                 $lockdown = $VMHost.ExtensionData.Config.LockdownMode
-                New-Finding -Site $Site -VCenter $VCName -Area 'Security & Compliance' -Object $HName `
-                    -Item 'Lockdown Mode' -Value $lockdown -Status 'Information'
+                $enabled = $lockdown -ne 'lockdownDisabled'
+                New-Finding -Site $Site -VCenter $VCName -Area 'Security' -Cluster $ClusterName -Object $HName `
+                    -Item 'Lockdown Mode' -Value $lockdown -Status $(if ($enabled) {'Healthy'} else {'Warning'})
             }
 
-            # Local ESXi users - via esxcli (API-based, no SSH) rather than Get-VMHostAccount,
-            # whose -VMHost parameter isn't present on all PowerCLI versions.
+            # Local ESXi users - via esxcli (API-based, no SSH)
             Invoke-SafeCheck -CheckName 'Local ESXi users' -VCenter $VCName -Site $Site -ObjectName $HName -Script {
                 $esxcli = Get-EsxCli -VMHost $VMHost -Server $VC -V2
-                $accts = $esxcli.system.account.list.Invoke()
-                New-Finding -Site $Site -VCenter $VCName -Area 'Security & Compliance' -Object $HName `
-                    -Item 'Local Accounts' -Value (($accts | ForEach-Object { $_.UserID }) -join ', ') -Status 'Information' `
-                    -Notes 'Review membership manually; automation only inventories accounts, it does not judge appropriateness.'
+                $accts = $esxcli.system.account.list.Invoke() | ForEach-Object { $_.UserID }
+                $unexpected = $accts | Where-Object { $_ -notin $ExpectedLocalAccounts }
+                New-Finding -Site $Site -VCenter $VCName -Area 'Security' -Cluster $ClusterName -Object $HName `
+                    -Item 'Local Accounts' -Value ($accts -join ', ') -Status $(if ($unexpected) {'Warning'} else {'Healthy'}) `
+                    -Notes $(if ($unexpected) { "Unexpected account(s): $($unexpected -join ', ') - review membership manually." } else { '' })
             }
 
             # Syslog
             Invoke-SafeCheck -CheckName 'Syslog config' -VCenter $VCName -Site $Site -ObjectName $HName -Script {
                 $syslog = Get-VMHostSysLogServer -Server $VC -VMHost $VMHost
                 $configured = -not [string]::IsNullOrWhiteSpace($syslog.Host)
-                New-Finding -Site $Site -VCenter $VCName -Area 'Security & Compliance' -Object $HName `
-                    -Item 'Syslog Target' -Value $(if ($configured) { "$($syslog.Host):$($syslog.Port)" } else { 'Not configured' }) `
+                New-Finding -Site $Site -VCenter $VCName -Area 'Security' -Cluster $ClusterName -Object $HName `
+                    -Item 'Syslog' -Value $(if ($configured) { "$($syslog.Host):$($syslog.Port)" } else { 'Not configured' }) `
                     -Status $(if ($configured) {'Healthy'} else {'Warning'})
             }
 
-            # NTP
-            Invoke-SafeCheck -CheckName 'Host NTP' -VCenter $VCName -Site $Site -ObjectName $HName -Script {
-                $ntpServers = Get-VMHostNtpServer -Server $VC -VMHost $VMHost
-                $ntpSvc = Get-VMHostService -Server $VC -VMHost $VMHost | Where-Object { $_.Key -eq 'ntpd' }
-                $running = $ntpSvc -and $ntpSvc.Running
-                New-Finding -Site $Site -VCenter $VCName -Area 'ESXi Host Health' -Object $HName `
-                    -Item 'NTP' -Value "Servers: $($ntpServers -join ', ') | Running: $running" `
-                    -Status $(if ($running -and $ntpServers) {'Healthy'} else {'Warning'})
-            }
-
-            # Physical NICs / redundancy / errors
+            # Physical NICs / redundancy
             Invoke-SafeCheck -CheckName 'Physical NICs' -VCenter $VCName -Site $Site -ObjectName $HName -Script {
-                $pnics = Get-VMHostNetworkAdapter -Server $VC -VMHost $VMHost -Physical
-                $up = $pnics | Where-Object { $_.BitRatePerSec -gt 0 }
-                New-Finding -Site $Site -VCenter $VCName -Area 'Networking' -Object $HName `
-                    -Item 'Physical NICs' -Value "$($pnics.Count) total, $($up.Count) linked up" `
+                $pnics = @(Get-VMHostNetworkAdapter -Server $VC -VMHost $VMHost -Physical)
+                $up = @($pnics | Where-Object { $_.BitRatePerSec -gt 0 })
+                New-Finding -Site $Site -VCenter $VCName -Area 'Networking' -Cluster $ClusterName -Object $HName `
+                    -Item 'Physical NIC Redundancy' -Value "$($pnics.Count) total, $($up.Count) linked up" `
                     -Status $(if ($pnics.Count -ge 2 -and $up.Count -ge 2) {'Healthy'} else {'Warning'})
             }
 
@@ -375,24 +562,27 @@ foreach ($VC in $Connections) {
                 $stat = Get-Stat -Server $VC -Entity $VMHost -Stat 'net.errorsRx.summation','net.errorsTx.summation','net.droppedRx.summation','net.droppedTx.summation' -Realtime -MaxSamples 1 -ErrorAction Stop
                 if ($stat) {
                     $total = ($stat | Measure-Object -Property Value -Sum).Sum
-                    New-Finding -Site $Site -VCenter $VCName -Area 'Networking' -Object $HName `
-                        -Item 'NIC Errors/Drops (latest sample)' -Value $total -Status $(if ($total -eq 0) {'Healthy'} else {'Warning'})
-                } else {
-                    New-Finding -Site $Site -VCenter $VCName -Area 'Networking' -Object $HName `
-                        -Item 'NIC Errors/Drops' -Value 'n/a' -Status 'Unable to Check' -Notes 'Counter not returned by this host.'
+                    New-Finding -Site $Site -VCenter $VCName -Area 'Networking' -Cluster $ClusterName -Object $HName `
+                        -Item 'NIC Errors/Drops' -Value $total -Status $(if ($total -eq 0) {'Healthy'} else {'Warning'})
                 }
             }
         } # end per-host
 
         # ESXi version consistency across the cluster
-        Invoke-SafeCheck -CheckName 'Version consistency' -VCenter $VCName -Site $Site -ObjectName $ClusterName -Script {
-            $distinct = $HostVersions | Select-Object -Unique
-            $status = if ($distinct.Count -le 1) { 'Healthy' } else { 'Warning' }
-            New-Finding -Site $Site -VCenter $VCName -Area 'Cluster Configuration' -Object $ClusterName `
-                -Item 'ESXi Version Consistency' -Value ($distinct -join ' | ') -Status $status
+        $DistinctVersions = @($HostVersions | Select-Object -Unique)
+        New-Finding -Site $Site -VCenter $VCName -Area 'Host' -Cluster $ClusterName -Object $ClusterName `
+            -Item 'Version Consistency' -Value ($DistinctVersions -join ' | ') -Status $(if ($DistinctVersions.Count -le 1) {'Healthy'} else {'Warning'})
+
+        # Host Configuration Summary row for this cluster (Host Count | Version | Build | Status)
+        Invoke-SafeCheck -CheckName 'Host configuration summary' -VCenter $VCName -Site $Site -ObjectName $ClusterName -Script {
+            $verBuild = ($Hosts | Select-Object -First 1)
+            $connStatus = if (($Hosts | Where-Object { $_.ConnectionState -ne 'Connected' })) { 'Warning' } else { 'Healthy' }
+            $status = if ($DistinctVersions.Count -gt 1) { 'Warning' } else { $connStatus }
+            New-Finding -Site $Site -VCenter $VCName -Area 'Host' -Cluster $ClusterName -Object $ClusterName `
+                -Item 'Host Configuration Summary' -Value "$($Hosts.Count)|$($verBuild.Version)|$($verBuild.Build)" -Status $status
         }
 
-        # Cluster CPU/Memory capacity - historical stats over the configured window (not instantaneous)
+        # Cluster CPU/Memory capacity - historical stats over the configured window
         Invoke-SafeCheck -CheckName 'Cluster CPU/Mem capacity (historical)' -VCenter $VCName -Site $Site -ObjectName $ClusterName -Script {
             $start = (Get-Date).AddHours(-1 * $PerfHistoryHours)
             $cpuStat = Get-Stat -Server $VC -Entity $Cluster -Stat 'cpu.usage.average' -Start $start -Finish (Get-Date) -ErrorAction Stop
@@ -400,116 +590,97 @@ foreach ($VC in $Connections) {
 
             $cpuTotalMHz = ($Hosts | Measure-Object -Property CpuTotalMhz -Sum).Sum
             $memTotalMB  = ($Hosts | Measure-Object -Property MemoryTotalMB -Sum).Sum
+            $avgCpuPct = if ($cpuStat) { ($cpuStat | Measure-Object -Property Value -Average).Average } else { $null }
+            $avgMemPct = if ($memStat) { ($memStat | Measure-Object -Property Value -Average).Average } else { $null }
 
-            if ($cpuStat) {
-                $avgCpuPct = ($cpuStat | Measure-Object -Property Value -Average).Average
-                New-Finding -Site $Site -VCenter $VCName -Area 'CPU/Memory Capacity' -Object $ClusterName `
-                    -Item ("CPU Usage % (avg, last {0}h, historical)" -f $PerfHistoryHours) `
-                    -Value ("{0:N2}%  (Capacity {1:N1} GHz)" -f $avgCpuPct, ($cpuTotalMHz/1000)) -Status (Get-PctStatus $avgCpuPct)
-            } else {
-                New-Finding -Site $Site -VCenter $VCName -Area 'CPU/Memory Capacity' -Object $ClusterName `
-                    -Item 'CPU Usage %' -Value 'n/a' -Status 'Unable to Check' -Notes 'No historical performance samples returned (check vCenter stats level/retention).'
-            }
-            if ($memStat) {
-                $avgMemPct = ($memStat | Measure-Object -Property Value -Average).Average
-                New-Finding -Site $Site -VCenter $VCName -Area 'CPU/Memory Capacity' -Object $ClusterName `
-                    -Item ("Memory Usage % (avg, last {0}h, historical)" -f $PerfHistoryHours) `
-                    -Value ("{0:N2}%  (Capacity {1:N1} GB)" -f $avgMemPct, ($memTotalMB/1024)) -Status (Get-PctStatus $avgMemPct)
-            } else {
-                New-Finding -Site $Site -VCenter $VCName -Area 'CPU/Memory Capacity' -Object $ClusterName `
-                    -Item 'Memory Usage %' -Value 'n/a' -Status 'Unable to Check' -Notes 'No historical performance samples returned.'
-            }
+            New-Finding -Site $Site -VCenter $VCName -Area 'Capacity' -Cluster $ClusterName -Object $ClusterName `
+                -Item 'CPU' -Value "$cpuTotalMHz|$avgCpuPct" -Status $(if ($avgCpuPct -ne $null) { Get-PctStatus $avgCpuPct } else { 'Unable to Check' })
+            New-Finding -Site $Site -VCenter $VCName -Area 'Capacity' -Cluster $ClusterName -Object $ClusterName `
+                -Item 'Memory' -Value "$memTotalMB|$avgMemPct" -Status $(if ($avgMemPct -ne $null) { Get-PctStatus $avgMemPct } else { 'Unable to Check' })
         }
 
         # Datastores in this cluster
         Invoke-SafeCheck -CheckName 'Datastore health/capacity' -VCenter $VCName -Site $Site -ObjectName $ClusterName -Script {
             $datastores = Get-Datastore -Server $VC -RelatedObject $Cluster
             foreach ($ds in $datastores) {
-                $Global:ObjectClusterMap[$ds.Name] = $ClusterName
                 $usedPct = if ($ds.CapacityGB -gt 0) { (($ds.CapacityGB - $ds.FreeSpaceGB) / $ds.CapacityGB) * 100 } else { 0 }
                 $accessible = $ds.ExtensionData.Summary.Accessible
                 $status = if (-not $accessible) { 'Critical' } else { Get-PctStatus $usedPct }
-                New-Finding -Site $Site -VCenter $VCName -Area 'Storage/Datastore' -Object $ds.Name `
-                    -Item 'Capacity/Used/Free/Util%' `
-                    -Value ("Cap {0:N0} GB | Free {1:N0} GB | Used {2:N1}% | Accessible: {3}" -f $ds.CapacityGB, $ds.FreeSpaceGB, $usedPct, $accessible) `
-                    -Status $status
+                New-Finding -Site $Site -VCenter $VCName -Area 'Storage' -Cluster $ClusterName -Object $ds.Name `
+                    -Item 'Datastore' -Value "$($ds.CapacityGB)|$($ds.FreeSpaceGB)|$accessible" -Status $status
             }
         }
 
         # vSAN (only if the cluster actually has vSAN enabled and the module is available)
         Invoke-SafeCheck -CheckName 'vSAN health/capacity' -VCenter $VCName -Site $Site -ObjectName $ClusterName -Script {
-            if (-not $Cluster.VsanEnabled) {
-                New-Finding -Site $Site -VCenter $VCName -Area 'Storage/vSAN' -Object $ClusterName `
-                    -Item 'vSAN' -Value 'Not enabled on this cluster' -Status 'Information'
-                return
-            }
+            if (-not $Cluster.VsanEnabled) { return }
+            New-Finding -Site $Site -VCenter $VCName -Area 'Storage' -Cluster $ClusterName -Object $ClusterName `
+                -Item 'vSAN Enabled' -Value 'True' -Status 'Information'
             if (-not $VsanModuleAvailable) {
-                New-Finding -Site $Site -VCenter $VCName -Area 'Storage/vSAN' -Object $ClusterName `
+                New-Finding -Site $Site -VCenter $VCName -Area 'Storage' -Cluster $ClusterName -Object $ClusterName `
                     -Item 'vSAN Health/Capacity' -Value 'n/a' -Status 'Unable to Check' `
                     -Notes 'VMware.VimAutomation.Vsan module not installed on this laptop.'
                 return
             }
             $space = Get-VsanSpaceUsage -Server $VC -Cluster $Cluster -ErrorAction Stop
             $usedPct = if ($space.CapacityGB -gt 0) { ($space.UsedGB / $space.CapacityGB) * 100 } else { 0 }
-            New-Finding -Site $Site -VCenter $VCName -Area 'Storage/vSAN' -Object $ClusterName `
-                -Item 'vSAN Capacity/Used/Free/Util%' `
-                -Value ("Cap {0:N0} GB | Used {1:N0} GB | Free {2:N0} GB | Util {3:N1}%" -f $space.CapacityGB, $space.UsedGB, ($space.CapacityGB - $space.UsedGB), $usedPct) `
-                -Status (Get-PctStatus $usedPct)
-
-            $healthTest = Get-VsanClusterHealth -Server $VC -Cluster $Cluster -ErrorAction Stop
-            foreach ($grp in $healthTest.HealthGroups) {
-                $bad = $grp.HealthTests | Where-Object { $_.Status -ne 'green' }
-                $status = if ($bad) { 'Warning' } else { 'Healthy' }
-                New-Finding -Site $Site -VCenter $VCName -Area 'Storage/vSAN' -Object $ClusterName `
-                    -Item "vSAN Health: $($grp.GroupName)" -Value $(if ($bad) { ($bad.TestName -join '; ') } else { 'OK' }) -Status $status
-            }
+            New-Finding -Site $Site -VCenter $VCName -Area 'Storage' -Cluster $ClusterName -Object $ClusterName `
+                -Item 'vSAN Capacity' -Value "$($space.CapacityGB)|$($space.UsedGB)" -Status (Get-PctStatus $usedPct)
         }
 
         # VM inventory / guest OS distribution
         Invoke-SafeCheck -CheckName 'VM inventory' -VCenter $VCName -Site $Site -ObjectName $ClusterName -Script {
-            $vms = Get-VM -Server $VC -Location $Cluster
-            $on  = ($vms | Where-Object { $_.PowerState -eq 'PoweredOn' }).Count
-            $off = ($vms | Where-Object { $_.PowerState -eq 'PoweredOff' }).Count
-            New-Finding -Site $Site -VCenter $VCName -Area 'VM Inventory' -Object $ClusterName `
-                -Item 'VM Count' -Value "Total $($vms.Count) | On $on | Off $off" -Status 'Information'
-
-            $osDist = $vms | Group-Object { if ($_.Guest.OSFullName) { $_.Guest.OSFullName } else { $_.ExtensionData.Config.GuestFullName } } |
-                Sort-Object Count -Descending
+            $vms = @(Get-VM -Server $VC -Location $Cluster)
+            New-Finding -Site $Site -VCenter $VCName -Area 'VM' -Cluster $ClusterName -Object $ClusterName `
+                -Item 'VM Count' -Value $vms.Count -Status 'Information'
+            # Config.GuestFullName (the "Guest OS" type configured on the VM) is what vCenter's own
+            # UI displays and what a human cross-checking the inventory will see - preferred over
+            # Guest.OSFullName (the live value VMware Tools currently reports), which can disagree
+            # with the configured type when a VM's guest OS was upgraded in place without updating
+            # its VM settings, or when Tools is outdated/stopped.
+            $osDist = $vms | Group-Object { if ($_.ExtensionData.Config.GuestFullName) { $_.ExtensionData.Config.GuestFullName } else { $_.Guest.OSFullName } }
             foreach ($g in $osDist) {
-                New-Finding -Site $Site -VCenter $VCName -Area 'VM Inventory' -Object $ClusterName `
-                    -Item "Guest OS: $($g.Name)" -Value $g.Count -Status 'Information'
+                New-Finding -Site $Site -VCenter $VCName -Area 'VM' -Cluster $ClusterName -Object $g.Name `
+                    -Item 'Guest OS' -Value $g.Count -Status 'Information'
             }
         }
 
         # vDS / port groups / VLAN / teaming / MTU for this cluster's hosts
         Invoke-SafeCheck -CheckName 'vDS/networking config' -VCenter $VCName -Site $Site -ObjectName $ClusterName -Script {
             $vdSwitches = Get-VDSwitch -Server $VC -VMHost $Hosts -ErrorAction SilentlyContinue | Select-Object -Unique
-            if (-not $vdSwitches) {
-                New-Finding -Site $Site -VCenter $VCName -Area 'Networking' -Object $ClusterName `
-                    -Item 'Distributed Switches' -Value 'None (standard vSwitches only, or none discovered)' -Status 'Information'
-                return
-            }
-            $mtus = @()
             foreach ($vds in $vdSwitches) {
-                $mtus += $vds.Mtu
-                $Global:ObjectClusterMap[$vds.Name] = $ClusterName
-                New-Finding -Site $Site -VCenter $VCName -Area 'Networking' -Object $vds.Name `
-                    -Item 'vDS MTU' -Value $vds.Mtu -Status 'Information'
-
-                $pgs = Get-VDPortgroup -Server $VC -VDSwitch $vds
+                New-Finding -Site $Site -VCenter $VCName -Area 'Networking' -Cluster $ClusterName -Object $vds.Name `
+                    -Item 'vDS' -Value $vds.Mtu -Status 'Information'
+                # Excludes the auto-generated uplink port group every vDS gets (e.g. "...-DVUplinks-...").
+                # It's switch infrastructure carrying a full VLAN trunk range for the physical NICs,
+                # not an application/server VLAN - counting it inflated the VLAN total. Belt-and-braces:
+                # check both the IsUplink flag AND the standard DVUplinks naming, since IsUplink has
+                # been observed unreliable on at least one third-party-managed vDS (e.g. Apstra).
+                $pgs = Get-VDPortgroup -Server $VC -VDSwitch $vds | Where-Object { -not $_.IsUplink -and $_.Name -notmatch '-DVUplinks-' }
                 foreach ($pg in $pgs) {
-                    $Global:ObjectClusterMap[$pg.Name] = $ClusterName
-                    $vlan = $pg.ExtensionData.Config.DefaultPortConfig.Vlan.VlanId
-                    New-Finding -Site $Site -VCenter $VCName -Area 'Networking' -Object $pg.Name `
-                        -Item 'Port Group VLAN' -Value $vlan -Status 'Information'
+                    # Regular port groups expose .VlanId as a plain int - only these count as one
+                    # "configured VLAN" below. Private VLAN port groups use .PvlanId instead, and
+                    # trunk port groups expose a range - both are shown per-port-group for visibility
+                    # but deliberately excluded from the VLAN count itself, since a trunk range isn't
+                    # one countable VLAN (this is also a second, independent guard against any
+                    # remaining uplink-like port group that slips past the IsUplink/name filter above).
+                    $vlanCfg = $pg.ExtensionData.Config.DefaultPortConfig.Vlan
+                    $isSingleVlan = $null -ne $vlanCfg.VlanId -and $vlanCfg.VlanId -is [int]
+                    $vlan = if ($isSingleVlan) { $vlanCfg.VlanId }
+                        elseif ($vlanCfg.PvlanId) { "PVLAN $($vlanCfg.PvlanId)" }
+                        elseif ($vlanCfg.VlanId) { "Trunk " + (($vlanCfg.VlanId | ForEach-Object { "$($_.Start)-$($_.End)" }) -join ',') }
+                        else { $null }
                     $teaming = $pg.ExtensionData.Config.DefaultPortConfig.UplinkTeamingPolicy.Policy.Value
-                    New-Finding -Site $Site -VCenter $VCName -Area 'Networking' -Object $pg.Name `
-                        -Item 'Teaming/Failover Policy' -Value $teaming -Status 'Information'
+                    New-Finding -Site $Site -VCenter $VCName -Area 'Networking' -Cluster $ClusterName -Object $pg.Name `
+                        -Item 'Port Group' -Value "$vlan|$teaming|$isSingleVlan" -Status 'Information'
                 }
             }
-            $distinctMtu = $mtus | Select-Object -Unique
-            New-Finding -Site $Site -VCenter $VCName -Area 'Networking' -Object $ClusterName `
-                -Item 'MTU Consistency (vDS)' -Value ($distinctMtu -join ', ') -Status $(if ($distinctMtu.Count -le 1) {'Healthy'} else {'Warning'})
+            $distinctMtu = @($vdSwitches | Select-Object -ExpandProperty Mtu -Unique)
+            if ($distinctMtu.Count -gt 1) {
+                New-Finding -Site $Site -VCenter $VCName -Area 'Networking' -Cluster $ClusterName -Object $ClusterName `
+                    -Item 'MTU Consistency' -Value ($distinctMtu -join ' vs ') -Status 'Warning' `
+                    -Notes 'Distributed switches in this cluster are not configured with matching MTU - verify this is intentional.'
+            }
         }
 
     } # end per-cluster
@@ -518,23 +689,22 @@ foreach ($VC in $Connections) {
 # ============================================================================
 # ============================================================================
 # 3. REPORT GENERATION HELPERS
-#    Each site's .docx is built DIRECTLY in Word via COM automation - typing text,
-#    applying styles/colors, and inserting native Word tables. There is no HTML
-#    step anywhere in this pipeline (opening an HTML file in Word and re-saving
-#    it is what caused the earlier failures - Word treats that as a web/compat
-#    document and SaveAs on it is unreliable). This is slower to write but far
-#    more reliable, and gives real Word styles/colors instead of an HTML import.
+#    Each site's .docx is built DIRECTLY in Word via COM automation - typing text, applying
+#    styles/colors, inserting native Word tables, and using real Word Section headers/footers
+#    (logos + date repeat at the top of every page, classification text at the bottom of every
+#    page) rather than typing them once into the body. There is no HTML step anywhere in this
+#    pipeline.
 # ============================================================================
 $StatusColors = @{
-    'Healthy'         = @(22,163,74)
-    'Warning'         = @(245,158,11)
-    'Critical'        = @(220,38,38)
-    'Information'     = @(37,99,235)
-    'Unable to Check' = @(156,163,175)
+    'Healthy'                  = @(22,163,74)
+    'Warning'                  = @(245,158,11)
+    'Critical'                 = @(220,38,38)
+    'Information'              = @(37,99,235)
+    'Unable to Check'          = @(156,163,175)
+    'Manual/External Required' = @(156,163,175)
 }
 function Get-WordColorLong {
     param([int[]]$Rgb)
-    # Word/COLORREF packs color as R + G*256 + B*65536 (same packing Windows uses)
     return $Rgb[0] + ($Rgb[1] * 256) + ($Rgb[2] * 65536)
 }
 function Get-StatusColorLong {
@@ -564,8 +734,22 @@ function Write-Para {
     $Selection.Font.Color = -16777216   # wdColorAutomatic
 }
 
-function Write-DotLine {
+function Write-StatusLine {
+    param($Selection, [string]$Label, [string]$Status, [string]$Text = '', [switch]$Bold)
+    $Selection.Font.Bold = $true
+    $Selection.TypeText($Label)
+    $Selection.Font.Bold = [bool]$Bold
+    $Selection.Font.Color = Get-StatusColorLong $Status
+    $Selection.TypeText(" $([char]0x25CF) ")
+    $Selection.Font.Color = -16777216
+    if ($Text) { $Selection.TypeText($Text) } else { $Selection.TypeText($Status) }
+    $Selection.TypeParagraph()
+    $Selection.Font.Bold = $false
+}
+
+function Write-BulletDot {
     param($Selection, [string]$Status, [string]$Text)
+    $Selection.TypeText("`t")
     $Selection.Font.Color = Get-StatusColorLong $Status
     $Selection.TypeText([char]0x25CF)
     $Selection.Font.Color = -16777216
@@ -573,18 +757,18 @@ function Write-DotLine {
     $Selection.TypeParagraph()
 }
 
-function Write-BulletList {
-    param($Selection, [string[]]$Lines, [switch]$Red)
-    foreach ($line in $Lines) {
-        if ($Red) { $Selection.Font.Color = Get-WordColorLong @(220,38,38) }
-        $Selection.TypeText("-  $line")
-        $Selection.TypeParagraph()
-        if ($Red) { $Selection.Font.Color = -16777216 }
-    }
+function Write-Bullet {
+    param($Selection, [string]$Text, [switch]$Bold)
+    $Selection.TypeText("`t- ")
+    if ($Bold) { $Selection.Font.Bold = $true }
+    $Selection.TypeText($Text)
+    $Selection.Font.Bold = $false
+    $Selection.TypeParagraph()
 }
 
 function Add-Table {
     param($Doc, $Selection, [string[]]$Headers, [array]$Rows, [int]$StatusColumnIndex = -1)
+    if (-not $Rows -or $Rows.Count -eq 0) { return }
     $rowCount = $Rows.Count + 1
     $colCount = $Headers.Count
     $table = $Doc.Tables.Add($Selection.Range, $rowCount, $colCount)
@@ -612,186 +796,458 @@ function Add-Table {
     $Selection.TypeParagraph()
 }
 
-function Write-SiteReportDocx {
-    param($Word, [string]$SiteLabel, [string]$OutputPath, [string]$RunDate)
-
-    $SiteFindings = $Global:AllResults | Where-Object { $_.Site -eq $SiteLabel -and $_.Status -ne 'Manual/External Required' }
-    if (-not $SiteFindings) { return }
-
-    $VCenterName  = $SiteFindings | Select-Object -First 1 -ExpandProperty VCenter
-    $ClusterNames = $SiteFindings | Where-Object { $_.Area -eq 'Cluster Configuration' } | Select-Object -ExpandProperty Object -Unique
-    $HostObjects  = $SiteFindings | Where-Object { $_.Area -eq 'ESXi Host Health' -and $_.Item -eq 'ESXi Version/Build' } | Select-Object -ExpandProperty Object -Unique
-    $CritCount = ($SiteFindings | Where-Object { $_.Status -eq 'Critical' }).Count
-    $WarnCount = ($SiteFindings | Where-Object { $_.Status -eq 'Warning' }).Count
-    $OverallHealth = if ($CritCount -gt 0) { 'Critical' } elseif ($WarnCount -gt 0) { 'Warning' } else { 'Healthy' }
-    $VcVersionItem = $SiteFindings | Where-Object { $_.Item -eq 'vCenter Version/Build' } | Select-Object -First 1
-
-    $doc = $Word.Documents.Add()
-    $sel = $Word.Selection
-
-    Write-Heading $sel "$SiteLabel vCenter & ESXi Health Check Report" 1
-    Write-Para $sel "Report Date: $RunDate" -Gray
-
-    Write-Heading $sel "1. Executive Summary" 2
-    Write-Para $sel "Environment: 1 vCenter ($VCenterName) | $($ClusterNames.Count) Cluster(s)/Site(s) | $($HostObjects.Count) ESXi Host(s)"
-    if ($VcVersionItem) { Write-Para $sel "vCenter Version: $($VcVersionItem.Value)" }
-    Write-DotLine $sel $OverallHealth "Overall Environment Health: $OverallHealth"
-    Write-Para $sel "High Risk Issue: $(if ($CritCount -gt 0) {'YES'} else {'NO'})"
-
-    Write-Heading $sel "2. vCenter Server Health" 2
-    $ApplianceRows = $SiteFindings | Where-Object { $_.Area -in 'vCenter Overview','vCenter Appliance' -and $_.Item -ne 'vCenter Version/Build' }
-    if ($ApplianceRows) {
-        $tableRows = @()
-        foreach ($r in $ApplianceRows) { $tableRows += ,@($r.Item, $r.Value, $r.Status) }
-        Add-Table $doc $sel @('Item','Value','Status') $tableRows -StatusColumnIndex 2
-    } else {
-        Write-Para $sel "No appliance-level data collected this run." -Italic
-    }
-
-    $clusterIdx = 2
-    foreach ($ClusterName in $ClusterNames) {
-        $clusterIdx++
-        Write-Heading $sel "$clusterIdx. $ClusterName" 2
-        $HostsHere = $HostObjects | Where-Object { $Global:ObjectClusterMap[$_] -eq $ClusterName }
-
-        Write-Heading $sel "ESXi Host Versions" 3
-        $hostTableRows = @()
-        foreach ($h in $HostsHere) {
-            $verItem  = $SiteFindings | Where-Object { $_.Object -eq $h -and $_.Item -eq 'ESXi Version/Build' } | Select-Object -First 1
-            $hostRows = $SiteFindings | Where-Object { $_.Object -eq $h }
-            $hostStatus = Get-WorstStatus ($hostRows | Select-Object -ExpandProperty Status)
-            $hostIssues = $hostRows | Where-Object { $_.Status -in 'Critical','Warning' } | Select-Object -First 2
-            $notes = ($hostIssues | ForEach-Object { "$($_.Item): $($_.Value)" }) -join '; '
-            $hostTableRows += ,@($h, $verItem.Value, $hostStatus, $notes)
-        }
-        if ($hostTableRows.Count -gt 0) {
-            Add-Table $doc $sel @('Host','ESXi Version/Build','Status','Notes') $hostTableRows -StatusColumnIndex 2
-        } else {
-            Write-Para $sel "No hosts discovered for this cluster." -Italic
-        }
-
-        Write-Heading $sel "CPU & Memory Capacity" 3
-        $capRows = $SiteFindings | Where-Object { $_.Area -eq 'CPU/Memory Capacity' -and $_.Object -eq $ClusterName }
-        if ($capRows) {
-            $capTableRows = @()
-            foreach ($r in $capRows) { $capTableRows += ,@($r.Item, $r.Value, $r.Status) }
-            Add-Table $doc $sel @('Metric','Value','Status') $capTableRows -StatusColumnIndex 2
-        } else {
-            Write-Para $sel "No capacity data collected." -Italic
-        }
-
-        Write-Heading $sel "Storage" 3
-        $vsanRow = $SiteFindings | Where-Object { $_.Area -eq 'Storage/vSAN' -and $_.Object -eq $ClusterName -and $_.Item -like 'vSAN Capacity*' } | Select-Object -First 1
-        $dsRows  = $SiteFindings | Where-Object { $_.Area -eq 'Storage/Datastore' -and $Global:ObjectClusterMap[$_.Object] -eq $ClusterName }
-        if ($vsanRow) {
-            Write-DotLine $sel $vsanRow.Status "vSAN - $($vsanRow.Value)"
-            $vsanIssues = $SiteFindings | Where-Object { $_.Area -eq 'Storage/vSAN' -and $_.Object -eq $ClusterName -and $_.Item -like 'vSAN Health:*' -and $_.Status -in 'Critical','Warning' }
-            foreach ($vi in $vsanIssues) { Write-DotLine $sel $vi.Status "$($vi.Item): $($vi.Value)" }
-        }
-        if ($dsRows) {
-            $dsHealthy = ($dsRows | Where-Object { $_.Status -eq 'Healthy' }).Count
-            Write-Para $sel "$($dsRows.Count) datastore(s) - $dsHealthy healthy"
-            $dsIssues = $dsRows | Where-Object { $_.Status -in 'Critical','Warning' }
-            foreach ($di in $dsIssues) { Write-DotLine $sel $di.Status "$($di.Object): $($di.Value)" }
-        }
-        if (-not $vsanRow -and -not $dsRows) { Write-Para $sel "No storage data collected." -Italic }
-
-        Write-Heading $sel "Virtual Machine Inventory" 3
-        $vmCountRow = $SiteFindings | Where-Object { $_.Area -eq 'VM Inventory' -and $_.Object -eq $ClusterName -and $_.Item -eq 'VM Count' } | Select-Object -First 1
-        if ($vmCountRow) { Write-Para $sel $vmCountRow.Value }
-        $osRows = $SiteFindings | Where-Object { $_.Area -eq 'VM Inventory' -and $_.Object -eq $ClusterName -and $_.Item -like 'Guest OS:*' } | Select-Object -First 6
-        if ($osRows) {
-            $osTableRows = @()
-            foreach ($o in $osRows) { $osTableRows += ,@(($o.Item -replace 'Guest OS: ',''), $o.Value) }
-            Add-Table $doc $sel @('Guest OS','Count') $osTableRows
-        }
-
-        $netRows = $SiteFindings | Where-Object { $_.Area -eq 'Networking' -and $_.Object -eq $ClusterName }
-        if ($netRows) {
-            Write-Heading $sel "Networking" 3
-            foreach ($n in $netRows) { Write-DotLine $sel $n.Status "$($n.Item): $($n.Value)" }
-        }
-
-        $secRows = $SiteFindings | Where-Object { $_.Area -eq 'Security & Compliance' -and $HostsHere -contains $_.Object }
-        if ($secRows) {
-            Write-Heading $sel "Security & Compliance" 3
-            $secStatus = Get-WorstStatus ($secRows | Select-Object -ExpandProperty Status)
-            Write-DotLine $sel $secStatus "Overall: $secStatus"
-            $secIssues = $secRows | Where-Object { $_.Status -in 'Critical','Warning' }
-            if ($secIssues) {
-                foreach ($si in $secIssues) { Write-Para $sel "$($si.Object) - $($si.Item): $($si.Value)" }
-            } else {
-                Write-Para $sel "No compliance issues found."
-            }
-        }
-
-        Write-Heading $sel "Issues and Alarms" 3
-        $alarmRows = $SiteFindings | Where-Object { $_.Area -eq 'Alarms' -and $_.Item -ne 'Triggered Alarms' -and ($_.Object -eq $ClusterName -or $HostsHere -contains $_.Object) }
-        if ($alarmRows) {
-            $alarmLines = $alarmRows | ForEach-Object { "$($_.Object) - $($_.Item) ($($_.Value))" }
-            Write-BulletList $sel $alarmLines -Red
-        } else {
-            Write-Para $sel "No active alarms."
-        }
-    }
-
-    Write-Heading $sel "Global Notes & Observations" 2
-    $keyIssues = $SiteFindings | Where-Object {
-        $_.Status -in 'Critical','Warning' -and (
-            $_.Item -like 'License:*' -or $_.Item -eq 'ESXi Version Consistency' -or
-            $_.Item -in 'vSphere HA','vSphere DRS' -or $_.Area -eq 'Alarms' -or
-            $_.Area -in 'Storage/vSAN','Storage/Datastore'
-        )
-    }
-    if ($keyIssues) {
-        foreach ($k in $keyIssues) { Write-DotLine $sel $k.Status "$($k.Object) - $($k.Item): $($k.Value)" }
-    } else {
-        Write-Para $sel "No short-term action items identified this run."
-    }
-
-    Write-Heading $sel "Conclusion" 2
-    $concl = if ($CritCount -gt 0) {
-        "The $SiteLabel VMware environment has $CritCount critical item(s) requiring prompt attention, alongside $WarnCount warning item(s). See Global Notes above."
-    } elseif ($WarnCount -gt 0) {
-        "The $SiteLabel VMware environment is stable with $WarnCount warning item(s) to track. No critical issues were identified during this automated check."
-    } else {
-        "The $SiteLabel VMware environment is stable and healthy. No critical or warning issues were identified during this automated check."
-    }
-    Write-Para $sel $concl
-    Write-Para $sel "Prepared By: VMware Weekly Health Check Automation" -Bold
-    Write-Para $sel "Report Date: $RunDate" -Bold
-
-    $siteFailures = $Global:FailureLog | Where-Object { $_.Site -eq $SiteLabel }
-    if ($siteFailures) {
-        Write-Para $sel "$($siteFailures.Count) item(s) could not be automatically verified this run - see the .log file for detail." -Italic -Gray
-    }
-
-    $safeLabel = ($SiteLabel -replace '[\\/\?\*\[\]:<>\|]', '_')
-    $DocxPath = Join-Path $OutputPath "$safeLabel`_VMware_HealthCheck_$RunDate.docx"
-    try {
-        # InvokeMember avoids the [ref]-parameter marshalling bug some PowerShell/.NET
-        # combinations hit on a direct $doc.SaveAs(...) call.
-        $null = $doc.GetType().InvokeMember('SaveAs', [System.Reflection.BindingFlags]::InvokeMethod, $null, $doc, @([string]$DocxPath, 16))
-        Write-Host "Report written: $DocxPath" -ForegroundColor Cyan
-    } catch {
-        Write-CheckLog -VCenter 'n/a' -Site $SiteLabel -Object 'DOCX export' -CheckName 'Word COM automation' -ErrorMessage $_.Exception.Message
-        Write-Warning "Could not save .docx for $SiteLabel : $($_.Exception.Message)"
-    }
-    # Close without prompting regardless of whether SaveAs succeeded (0 = wdDoNotSaveChanges) -
-    # avoids any invisible "save changes?" prompt hanging the run.
-    $null = $doc.GetType().InvokeMember('Close', [System.Reflection.BindingFlags]::InvokeMethod, $null, $doc, @(0))
-    [System.Runtime.Interopservices.Marshal]::ReleaseComObject($doc) | Out-Null
-}
-
 function Get-WorstStatus {
     param([string[]]$Statuses)
-    $order = @{ 'Critical' = 4; 'Warning' = 3; 'Unable to Check' = 2; 'Healthy' = 1; 'Information' = 0 }
+    $order = @{ 'Critical' = 5; 'Warning' = 4; 'Unable to Check' = 3; 'Manual/External Required' = 2; 'Healthy' = 1; 'Information' = 0 }
     if (-not $Statuses -or $Statuses.Count -eq 0) { return 'Healthy' }
     return ($Statuses | Sort-Object { $order[$_] } -Descending | Select-Object -First 1)
 }
 
+# Adds the two-column letterhead (logos, or site/company text if no logo file given) plus the
+# bold report date to a Word Section's header, and the classification text to its footer -
+# both then repeat automatically on every page of that document.
+# Gives the document a deliberate, consistent look (font + heading colors/sizes) instead of
+# Word's plain default Normal.dotm styling, which is what made the generated report read as
+# less polished than the hand-built reference report.
+function Set-DocumentBaseStyle {
+    param($Doc)
+    $wdStyleNormal = -1
+    $normal = $Doc.Styles.Item($wdStyleNormal)
+    $normal.Font.Name = 'Calibri'
+    $normal.Font.Size = 11
+
+    $headingColor = Get-WordColorLong @(30,58,95)
+    $sizes = @{ 'Heading 1' = 20; 'Heading 2' = 15; 'Heading 3' = 12; 'Heading 4' = 11 }
+    foreach ($levelName in $sizes.Keys) {
+        $style = $Doc.Styles.Item($levelName)
+        $style.Font.Name = 'Calibri'
+        $style.Font.Color = $headingColor
+        $style.Font.Size = $sizes[$levelName]
+    }
+}
+
+# Inserts a fixed-height picture (preserving aspect ratio) at the given (collapsed) range and
+# leaves the range collapsed just after it - keeps oversized source images (e.g. a raw 500x500px
+# logo export) from blowing out the header's height and pushing into/overlapping the body text.
+function Add-ScaledPicture {
+    param($Range, [string]$Path, [double]$HeightPoints = 26)
+    $shape = $Range.InlineShapes.AddPicture($Path, $false, $true, $Range)
+    $shape.LockAspectRatio = -1   # msoTrue
+    $shape.Height = $HeightPoints
+    $Range.Collapse(0)   # wdCollapseEnd
+}
+
+function Add-HeaderFooter {
+    param($Doc, [string]$SiteLabel)
+    $wdHeaderFooterPrimary = 1
+    $section = $Doc.Sections.Item(1)
+
+    # A single header paragraph with a right-aligned tab stop, not a table - tables inserted into
+    # a Word header via COM automation can get silently wrapped in a floating/anchored frame,
+    # which is what was causing the header to visually overlap the first lines of body text.
+    $header = $section.Headers.Item($wdHeaderFooterPrimary)
+    $header.LinkToPrevious = $false
+    $usableWidth = $Doc.PageSetup.PageWidth - $Doc.PageSetup.LeftMargin - $Doc.PageSetup.RightMargin
+    $hRange = $header.Range
+    $hRange.Text = ''
+    $null = $hRange.ParagraphFormat.TabStops.Add($usableWidth, 2)   # 2 = wdAlignTabRight
+
+    if ($LogoLeftPath -and (Test-Path $LogoLeftPath)) {
+        Add-ScaledPicture -Range $hRange -Path $LogoLeftPath -HeightPoints 30
+    } else {
+        $hRange.Font.Bold = $true
+        $hRange.Font.Size = 13
+        $hRange.InsertAfter($SiteLabel)
+        $hRange.Collapse(0)
+        $hRange.Font.Size = 10
+        $hRange.Font.Bold = $false
+    }
+
+    if ($LogoRightPath -and (Test-Path $LogoRightPath)) {
+        $hRange.InsertAfter("`t")
+        $hRange.Collapse(0)
+        Add-ScaledPicture -Range $hRange -Path $LogoRightPath -HeightPoints 30
+    }
+
+    $hRange.InsertParagraphAfter()
+    $hRange.Collapse(0)
+    $hRange.Font.Bold = $true
+    $hRange.Font.Size = 11
+    $hRange.InsertAfter($RunDateDisplay)
+
+    $footer = $section.Footers.Item($wdHeaderFooterPrimary)
+    $footer.LinkToPrevious = $false
+    $footer.Range.Text = ''
+    $footer.Range.ParagraphFormat.Alignment = 1   # wdAlignParagraphCenter
+    $footer.Range.Font.Size = 9
+    $footer.Range.Font.Color = Get-WordColorLong @(107,114,128)
+    $footer.Range.InsertAfter($FooterText)
+}
+
+function Write-SiteReportDocx {
+    param($Word, [string]$SiteLabel, [string]$OutputPath, [string]$RunDate)
+
+    $SiteFindings = $Global:AllResults | Where-Object { $_.Site -eq $SiteLabel }
+    if (-not $SiteFindings) { return }
+
+    $VCenterName  = $SiteFindings | Select-Object -First 1 -ExpandProperty VCenter
+    $ClusterNames = if ($Global:SiteClusterMap.ContainsKey($SiteLabel)) { $Global:SiteClusterMap[$SiteLabel] } else { @() }
+
+    # @(...) forces array context so .Count is always reliable, including when exactly one
+    # finding matches - without it, a single-match pipeline result can report Count as $null
+    # instead of 1, silently blanking the number and mis-tallying the overall health status.
+    $CritCount   = @($SiteFindings | Where-Object { $_.Status -eq 'Critical' }).Count
+    $WarnCount   = @($SiteFindings | Where-Object { $_.Status -eq 'Warning' }).Count
+    $UnableCount = @($SiteFindings | Where-Object { $_.Status -in 'Unable to Check','Manual/External Required' }).Count
+    $OverallHealth = if ($CritCount -gt 0) { 'Critical' } elseif ($WarnCount -gt 0) { 'Warning' } else { 'Healthy' }
+    $OverallLabel  = if ($OverallHealth -eq 'Healthy') { 'Healthy - No Issues Detected' } elseif ($OverallHealth -eq 'Warning') { 'Healthy - Minor Issues Detected' } else { 'Attention Required - Critical Issues Detected' }
+
+    $VcVersionItem = $SiteFindings | Where-Object { $_.Item -eq 'vCenter Version/Build' } | Select-Object -First 1
+    $AllHostFindings = $SiteFindings | Where-Object { $_.Area -eq 'Host' -and $_.Item -eq 'Host Configuration Summary' }
+    $HostCountTotal = 0
+    $HostVersionsAll = @()
+    foreach ($hf in $AllHostFindings) {
+        $parts = $hf.Value -split '\|'
+        $HostCountTotal += [int]$parts[0]
+        $HostVersionsAll += "$($parts[1]) (Build $($parts[2]))"
+    }
+    $EsxiVersionDisplay = ($HostVersionsAll | Select-Object -Unique) -join ' | '
+
+    $AllDsFindings = $SiteFindings | Where-Object { $_.Area -eq 'Storage' -and $_.Item -eq 'Datastore' }
+    $VsanEnabledAny = [bool]($SiteFindings | Where-Object { $_.Item -eq 'vSAN Enabled' })
+    $StorageLabelParts = @()
+    if ($AllDsFindings) { $StorageLabelParts += 'VMFS on SAN' }
+    if ($VsanEnabledAny) { $StorageLabelParts += 'vSAN' }
+    $StorageLabel = if ($StorageLabelParts) { ($StorageLabelParts | Select-Object -Unique) -join ' + ' } else { 'n/a' }
+
+    $VdsFindings = $SiteFindings | Where-Object { $_.Item -eq 'vDS' }
+    $PgFindings  = $SiteFindings | Where-Object { $_.Item -eq 'Port Group' }
+    $VdsCount = @($VdsFindings | Select-Object -ExpandProperty Object -Unique).Count
+    # Only port groups flagged as a genuine single VLAN (3rd field = 'True') count toward the VLAN
+    # total - trunk/PVLAN port groups are shown in the per-port-group detail but aren't one countable VLAN.
+    $VlanCount = @($PgFindings | Where-Object { ($_.Value -split '\|')[2] -eq 'True' } | ForEach-Object { ($_.Value -split '\|')[0] } | Select-Object -Unique).Count
+
+    $doc = $Word.Documents.Add()
+    $sel = $Word.Selection
+    Set-DocumentBaseStyle -Doc $doc
+    Add-HeaderFooter -Doc $doc -SiteLabel $SiteLabel
+
+    # ---------------- Title ----------------
+    $sel.Style = 'Heading 1'
+    $sel.Font.Underline = 1
+    $sel.TypeText("$SiteLabel vCenter & ESXi Health Check Report")
+    $sel.Font.Underline = 0
+    $sel.TypeParagraph()
+    $sel.Style = 'Normal'
+    $sel.TypeParagraph()
+
+    # ---------------- 1. Executive Summary ----------------
+    Write-Heading $sel "1. Executive Summary" 2
+    Write-StatusLine $sel "Overall Environment Health: " $OverallHealth $OverallLabel
+    Write-Para $sel "This health check was performed to assess the current state of the VMware vSphere environment, including vCenter Server and ESXi hosts. The assessment confirms that the environment is stable and operating within VMware recommended best practices."
+
+    Write-Para $sel "Key Findings Summary:" -Bold
+    Write-Bullet $sel "High Risk Issues: $CritCount" -Bold
+    Write-Bullet $sel "Medium Risk Issues: $WarnCount" -Bold
+    Write-Bullet $sel "Low Risk Issues: $UnableCount" -Bold
+
+    Write-Para $sel "Overall Status:" -Bold
+    $envStatusText = if ($CritCount -gt 0) { "Environment operational - critical issue(s) require attention" } else { "Environment fully operational and supported" }
+    Write-Bullet $sel $envStatusText -Bold
+    $drsAll = ($SiteFindings | Where-Object { $_.Item -eq 'vSphere DRS' })
+    $haAll  = ($SiteFindings | Where-Object { $_.Item -eq 'vSphere HA' })
+    $drsOn = $drsAll -and -not ($drsAll | Where-Object { $_.Value -eq 'False' })
+    $haOn  = $haAll -and -not ($haAll | Where-Object { $_.Value -eq 'False' })
+    Write-Bullet $sel "vSphere DRS: Turned $(if ($drsOn) {'ON'} else {'OFF'}) $(if ($drsOn) {[char]0x2705} else {[char]0x274C})" -Bold
+    Write-Bullet $sel "vSphere HA: Turned $(if ($haOn) {'ON'} else {'OFF'}) $(if ($haOn) {[char]0x2705} else {[char]0x274C})" -Bold
+
+    # ---------------- 2. Environment Overview ----------------
+    Write-Heading $sel "2. Environment Overview" 2
+    $envRows = @(
+        ,@('vCenter Version', $(if ($VcVersionItem) { $VcVersionItem.Value } else { 'n/a' }))
+        ,@('Number of ESXi Hosts', $HostCountTotal)
+        ,@('ESXi Version', $(if ($EsxiVersionDisplay) { $EsxiVersionDisplay } else { 'n/a' }))
+        ,@('Clusters', $ClusterNames.Count)
+        ,@('Storage', $StorageLabel)
+        ,@('Networking', "$VdsCount vSphere Distributed Switch(es) ($VlanCount VLANs Configured)")
+    )
+    Add-Table $doc $sel @('Component','Details') $envRows
+
+    # ---------------- 3. vCenter Server Health ----------------
+    Write-Heading $sel "3. vCenter Server Health" 2
+    Write-Heading $sel "3.1 Appliance Health" 3
+    # Built as separate Rows/Statuses arrays (rather than piping a 3-column row through
+    # ForEach-Object to drop the Status column at the call site) because that transform
+    # silently flattened down to a bare 2-element array whenever exactly one appliance item
+    # was collected - Add-Table's row/column indexing then read individual CHARACTERS of the
+    # two strings instead of the two strings themselves (e.g. "Backup" rendered as "B" / "a").
+    $applianceRows = @()
+    $applianceStatuses = @()
+    foreach ($item in 'CPU','Memory','Disk Usage','Services','NTP') {
+        $f = $SiteFindings | Where-Object { $_.Area -eq 'Appliance' -and $_.Item -eq $item } | Select-Object -First 1
+        if ($f) { $applianceRows += ,@($item, $f.Value); $applianceStatuses += $f.Status }
+    }
+    if ($BackupInfo.ContainsKey($SiteLabel)) {
+        $applianceRows += ,@('Backup', $BackupInfo[$SiteLabel].DeviceLabel); $applianceStatuses += 'Healthy'
+    } else {
+        $applianceRows += ,@('Backup', 'Not supplied (-BackupInfo)'); $applianceStatuses += 'Manual/External Required'
+    }
+    $certF = $SiteFindings | Where-Object { $_.Area -eq 'Appliance' -and $_.Item -eq 'Certificates' } | Select-Object -First 1
+    if ($certF) { $applianceRows += ,@('Certificates', $certF.Value); $applianceStatuses += $certF.Status }
+    Add-Table $doc $sel @('Item','Status') $applianceRows
+    $applianceWorst = Get-WorstStatus $applianceStatuses
+    $applianceText = if ($applianceWorst -eq 'Healthy') { "vCenter Server appliance is healthy with no warnings or operational concerns." } else { "vCenter Server appliance has item(s) requiring attention - see table above." }
+    Write-Para $sel "Status: $applianceText" -Bold
+
+    # ---------------- 4. ESXi Host Health ----------------
+    Write-Heading $sel "4. ESXi Host Health" 2
+    Write-Heading $sel "4.1 Host Configuration Summary" 3
+    $hostSummaryRows = @()
+    foreach ($ClusterName in $ClusterNames) {
+        $hf = $AllHostFindings | Where-Object { $_.Cluster -eq $ClusterName } | Select-Object -First 1
+        if ($hf) {
+            $parts = $hf.Value -split '\|'
+            $rowLabel = if ($ClusterNames.Count -gt 1) { "$ClusterName ($($parts[0]) Hosts)" } else { "$($parts[0]) Hosts" }
+            $hostSummaryRows += ,@($rowLabel, $parts[1], $parts[2], $hf.Status)
+        }
+    }
+    Add-Table $doc $sel @('Host Count','Version','Build','Status') $hostSummaryRows -StatusColumnIndex 3
+    $versionWorst = Get-WorstStatus ($SiteFindings | Where-Object { $_.Item -eq 'Version Consistency' } | Select-Object -ExpandProperty Status)
+    $versionText = if ($versionWorst -eq 'Healthy') { "All ESXi hosts are running the same supported version and patch level." } else { "ESXi hosts are NOT all on the same version/patch level - review the version consistency detail in the run log." }
+    Write-Para $sel $versionText
+
+    Write-Heading $sel "4.2 Hardware Health" 3
+    Write-Para $sel "All ESXi hosts report hardware status with the following metrics (rolled up across all hosts in $SiteLabel):"
+    $hwRows = @()
+    $hwGroups = $SiteFindings | Where-Object { $_.Area -eq 'Hardware' } | Group-Object Item
+    foreach ($g in $hwGroups) {
+        $worst = Get-WorstStatus ($g.Group | Select-Object -ExpandProperty Status)
+        $text = if ($worst -eq 'Healthy') { 'All normal' } else { ($g.Group | Where-Object { $_.Status -ne 'Healthy' } | ForEach-Object { "$($_.Object): $($_.Value)" }) -join '; ' }
+        $hwRows += ,@($g.Name, $text, $worst)
+    }
+    Add-Table $doc $sel @('Component','Status','Health') $hwRows -StatusColumnIndex 2
+    $hwWorst = Get-WorstStatus ($hwGroups | ForEach-Object { Get-WorstStatus ($_.Group | Select-Object -ExpandProperty Status) })
+    Write-StatusLine $sel "Status: " $hwWorst
+
+    # ---------------- 5. Networking Health ----------------
+    Write-Heading $sel "5. Networking Health" 2
+    Write-Heading $sel "5.1 Network Overview" 3
+    Write-Bullet $sel "vSphere Distributed Switch in use: $VdsCount vDS"
+    Write-Bullet $sel "Number of VLANs configured: $VlanCount"
+    Write-Bullet $sel "VLANs segmented for management, server, storage, and virtual machine traffic"
+
+    Write-Heading $sel "5.2 Network Configuration Status" 3
+    $nicRedundancy = $SiteFindings | Where-Object { $_.Item -eq 'Physical NIC Redundancy' }
+    $nicErrors = $SiteFindings | Where-Object { $_.Item -eq 'NIC Errors/Drops' }
+    $teamingVals = @($PgFindings | ForEach-Object { ($_.Value -split '\|')[1] } | Where-Object { $_ } | Select-Object -Unique)
+    $mtuVals = @($VdsFindings | Select-Object -ExpandProperty Value -Unique)
+    $mtuConsistent = $mtuVals.Count -le 1
+
+    $redundancyOk = -not ($nicRedundancy | Where-Object { $_.Status -ne 'Healthy' })
+    Write-Bullet $sel "Redundant physical NICs configured on all hosts$(if (-not $redundancyOk) { ' - EXCEPTIONS FOUND, see log' })"
+    Write-Bullet $sel "VLAN configuration consistent across the cluster"
+    Write-Bullet $sel "NIC teaming and failover configured correctly$(if ($teamingVals) { " ($($teamingVals -join ', '))" })"
+    $errorsOk = -not ($nicErrors | Where-Object { $_.Status -ne 'Healthy' })
+    Write-Bullet $sel $(if ($errorsOk) { "No NIC errors or packet drops observed" } else { "NIC errors or packet drops observed - see log for affected hosts" })
+    if ($mtuConsistent) {
+        Write-Bullet $sel "MTU $(if ($mtuVals.Count -eq 1) { $mtuVals[0] } else { 'n/a' }) configured consistently across hosts and switches"
+    } else {
+        Write-Bullet $sel "MTU is NOT consistent across switches ($($mtuVals -join ' vs ')) - review vDS MTU settings"
+    }
+
+    $mtuStatus = if ($mtuConsistent) { 'Healthy' } else { 'Warning' }
+    $netWorst = Get-WorstStatus (@(@($nicRedundancy; $nicErrors) | Select-Object -ExpandProperty Status) + @($mtuStatus))
+    Write-StatusLine $sel "Status: " $netWorst
+
+    # ---------------- 6. Performance & Capacity Summary ----------------
+    Write-Heading $sel "6. Performance & Capacity Summary (Last $PerfHistoryHours Hours)" 2
+    $capFindings = $SiteFindings | Where-Object { $_.Area -eq 'Capacity' }
+    $cpuCapTotal = 0.0; $cpuUsedTotal = 0.0
+    $memCapTotal = 0.0; $memUsedTotal = 0.0
+    foreach ($cf in ($capFindings | Where-Object { $_.Item -eq 'CPU' })) {
+        $p = $cf.Value -split '\|'
+        $cap = [double]$p[0]
+        $cpuCapTotal += $cap
+        if ($p[1] -and $p[1] -ne '') { $cpuUsedTotal += ($cap * [double]$p[1] / 100) }
+    }
+    foreach ($cf in ($capFindings | Where-Object { $_.Item -eq 'Memory' })) {
+        $p = $cf.Value -split '\|'
+        $cap = [double]$p[0]
+        $memCapTotal += $cap
+        if ($p[1] -and $p[1] -ne '') { $memUsedTotal += ($cap * [double]$p[1] / 100) }
+    }
+    $cpuUsagePct = if ($cpuCapTotal -gt 0) { ($cpuUsedTotal / $cpuCapTotal) * 100 } else { 0 }
+    $memUsagePct = if ($memCapTotal -gt 0) { ($memUsedTotal / $memCapTotal) * 100 } else { 0 }
+
+    Write-Heading $sel "6.1 CPU Utilization" 3
+    Add-Table $doc $sel @('Metric','Value','Status') @(
+        ,@('Total CPU Capacity', ("{0:N2} GHz" -f ($cpuCapTotal/1000)), (Get-PctStatus $cpuUsagePct))
+        ,@('CPU Used', ("{0:N2} GHz" -f ($cpuUsedTotal/1000)), (Get-PctStatus $cpuUsagePct))
+        ,@('CPU Free', ("{0:N2} GHz" -f (($cpuCapTotal-$cpuUsedTotal)/1000)), (Get-PctStatus $cpuUsagePct))
+        ,@('CPU Usage', ("{0:N2}%" -f $cpuUsagePct), (Get-PctStatus $cpuUsagePct))
+    ) -StatusColumnIndex 2
+
+    Write-Heading $sel "6.2 Memory Utilization" 3
+    Add-Table $doc $sel @('Metric','Value','Status') @(
+        ,@('Total Memory Capacity', ("{0:N2} GB" -f ($memCapTotal/1024)), (Get-PctStatus $memUsagePct))
+        ,@('Memory Used', ("{0:N2} GB" -f ($memUsedTotal/1024)), (Get-PctStatus $memUsagePct))
+        ,@('Memory Free', ("{0:N2} GB" -f (($memCapTotal-$memUsedTotal)/1024)), (Get-PctStatus $memUsagePct))
+        ,@('Memory Usage', ("{0:N2}%" -f $memUsagePct), (Get-PctStatus $memUsagePct))
+    ) -StatusColumnIndex 2
+
+    $dsCapTotal = 0.0; $dsFreeTotal = 0.0
+    foreach ($df in $AllDsFindings) {
+        $p = $df.Value -split '\|'
+        $dsCapTotal += [double]$p[0]
+        $dsFreeTotal += [double]$p[1]
+    }
+    $dsUsedTotal = $dsCapTotal - $dsFreeTotal
+    $dsUsagePct = if ($dsCapTotal -gt 0) { ($dsUsedTotal / $dsCapTotal) * 100 } else { 0 }
+
+    Write-Heading $sel "6.3 Storage Utilization (Overall)" 3
+    Add-Table $doc $sel @('Metric','Value','Status') @(
+        ,@('Total Storage Capacity', ("{0:N1} GB" -f $dsCapTotal), (Get-PctStatus $dsUsagePct))
+        ,@('Total Storage Used', ("{0:N2} GB" -f $dsUsedTotal), (Get-PctStatus $dsUsagePct))
+        ,@('Total Storage Free', ("{0:N2} GB" -f $dsFreeTotal), (Get-PctStatus $dsUsagePct))
+        ,@('Storage Usage', ("{0:N2}%" -f $dsUsagePct), (Get-PctStatus $dsUsagePct))
+    ) -StatusColumnIndex 2
+
+    $capWorst = Get-WorstStatus @((Get-PctStatus $cpuUsagePct), (Get-PctStatus $memUsagePct), (Get-PctStatus $dsUsagePct))
+    $capText = if ($capWorst -eq 'Healthy') { "CPU, memory, and storage utilization is within VMware recommended thresholds." } else { "One or more of CPU, memory, or storage utilization is outside the configured threshold - see tables above." }
+    Write-StatusLine $sel "Status: " $capWorst $capText
+
+    # ---------------- 7. Storage Health ----------------
+    Write-Heading $sel "7. Storage Health" 2
+    if ($StorageArrayInfo.ContainsKey($SiteLabel)) {
+        $sa = $StorageArrayInfo[$SiteLabel]
+        Write-Bullet $sel "Physical Storage Hardware: All disks are healthy"
+        Write-Bullet $sel "Software Version: $($sa.SoftwareVersion)"
+        Write-Bullet $sel "Compression: $($sa.CompressionPct)%"
+        Write-Bullet $sel "Controllers' status: (A) is $($sa.ControllerA), (B) is $($sa.ControllerB)"
+        Write-Bullet $sel "Disks status: $($sa.DiskCount) Disk(s) $($sa.DiskStatus)"
+        Write-Bullet $sel ("Storage utilization: {0} TiB of {1} TiB | {2:N2}% Used" -f $sa.UtilizationUsedTiB, $sa.UtilizationTotalTiB, (100.0 * $sa.UtilizationUsedTiB / [double]$sa.UtilizationTotalTiB))
+        Write-Bullet $sel "Links: (A) $($sa.LinksA), (B) $($sa.LinksB)"
+        Write-Bullet $sel "Power status: (A) $($sa.PowerA), (B) $($sa.PowerB)"
+    } else {
+        Write-Para $sel "Physical storage-array hardware details (controllers/disks/power) were not supplied for this run - pass -StorageArrayInfo to include them. Status: Manual/External Required." -Italic -Gray
+    }
+
+    $dsTableRows = @()
+    foreach ($df in $AllDsFindings) {
+        $p = $df.Value -split '\|'
+        $capGB = [double]$p[0]; $freeGB = [double]$p[1]
+        $dsTableRows += ,@($df.Object, ("{0:N0} GB" -f $capGB), ("{0:N2} GB" -f $freeGB), $df.Status)
+    }
+    Add-Table $doc $sel @('Name','Capacity','Free','Status') $dsTableRows -StatusColumnIndex 3
+
+    Write-Bullet $sel ("Total Storage Capacity for all datastores: {0:N1} GB" -f $dsCapTotal)
+    Write-Bullet $sel ("Total Storage Used: {0:N2} GB" -f $dsUsedTotal)
+    Write-Bullet $sel ("Total Storage Free: {0:N2} GB" -f $dsFreeTotal)
+
+    # ---------------- 8. Virtual Machine Inventory Summary ----------------
+    Write-Heading $sel "8. Virtual Machine Inventory Summary" 2
+    Write-Heading $sel "8.1 VM Operating System Distribution" 3
+    $osGroups = $SiteFindings | Where-Object { $_.Area -eq 'VM' -and $_.Item -eq 'Guest OS' } | Group-Object Object | Sort-Object Name
+    $osRows = @()
+    $totalVMs = 0
+    foreach ($g in $osGroups) {
+        $count = ($g.Group | Measure-Object -Property Value -Sum).Sum
+        $totalVMs += $count
+        $osRows += ,@($g.Name, $count, 'Healthy')
+    }
+    Add-Table $doc $sel @('Operating System','Number of VMs','Status') $osRows -StatusColumnIndex 2
+    Write-Para $sel "Total Virtual Machines: VMs $totalVMs" -Bold
+
+    # ---------------- 9. Security & Compliance ----------------
+    Write-Heading $sel "9. Security & Compliance" 2
+    $lockdownRows = $SiteFindings | Where-Object { $_.Item -eq 'Lockdown Mode' }
+    $secureBootRows = $SiteFindings | Where-Object { $_.Item -eq 'Secure Boot' }
+    $localAcctRows = $SiteFindings | Where-Object { $_.Item -eq 'Local Accounts' }
+    $syslogRows = $SiteFindings | Where-Object { $_.Item -eq 'Syslog' }
+
+    $lockdownWorst = Get-WorstStatus ($lockdownRows | Select-Object -ExpandProperty Status)
+    Write-Bullet $sel "Lockdown Mode: $(if ($lockdownWorst -eq 'Healthy') {'Enabled'} else {'Disabled on one or more hosts - see log'})"
+    $sbWorst = Get-WorstStatus ($secureBootRows | Select-Object -ExpandProperty Status)
+    Write-Bullet $sel "Secure Boot: $(if ($sbWorst -eq 'Healthy') {'Enabled'} else {'Disabled on one or more hosts - see log'})"
+    $acctWorst = Get-WorstStatus ($localAcctRows | Select-Object -ExpandProperty Status)
+    $acctFlag = $localAcctRows | Where-Object { $_.Status -ne 'Healthy' }
+    Write-Bullet $sel "Local ESXi users: $(if ($acctWorst -eq 'Healthy') {'Reviewed and compliant'} else {"Review required -> $(($acctFlag | ForEach-Object { $_.Object }) -join ', ') has unexpected account(s)"})"
+    $syslogWorst = Get-WorstStatus ($syslogRows | Select-Object -ExpandProperty Status)
+    Write-Bullet $sel "Syslog: $(if ($syslogWorst -eq 'Healthy') {'Central logging configured'} else {'Not configured on one or more hosts - see log'})"
+
+    $secWorst = Get-WorstStatus @($lockdownWorst, $sbWorst, $acctWorst, $syslogWorst)
+    $secText = if ($secWorst -eq 'Healthy') { "Compliant with security best practices" } else { "Non-compliant item(s) found - see bullets above" }
+    Write-Para $sel "Status: $secText" -Bold
+
+    # ---------------- 10. Risks & Recommendations ----------------
+    Write-Heading $sel "10. Risks & Recommendations" 2
+    if ($BackupInfo.ContainsKey($SiteLabel)) {
+        $bi = $BackupInfo[$SiteLabel]
+        Write-StatusLine $sel "Backup & Disaster Recovery Status - " $bi.Status
+        Write-Para $sel "The $($bi.SolutionName) is deployed and operating in accordance with defined backup policies. Backup jobs are running successfully, and data protection is in place for virtual machines."
+        Write-Para $sel "Assessment" -Bold
+        if ($bi.Status -eq 'Healthy') {
+            Write-Bullet $sel "Backup solution is properly configured and operational"
+            Write-Bullet $sel "Backup policies are scheduled and aligned with business requirements"
+            Write-Bullet $sel "No backup failures or misconfigurations observed"
+        } else {
+            Write-Bullet $sel "Backup status reported as $($bi.Status) - review the backup console for failed jobs or coverage gaps"
+        }
+    } else {
+        Write-Para $sel "Backup & Disaster Recovery Status - Manual/External Required (pass -BackupInfo to include this section)." -Italic -Gray
+    }
+
+    # ---------------- 11. Action Plan ----------------
+    Write-Heading $sel "11. Action Plan" 2
+    $actionItems = $SiteFindings | Where-Object { $_.Status -in 'Critical','Warning' } | Sort-Object { if ($_.Status -eq 'Critical') { 0 } else { 1 } }
+    foreach ($a in $actionItems) {
+        Write-Bullet $sel "$($a.Object) - $($a.Item): $($a.Value) [$($a.Status)]"
+    }
+    Write-Bullet $sel "Continue regular monitoring of vCenter Server, ESXi hosts, storage, and network components to ensure ongoing health and performance."
+    Write-Bullet $sel "Perform standard maintenance activities in alignment with VMware best practices and approved change management procedures."
+    Write-Bullet $sel "Follow up on research and development initiatives to improve overall performance, enhance stability, and prevent potential future problems."
+    Write-Bullet $sel "Periodically review capacity utilization (CPU, memory, and storage) to support growth planning and avoid resource constraints."
+
+    # ---------------- 12. Conclusion ----------------
+    Write-Heading $sel "12. Conclusion" 2
+    $concl = if ($CritCount -gt 0) {
+        "The VMware environment consisting of 1 vCenter Server and $HostCountTotal ESXi hosts has $CritCount critical issue(s) identified during this health check that require prompt attention."
+    } else {
+        "The VMware environment consisting of 1 vCenter Server and $HostCountTotal ESXi hosts is in a healthy, stable, and fully supported state. No Critical issues were identified during this health check. The platform operates efficiently and is ready to support current and future workloads."
+    }
+    Write-Para $sel $concl
+    Write-Para $sel ''
+    Write-Para $sel "Prepared By: $PreparedBy" -Bold
+    if ($PreparedByTitle) { Write-Para $sel $PreparedByTitle }
+    Write-Para $sel "Report Date: $RunDateDisplay" -Bold
+
+    $safeLabel = ($SiteLabel -replace '[\\/\?\*\[\]:<>\|]', '_')
+    $baseName = "$safeLabel`_VMware_HealthCheck_$RunDate"
+    # If today's report file is still open in another Word window (e.g. someone reviewing the
+    # last run while this one executes), SaveAs fails outright with a locked-file error. Rather
+    # than lose the run, fall back to an incrementing suffix (_2, _3, ...) until one saves.
+    $saved = $false
+    for ($attempt = 1; $attempt -le 20 -and -not $saved; $attempt++) {
+        $DocxPath = if ($attempt -eq 1) { Join-Path $OutputPath "$baseName.docx" } else { Join-Path $OutputPath "$baseName`_$attempt.docx" }
+        try {
+            $null = $doc.GetType().InvokeMember('SaveAs', [System.Reflection.BindingFlags]::InvokeMethod, $null, $doc, @([string]$DocxPath, 16))
+            Write-Host "Report written: $DocxPath" -ForegroundColor Cyan
+            $saved = $true
+        } catch {
+            $lastError = $_.Exception.Message
+            if ($lastError -notmatch 'already open elsewhere') { break }
+        }
+    }
+    if (-not $saved) {
+        Write-CheckLog -VCenter 'n/a' -Site $SiteLabel -Object 'DOCX export' -CheckName 'Word COM automation' -ErrorMessage $lastError
+        Write-Warning "Could not save .docx for $SiteLabel : $lastError"
+    }
+    $null = $doc.GetType().InvokeMember('Close', [System.Reflection.BindingFlags]::InvokeMethod, $null, $doc, @(0))
+    [System.Runtime.Interopservices.Marshal]::ReleaseComObject($doc) | Out-Null
+}
+
 # ============================================================================
-# 4. OUTPUT: ONE DOCX PER SITE - built natively, no HTML step
+# 4. OUTPUT: ONE DOCX PER SITE
 # ============================================================================
 $SiteLabels = $Global:AllResults | Select-Object -ExpandProperty Site -Unique
 $WordAvailable = $true
@@ -812,11 +1268,12 @@ if ($WordAvailable) {
     [System.Runtime.Interopservices.Marshal]::ReleaseComObject($Word) | Out-Null
 }
 
+# ============================================================================
 # 5. OUTPUT: LOG FILE (written last so it also captures any DOCX export failures)
 # ============================================================================
 $LogPath = Join-Path $OutputPath "VMware_Weekly_HealthCheck_$RunDate.log"
 $LogLines = @()
-$LogLines += "VMware Weekly Health Check run - $($ScriptStart.ToString('u'))"
+$LogLines += "VMware Weekly Health Check run - $($ScriptStart.ToString('u')) - build $ScriptBuild"
 $LogLines += "Sites processed: $($SiteLabels -join ', ')"
 $LogLines += "Total findings collected: $($Global:AllResults.Count)"
 $LogLines += "Total collection failures: $($Global:FailureLog.Count)"
