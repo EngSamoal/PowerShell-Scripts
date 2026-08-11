@@ -6,11 +6,11 @@
 
 .DESCRIPTION
     Run from a laptop that already has an active PowerCLI session
-    (Connect-VIServer done beforehand). For each VM in -InputFile:
+    (Connect-VIServer done beforehand). -InputFile is a plain TXT file with one VM
+    name per line (blank lines and lines starting with # are ignored). For each VM:
 
-      1. Validates: VM exists in vCenter, name/IP match the input list, VM is
-         powered on, VMware Tools is running, guest credentials work, and Splunk UF
-         is not already installed.
+      1. Validates: VM exists in vCenter, VM is powered on, VMware Tools is
+         running, guest credentials work, and Splunk UF is not already installed.
       2. Copies the local Splunk UF installer into the guest with Copy-VMGuestFile.
       3. Runs the installer silently (msiexec /quiet) via Invoke-VMScript.
       4. Verifies install: SplunkForwarder service exists/running, installed version.
@@ -20,6 +20,12 @@
     the next VM. Nothing here configures a deployment server, indexer, outputs.conf,
     or forwarding - that is intentionally left to you (see $InstallArguments below).
 
+    Guest credentials are read from a saved credential XML file (created once with
+    Get-Credential | Export-Clixml), never typed or hard-coded into this script.
+    Because Export-Clixml encrypts the password with Windows DPAPI, that file can
+    only be decrypted by the same Windows user account on the same machine that
+    created it - copying it to another PC or user profile will not work.
+
 .NOTES
     Author:  (fill in)
     Requires: VMware PowerCLI module, an already-connected vCenter session,
@@ -27,16 +33,16 @@
 
 .EXAMPLE
     Connect-VIServer vcenter.corp.local
-    $GuestCred = Get-Credential -Message 'Local admin creds valid on all target guests'
-    .\Deploy-SplunkForwarder.ps1 -InputFile .\targets.csv -InstallerPath 'C:\Installers\splunkforwarder-9.2.1-x64-release.msi' -GuestCredential $GuestCred
+    # One-time setup, on this laptop, under your own Windows account:
+    Get-Credential | Export-Clixml -Path .\GuestCredential.xml
+    .\Deploy-SplunkForwarder.ps1 -InputFile .\vmlist.txt -InstallerPath 'C:\Installers\splunkforwarder-9.2.1-x64-release.msi' -GuestCredentialFile .\GuestCredential.xml
 #>
 
 [CmdletBinding()]
 param(
     # ===== REQUIRED - CHANGE THESE FOR YOUR RUN =====================================
 
-    # CSV or TXT file with the target VM list. Must have headers: VMName,IPAddress
-    # (a plain TXT file works fine as long as it is comma-delimited with that header row).
+    # Plain TXT file, one VM name per line (blank lines / lines starting with # ignored).
     [Parameter(Mandatory)]
     [string]$InputFile,
 
@@ -44,10 +50,12 @@ param(
     [Parameter(Mandatory)]
     [string]$InstallerPath,
 
-    # Credential valid inside every target guest (local admin or domain account with
-    # local admin rights on the guest). Prompted interactively - never hard-code passwords.
+    # Path to a credential XML file created ahead of time with:
+    #   Get-Credential | Export-Clixml -Path .\GuestCredential.xml
+    # Must be a local admin (or equivalent) account on every target guest. This file is
+    # DPAPI-encrypted and only readable by the Windows user/machine that created it.
     [Parameter(Mandatory)]
-    [System.Management.Automation.PSCredential]$GuestCredential,
+    [string]$GuestCredentialFile,
 
     # ===== OPTIONAL - defaults are reasonable, review before a large run ============
 
@@ -136,10 +144,26 @@ if (-not (Test-Path $InputFile)) {
 if (-not (Test-Path $InstallerPath)) {
     throw "Splunk installer not found: $InstallerPath"
 }
+if (-not (Test-Path $GuestCredentialFile)) {
+    throw "Guest credential file not found: $GuestCredentialFile. Create it once with: Get-Credential | Export-Clixml -Path '$GuestCredentialFile'"
+}
 
-$Targets = Import-Csv -Path $InputFile
-if (-not $Targets -or -not ($Targets | Get-Member -Name VMName) -or -not ($Targets | Get-Member -Name IPAddress)) {
-    throw "Input file must be a CSV/TXT with headers 'VMName,IPAddress'."
+try {
+    $GuestCredential = Import-Clixml -Path $GuestCredentialFile
+} catch {
+    throw "Failed to load guest credential from '$GuestCredentialFile': $($_.Exception.Message). This file can only be read back by the same Windows user account, on the same machine, that created it."
+}
+if ($GuestCredential -isnot [System.Management.Automation.PSCredential]) {
+    throw "'$GuestCredentialFile' does not contain a saved PSCredential object."
+}
+
+$Targets = Get-Content -Path $InputFile |
+    ForEach-Object { $_.Trim() } |
+    Where-Object { $_ -and -not $_.StartsWith('#') } |
+    Select-Object -Unique
+
+if (-not $Targets) {
+    throw "Input file '$InputFile' has no VM names (one per line)."
 }
 
 Write-Log "Starting Splunk UF deployment run. Targets: $($Targets.Count). Installer: $InstallerPath"
@@ -147,31 +171,30 @@ Write-Log "Starting Splunk UF deployment run. Targets: $($Targets.Count). Instal
 # ============================================================================
 # 2. PER-VM DEPLOYMENT
 # ============================================================================
-foreach ($target in $Targets) {
+foreach ($vmName in $Targets) {
 
-    $vmName = $target.VMName.Trim()
-    $expectedIP = $target.IPAddress.Trim()
+    $vmIP = ''
 
-    Write-Log "----- Processing '$vmName' ($expectedIP) -----"
+    Write-Log "----- Processing '$vmName' -----"
 
     try {
         # --- 2.1 VM exists in vCenter -------------------------------------------------
         $vm = Get-VM -Name $vmName -ErrorAction SilentlyContinue
         if (-not $vm) {
             Write-Log "VM '$vmName' not found in vCenter." 'WARN'
-            Add-Result -VMName $vmName -IPAddress $expectedIP -Status 'Skipped' -Reason 'VM not found in vCenter'
+            Add-Result -VMName $vmName -IPAddress $vmIP -Status 'Skipped' -Reason 'VM not found in vCenter'
             continue
         }
         if (@($vm).Count -gt 1) {
             Write-Log "Multiple VMs named '$vmName' found; ambiguous, skipping." 'WARN'
-            Add-Result -VMName $vmName -IPAddress $expectedIP -Status 'Skipped' -Reason 'Multiple VMs with this name in vCenter'
+            Add-Result -VMName $vmName -IPAddress $vmIP -Status 'Skipped' -Reason 'Multiple VMs with this name in vCenter'
             continue
         }
 
         # --- 2.2 Powered on -------------------------------------------------------------
         if ($vm.PowerState -ne 'PoweredOn') {
             Write-Log "VM '$vmName' is not powered on (state: $($vm.PowerState))." 'WARN'
-            Add-Result -VMName $vmName -IPAddress $expectedIP -Status 'Skipped' -Reason "VM not powered on ($($vm.PowerState))"
+            Add-Result -VMName $vmName -IPAddress $vmIP -Status 'Skipped' -Reason "VM not powered on ($($vm.PowerState))"
             continue
         }
 
@@ -179,31 +202,27 @@ foreach ($target in $Targets) {
         $vmView = Get-View -VIObject $vm -Property Guest
         $toolsStatus = $vmView.Guest.ToolsStatus
         $toolsRunning = $vmView.Guest.ToolsRunningStatus
+
+        $guestIPs = $vmView.Guest.Net | ForEach-Object { $_.IpAddress } | Where-Object { $_ }
+        $vmIP = $guestIPs -join '; '
+
         if ($toolsRunning -ne 'guestToolsRunning') {
             Write-Log "VMware Tools not running on '$vmName' (status: $toolsStatus / $toolsRunning)." 'WARN'
-            Add-Result -VMName $vmName -IPAddress $expectedIP -Status 'Skipped' -Reason "VMware Tools not running ($toolsStatus)"
+            Add-Result -VMName $vmName -IPAddress $vmIP -Status 'Skipped' -Reason "VMware Tools not running ($toolsStatus)"
             continue
         }
 
-        # --- 2.4 Name/IP match the input list --------------------------------------------
-        $guestIPs = $vmView.Guest.Net | ForEach-Object { $_.IpAddress } | Where-Object { $_ }
-        if ($expectedIP -notin $guestIPs) {
-            Write-Log "IP mismatch for '$vmName'. Expected $expectedIP, VM reports: $($guestIPs -join ', ')" 'WARN'
-            Add-Result -VMName $vmName -IPAddress $expectedIP -Status 'Skipped' -Reason "IP mismatch (VM reports: $($guestIPs -join ', '))"
-            continue
-        }
-
-        # --- 2.5 Guest credentials valid (also confirms guest OS is responsive) -----------
+        # --- 2.4 Guest credentials valid (also confirms guest OS is responsive) -----------
         try {
             $osCheck = Invoke-VMScript -VM $vm -GuestCredential $GuestCredential `
                 -ScriptType Powershell -ScriptText '$env:COMPUTERNAME' -ErrorAction Stop
         } catch {
             Write-Log "Guest credential/connectivity check failed for '$vmName': $($_.Exception.Message)" 'WARN'
-            Add-Result -VMName $vmName -IPAddress $expectedIP -Status 'Skipped' -Reason "Guest credential/connectivity check failed: $($_.Exception.Message)"
+            Add-Result -VMName $vmName -IPAddress $vmIP -Status 'Skipped' -Reason "Guest credential/connectivity check failed: $($_.Exception.Message)"
             continue
         }
 
-        # --- 2.6 Already installed? --------------------------------------------------------
+        # --- 2.5 Already installed? --------------------------------------------------------
         $checkInstalledScript = @"
 if (Test-Path '$SplunkInstallDir\bin\splunk.exe') {
     `$svc = Get-Service -Name 'SplunkForwarder' -ErrorAction SilentlyContinue
@@ -220,12 +239,12 @@ if (Test-Path '$SplunkInstallDir\bin\splunk.exe') {
         if ($installedOut -like 'INSTALLED|*') {
             $parts = $installedOut.Split('|')
             Write-Log "Splunk UF already installed on '$vmName' (version $($parts[2]), service: $($parts[1]))."
-            Add-Result -VMName $vmName -IPAddress $expectedIP -Status 'AlreadyInstalled' `
+            Add-Result -VMName $vmName -IPAddress $vmIP -Status 'AlreadyInstalled' `
                 -SplunkVersion $parts[2] -ServiceStatus $parts[1] -Reason 'Already installed'
             continue
         }
 
-        # --- 2.7 Copy installer to guest ---------------------------------------------------
+        # --- 2.6 Copy installer to guest ---------------------------------------------------
         $remoteDir = Split-Path $RemoteStagingPath -Parent
         $mkdirScript = "New-Item -ItemType Directory -Path '$remoteDir' -Force | Out-Null"
         Invoke-VMScript -VM $vm -GuestCredential $GuestCredential -ScriptType Powershell -ScriptText $mkdirScript -ErrorAction Stop | Out-Null
@@ -234,7 +253,7 @@ if (Test-Path '$SplunkInstallDir\bin\splunk.exe') {
         Copy-VMGuestFile -Source $InstallerPath -Destination $RemoteStagingPath -VM $vm `
             -LocalToGuest -GuestCredential $GuestCredential -Force -ErrorAction Stop
 
-        # --- 2.8 Silent install --------------------------------------------------------------
+        # --- 2.7 Silent install --------------------------------------------------------------
         $installScript = @"
 `$p = Start-Process -FilePath 'msiexec.exe' -ArgumentList '/i `"$RemoteStagingPath`" $InstallArguments /norestart /l*v `"$remoteDir\install.log`"' -Wait -PassThru
 "ExitCode=`$(`$p.ExitCode)"
@@ -246,11 +265,11 @@ if (Test-Path '$SplunkInstallDir\bin\splunk.exe') {
 
         if ($installOut -notmatch 'ExitCode=0') {
             Write-Log "Install on '$vmName' returned non-zero: $installOut" 'WARN'
-            Add-Result -VMName $vmName -IPAddress $expectedIP -Status 'Failed' -Reason "msiexec $installOut"
+            Add-Result -VMName $vmName -IPAddress $vmIP -Status 'Failed' -Reason "msiexec $installOut"
             continue
         }
 
-        # --- 2.9 Post-install verification -----------------------------------------------
+        # --- 2.8 Post-install verification -----------------------------------------------
         $verifyScript = @"
 `$svc = Get-Service -Name 'SplunkForwarder' -ErrorAction SilentlyContinue
 if (-not `$svc) { "NOSERVICE"; exit }
@@ -266,7 +285,7 @@ Start-Sleep -Seconds 5
 
         if ($verifyOut -eq 'NOSERVICE' -or -not $verifyOut) {
             Write-Log "Install ran but SplunkForwarder service not found on '$vmName'." 'WARN'
-            Add-Result -VMName $vmName -IPAddress $expectedIP -Status 'Failed' -Reason 'Installer completed but SplunkForwarder service missing'
+            Add-Result -VMName $vmName -IPAddress $vmIP -Status 'Failed' -Reason 'Installer completed but SplunkForwarder service missing'
             continue
         }
 
@@ -276,17 +295,17 @@ Start-Sleep -Seconds 5
 
         if ($svcStatus -ne 'Running') {
             Write-Log "SplunkForwarder installed on '$vmName' but service is '$svcStatus', not Running." 'WARN'
-            Add-Result -VMName $vmName -IPAddress $expectedIP -Status 'Failed' -SplunkVersion $version -ServiceStatus $svcStatus `
+            Add-Result -VMName $vmName -IPAddress $vmIP -Status 'Failed' -SplunkVersion $version -ServiceStatus $svcStatus `
                 -Reason "Service present but not running ($svcStatus)"
             continue
         }
 
         Write-Log "Splunk UF $version successfully installed and running on '$vmName'."
-        Add-Result -VMName $vmName -IPAddress $expectedIP -Status 'Success' -SplunkVersion $version -ServiceStatus $svcStatus -Reason ''
+        Add-Result -VMName $vmName -IPAddress $vmIP -Status 'Success' -SplunkVersion $version -ServiceStatus $svcStatus -Reason ''
     }
     catch {
         Write-Log "Unhandled error processing '$vmName': $($_.Exception.Message)" 'ERROR'
-        Add-Result -VMName $vmName -IPAddress $expectedIP -Status 'Failed' -Reason $_.Exception.Message
+        Add-Result -VMName $vmName -IPAddress $vmIP -Status 'Failed' -Reason $_.Exception.Message
     }
 }
 
