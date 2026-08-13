@@ -5,8 +5,8 @@
     AD admin credential - no interactive prompts, safe to run unattended.
 
 .DESCRIPTION
-    - Reads new-user details from an Excel file (C:\temp\new-AD-users.xlsx by default) via
-      the ImportExcel module.
+    - Reads new-user details from a CSV file (C:\temp\new-AD-users.csv by default) via the
+      built-in Import-Csv cmdlet - no external module, no Excel installation, anywhere.
     - Authenticates to AD using a credential previously saved with Export-Clixml
       (C:\temp\ADcred.xml by default).
     - Per row: validates required fields, confirms the target OU exists, checks whether the
@@ -31,9 +31,9 @@
       every failure.
 
 .NOTES
-    Requires: RSAT "ActiveDirectory" PowerShell module, and the "ImportExcel" PowerShell
-    module (Install-Module ImportExcel -Scope CurrentUser - no Microsoft Excel installation
-    required, it reads the .xlsx file format directly).
+    Requires only the RSAT "ActiveDirectory" PowerShell module. No third-party module and no
+    Excel installation needed anywhere - the input file is plain CSV, read with the built-in
+    Import-Csv cmdlet.
     Run against a handful of test rows first before a full batch.
 #>
 
@@ -54,14 +54,14 @@ $ADCred = Import-Clixml -Path $ADCredPath
 #    module locate one automatically.
 $DomainController = ""
 
-# 3) Spreadsheet of new users. See the column layout in the accompanying description -
+# 3) CSV of new users. See the column layout in the accompanying description -
 #    required columns: SamAccountName, FirstName, LastName, Password, DisplayName, Groups.
 #    Optional columns: OUPath, UserPrincipalName, Title, Department, ChangePasswordAtLogon,
 #    Enabled.
 #    OUPath: leave blank to use the domain's default "Users" container (resolved below from
 #    AD itself, since that container's DN is domain-specific and it is NOT an OU object - it's
 #    a special "Container" object, so Get-ADOrganizationalUnit can't be used to validate it).
-$UsersXlsxPath = "C:\temp\new-AD-users.xlsx"
+$UsersCsvPath = "C:\temp\new-AD-users.csv"
 
 # 4) Used to build UserPrincipalName for rows that don't supply one explicitly.
 $DefaultUPNSuffix = "yourdomain.com"
@@ -108,8 +108,8 @@ function Get-FullExceptionDetail {
     return $sb.ToString().TrimEnd()
 }
 
-# Excel boolean cells can come back as actual booleans, "TRUE"/"FALSE" strings, or blank -
-# normalize all three instead of assuming one representation.
+# CSV boolean cells come back as plain strings ("TRUE"/"FALSE"/"1"/"0"/blank) - normalize
+# instead of assuming one representation.
 function Get-BoolValue {
     param($Value, [bool]$Default)
     if ($null -eq $Value -or "$Value".Trim() -eq "") { return $Default }
@@ -130,19 +130,15 @@ function Get-TrimmedValue {
 if (-not (Get-Module -Name ActiveDirectory -ListAvailable)) {
     throw "ActiveDirectory module not found. Install RSAT: Add-WindowsCapability -Online -Name 'Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0'"
 }
-if (-not (Get-Module -Name ImportExcel -ListAvailable)) {
-    throw "ImportExcel module not found. Install with: Install-Module ImportExcel -Scope CurrentUser"
-}
 Import-Module ActiveDirectory -ErrorAction Stop
-Import-Module ImportExcel -ErrorAction Stop
 
-if (-not (Test-Path $UsersXlsxPath)) {
-    throw "Users spreadsheet not found at $UsersXlsxPath."
+if (-not (Test-Path $UsersCsvPath)) {
+    throw "Users CSV not found at $UsersCsvPath."
 }
 
-$rows = Import-Excel -Path $UsersXlsxPath
+$rows = Import-Csv -Path $UsersCsvPath
 if (-not $rows -or $rows.Count -eq 0) {
-    throw "No rows found in $UsersXlsxPath."
+    throw "No rows found in $UsersCsvPath."
 }
 
 $adSplat = @{ Credential = $ADCred }
@@ -157,8 +153,8 @@ try {
 }
 Write-Log "Default OU for rows with a blank OUPath: $DefaultUsersContainer"
 
-Write-Log "=== Fleet AD user creation started. Row count: $($rows.Count) | Spreadsheet: $UsersXlsxPath ==="
-Write-Log "Passwords are being read from the spreadsheet in plaintext - secure or delete '$UsersXlsxPath' and the Secrets CSV this run produces once you're done." "WARN"
+Write-Log "=== Fleet AD user creation started. Row count: $($rows.Count) | CSV: $UsersCsvPath ==="
+Write-Log "Passwords are being read from the CSV in plaintext - secure or delete '$UsersCsvPath' and the Secrets CSV this run produces once you're done." "WARN"
 
 $CreatedSuccess  = @()
 $CreatedWarnings = @()
