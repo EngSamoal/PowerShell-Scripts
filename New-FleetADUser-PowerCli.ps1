@@ -52,7 +52,7 @@ $ADCred = Import-Clixml -Path $ADCredPath
 
 # 2) Optional: pin a specific domain controller. Leave blank ("") to let the ActiveDirectory
 #    module locate one automatically.
-$DomainController = ""
+$DomainController = "YOUR DOMAIN" # TYPE YOUR DOMAIN HARE 
 
 # 3) CSV of new users. See the column layout in the accompanying description -
 #    required columns: SamAccountName, FirstName, LastName, Password, DisplayName, Groups.
