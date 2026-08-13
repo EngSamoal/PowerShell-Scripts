@@ -43,7 +43,7 @@
 # ============================== CONFIGURATION ==============================
 # 1) Optional: pin a specific domain controller. Leave blank ("") to let the ActiveDirectory
 #    module use the one it's already running on / locate one automatically.
-$DomainController = ""
+$DomainController = "YOUR DOMAIN" # TYPE YOUR DOMAIN HARE 
 
 # 2) CSV of new users. See the column layout in the accompanying description -
 #    required columns: SamAccountName, FirstName, LastName, Password, DisplayName, Groups.
