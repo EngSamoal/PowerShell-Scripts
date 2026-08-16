@@ -100,7 +100,7 @@ param(
 
 # Bump this on every change so it's always possible to confirm which version of the script
 # produced a given run - printed first thing at startup and written into the log file.
-$ScriptBuild = '2026-08-16-01'
+$ScriptBuild = '2026-08-16-02-interpreter-permission-note'
 Write-Host "Get-WindowsServerSecurityAudit.ps1 - build $ScriptBuild" -ForegroundColor Magenta
 Write-Host "READ-ONLY ASSESSMENT - no configuration changes, restarts, or GPO/registry/service/Defender/WinRM writes are made by this script." -ForegroundColor Yellow
 
@@ -646,11 +646,19 @@ foreach ($target in $Targets) {
         $rawOutput = $invokeResult.ScriptOutput
     } catch {
         $msg = $_.Exception.Message
-        $authFailure = $msg -match 'login|credential|password|authenticat|permission denied'
+        $authFailure       = $msg -match 'login|credential|password|authenticat'
+        $interpreterMissing = $msg -match 'locate.*script interpreter|not have enough permissions'
         Write-Log "Invoke-VMScript failed for $vmName - $msg" 'ERROR'
+        $interpretation =
+            if ($interpreterMissing) {
+                "Guest login succeeded, but VMware Tools could not locate/run the script interpreter. This is VMware's known misleading error for an account that authenticates OK but is NOT a member of the local Administrators group (directly or via a nested domain group) on this guest - Invoke-VMScript's guest-operations API requires admin rights to do this, beyond simple logon. Verify the -GuestCredential account's local admin membership on $vmName specifically; it can differ per-VM even with one shared account."
+            } elseif ($authFailure) {
+                'Guest authentication failed - verify -GuestCredential/-GuestCredentialPath has a valid username and password for this VM.'
+            } else {
+                'Invoke-VMScript could not run inside the guest - see Evidence for the underlying error.'
+            }
         Add-ResultRow -Target $rowsForVm -VMName $vmName -IPAddress $vmIp -Category 'VM Connectivity' -Check 'Guest Script Execution' `
-            -Status 'Unable to Verify' -Evidence $msg `
-            -Interpretation $(if ($authFailure) { 'Guest authentication failed - verify -GuestCredential is a valid local/domain admin on this VM.' } else { 'Invoke-VMScript could not run inside the guest - see Evidence for the underlying error.' })
+            -Status 'Unable to Verify' -Evidence $msg -Interpretation $interpretation
         $AllResults.AddRange($rowsForVm)
         continue
     }
