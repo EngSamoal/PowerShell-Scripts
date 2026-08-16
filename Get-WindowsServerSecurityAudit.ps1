@@ -51,7 +51,15 @@
 
 .PARAMETER GuestCredential
     Credential used for guest-OS authentication via Invoke-VMScript (needs local admin or
-    equivalent read access inside each guest). Prompted for interactively if not supplied.
+    equivalent read access inside each guest). Optional - if not supplied, the script tries to
+    load one from -GuestCredentialPath, and only prompts interactively if that file isn't found.
+
+.PARAMETER GuestCredentialPath
+    Path to a credential previously saved with Export-Clixml (e.g.
+    Get-Credential | Export-Clixml C:\temp\guestcred.xml). Defaults to C:\temp\guestcred.xml.
+    Only used when -GuestCredential isn't passed explicitly. Note: Export-Clixml encrypts the
+    password with Windows DPAPI tied to the user account + machine that created it, so this only
+    works when run as that same user on that same machine.
 
 .PARAMETER OutputPath
     Folder for the CSV/XLSX + log file. Created if it doesn't exist. Defaults to
@@ -63,7 +71,8 @@
 
 .EXAMPLE
     # Already connected: Connect-VIServer aq-vc.aq.local ; Connect-VIServer sf-vc.sixflags.local
-    .\Get-WindowsServerSecurityAudit.ps1 -GuestCredential (Get-Credential)
+    # Loads the credential automatically from C:\temp\guestcred.xml
+    .\Get-WindowsServerSecurityAudit.ps1
 
 .EXAMPLE
     .\Get-WindowsServerSecurityAudit.ps1 -GuestCredential (Get-Credential) `
@@ -79,9 +88,10 @@ param(
         [PSCustomObject]@{ Name = 'SF-UFM-DB01';  IPAddress = '10.50.18.28' }
     ),
 
-    [Parameter(Mandatory)]
     [System.Management.Automation.PSCredential]
     $GuestCredential,
+
+    [string]$GuestCredentialPath = 'C:\temp\guestcred.xml',
 
     [string]$OutputPath = (Join-Path $PSScriptRoot 'SecurityAudit_Reports'),
 
@@ -99,6 +109,30 @@ if (-not (Get-Module -ListAvailable -Name VMware.VimAutomation.Core)) {
 }
 if (-not $global:DefaultVIServers -or $global:DefaultVIServers.Count -eq 0) {
     throw "No connected vCenter session found. Run Connect-VIServer <vcenter> first, then re-run this script."
+}
+
+if (-not $PSBoundParameters.ContainsKey('GuestCredential')) {
+    # Try the given path, then the same filename with/without a .xml extension, so it doesn't
+    # matter which exact form was used when the credential was originally exported.
+    $candidatePaths = @(
+        $GuestCredentialPath,
+        $(if ($GuestCredentialPath -notmatch '\.xml$') { "$GuestCredentialPath.xml" }),
+        $(if ($GuestCredentialPath -match '\.xml$') { $GuestCredentialPath -replace '\.xml$', '' })
+    ) | Where-Object { $_ } | Select-Object -Unique
+
+    $foundPath = $candidatePaths | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+    if ($foundPath) {
+        try {
+            $GuestCredential = Import-Clixml -Path $foundPath -ErrorAction Stop
+            Write-Host "Loaded guest credential from $foundPath" -ForegroundColor Cyan
+        } catch {
+            throw "Found a credential file at '$foundPath' but could not import it (it may have been exported by a different user account or on a different machine - Export-Clixml credentials only decrypt for the same user+machine that created them). Underlying error: $($_.Exception.Message)"
+        }
+    } else {
+        Write-Host "No saved credential found at '$GuestCredentialPath' - prompting interactively." -ForegroundColor Yellow
+        $GuestCredential = Get-Credential -Message 'Guest OS credential for Invoke-VMScript (local/domain admin on the target VMs)'
+    }
 }
 
 if (-not (Test-Path $OutputPath)) { New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null }
