@@ -75,8 +75,7 @@
     .\Get-WindowsServerSecurityAudit.ps1
 
 .EXAMPLE
-    .\Get-WindowsServerSecurityAudit.ps1 -GuestCredential (Get-Credential) `
-        -Targets @([PSCustomObject]@{Name='AQ-UFM-APP01';IPAddress='10.28.9.46'}) -ExportExcel
+    .\Get-WindowsServerSecurityAudit.ps1 -GuestCredential (Get-Credential) -Targets @([PSCustomObject]@{Name='AQ-UFM-APP01';IPAddress='10.28.9.46'}) -ExportExcel
 #>
 
 [CmdletBinding()]
@@ -108,7 +107,7 @@ param(
 
 # Bump this on every change so it's always possible to confirm which version of the script
 # produced a given run - printed first thing at startup and written into the log file.
-$ScriptBuild = '2026-08-16-03-bat-powershell-wrapper'
+$ScriptBuild = '2026-08-16-04-no-backticks'
 Write-Host "Get-WindowsServerSecurityAudit.ps1 - build $ScriptBuild" -ForegroundColor Magenta
 Write-Host "READ-ONLY ASSESSMENT - no configuration changes, restarts, or GPO/registry/service/Defender/WinRM writes are made by this script." -ForegroundColor Yellow
 
@@ -226,9 +225,7 @@ function New-Check {
 
 try {
     $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
-    $results.Add((New-Check -Category "Host Info" -Check "Operating System" -Status "Info" `
-        -Evidence "$($os.Caption) Build $($os.BuildNumber)" `
-        -Interpretation "Guest operating system reported by WMI - for reference only."))
+    $results.Add((New-Check -Category "Host Info" -Check "Operating System" -Status "Info" -Evidence "$($os.Caption) Build $($os.BuildNumber)" -Interpretation "Guest operating system reported by WMI - for reference only."))
 } catch {
     $results.Add((New-Check -Category "Host Info" -Check "Operating System" -Status "Unable to Verify" -Evidence $_.Exception.Message))
 }
@@ -246,9 +243,7 @@ try {
         0 { "Not Enabled" }
         default { "Unknown ($vbsStatus)" }
     }
-    $results.Add((New-Check -Category "VBS & Credential Protection" -Check "Virtualization Based Security (VBS)" `
-        -Status $vbsText -Evidence "VirtualizationBasedSecurityStatus=$vbsStatus" `
-        -Interpretation "0=Not enabled, 1=Enabled in policy but not actually running (hardware/firmware may not support it), 2=Enabled and running."))
+    $results.Add((New-Check -Category "VBS & Credential Protection" -Check "Virtualization Based Security (VBS)" -Status $vbsText -Evidence "VirtualizationBasedSecurityStatus=$vbsStatus" -Interpretation "0=Not enabled, 1=Enabled in policy but not actually running (hardware/firmware may not support it), 2=Enabled and running."))
 
     $configured = @($dg.SecurityServicesConfigured)
     $running    = @($dg.SecurityServicesRunning)
@@ -256,47 +251,30 @@ try {
     $cgConfigured = $configured -contains 1
     $cgRunning    = $running -contains 1
     $cgStatus = if ($cgRunning) { "Enabled (Running)" } elseif ($cgConfigured) { "Configured but NOT Running" } else { "Not Configured" }
-    $results.Add((New-Check -Category "VBS & Credential Protection" -Check "Credential Guard" `
-        -Status $cgStatus -Evidence "SecurityServicesConfigured=[$($configured -join ',')] SecurityServicesRunning=[$($running -join ',')]" `
-        -Interpretation "Isolates LSASS secrets in a VBS container to block credential-theft tools (e.g. Mimikatz-style attacks). 'Configured but not running' usually means a pending reboot or unmet hardware/firmware requirements."))
+    $results.Add((New-Check -Category "VBS & Credential Protection" -Check "Credential Guard" -Status $cgStatus -Evidence "SecurityServicesConfigured=[$($configured -join ',')] SecurityServicesRunning=[$($running -join ',')]" -Interpretation "Isolates LSASS secrets in a VBS container to block credential-theft tools (e.g. Mimikatz-style attacks). 'Configured but not running' usually means a pending reboot or unmet hardware/firmware requirements."))
 
     $hvciConfigured = $configured -contains 2
     $hvciRunning    = $running -contains 2
     $hvciStatus = if ($hvciRunning) { "Enabled (Running)" } elseif ($hvciConfigured) { "Configured but NOT Running" } else { "Not Configured" }
-    $results.Add((New-Check -Category "VBS & Credential Protection" -Check "HVCI / Memory Integrity" `
-        -Status $hvciStatus -Evidence "SecurityServicesConfigured=[$($configured -join ',')] SecurityServicesRunning=[$($running -join ',')]" `
-        -Interpretation "Hypervisor-protected Code Integrity ensures only signed, trusted code runs in kernel mode. 'Configured but not running' usually means a pending reboot or unmet hardware/firmware requirements."))
+    $results.Add((New-Check -Category "VBS & Credential Protection" -Check "HVCI / Memory Integrity" -Status $hvciStatus -Evidence "SecurityServicesConfigured=[$($configured -join ',')] SecurityServicesRunning=[$($running -join ',')]" -Interpretation "Hypervisor-protected Code Integrity ensures only signed, trusted code runs in kernel mode. 'Configured but not running' usually means a pending reboot or unmet hardware/firmware requirements."))
 } catch {
-    $results.Add((New-Check -Category "VBS & Credential Protection" -Check "Credential Guard" -Status "Unable to Verify" -Evidence $_.Exception.Message `
-        -Interpretation "Could not query Win32_DeviceGuard (root\Microsoft\Windows\DeviceGuard) - class may be unavailable on this OS build/SKU."))
+    $results.Add((New-Check -Category "VBS & Credential Protection" -Check "Credential Guard" -Status "Unable to Verify" -Evidence $_.Exception.Message -Interpretation "Could not query Win32_DeviceGuard (root\Microsoft\Windows\DeviceGuard) - class may be unavailable on this OS build/SKU."))
     $results.Add((New-Check -Category "VBS & Credential Protection" -Check "HVCI / Memory Integrity" -Status "Unable to Verify" -Evidence $_.Exception.Message))
 }
 
-$results.Add((New-Check -Category "VBS & Credential Protection" -Check "Machine Identity Isolation" -Status "Unable to Verify" `
-    -Evidence "No single well-documented registry/WMI indicator identified for this setting at time of writing." `
-    -Interpretation "This is a newer Windows security capability; this script deliberately does not guess at an unverified indicator rather than report a false Enabled/Disabled result." `
-    -RequiresAdditionalEvidence $true `
-    -EvidenceGuidance "Confirm current implementation details against up-to-date Microsoft Windows Server 2025 documentation, then extend this script once confirmed."))
+$results.Add((New-Check -Category "VBS & Credential Protection" -Check "Machine Identity Isolation" -Status "Unable to Verify" -Evidence "No single well-documented registry/WMI indicator identified for this setting at time of writing." -Interpretation "This is a newer Windows security capability; this script deliberately does not guess at an unverified indicator rather than report a false Enabled/Disabled result." -RequiresAdditionalEvidence $true -EvidenceGuidance "Confirm current implementation details against up-to-date Microsoft Windows Server 2025 documentation, then extend this script once confirmed."))
 
 # ===========================================================================
 # 2. Microsoft Defender
 # ===========================================================================
 $mpAvailable = [bool](Get-Command Get-MpComputerStatus -ErrorAction SilentlyContinue)
 if (-not $mpAvailable) {
-    $results.Add((New-Check -Category "Microsoft Defender" -Check "Defender Cmdlets Available" -Status "Not Applicable" `
-        -Evidence "Get-MpComputerStatus / Get-MpPreference not found." `
-        -Interpretation "Defender PowerShell module is not present - this can mean Defender is disabled/uninstalled, or a third-party AV has replaced it. Verify manually via the Windows Security app or the AV vendor's console."))
+    $results.Add((New-Check -Category "Microsoft Defender" -Check "Defender Cmdlets Available" -Status "Not Applicable" -Evidence "Get-MpComputerStatus / Get-MpPreference not found." -Interpretation "Defender PowerShell module is not present - this can mean Defender is disabled/uninstalled, or a third-party AV has replaced it. Verify manually via the Windows Security app or the AV vendor's console."))
 } else {
     try {
         $mpStatus = Get-MpComputerStatus -ErrorAction Stop
-        $results.Add((New-Check -Category "Microsoft Defender" -Check "Real-Time Protection" `
-            -Status $(if ($mpStatus.RealTimeProtectionEnabled) { "Enabled" } else { "Disabled" }) `
-            -Evidence "RealTimeProtectionEnabled=$($mpStatus.RealTimeProtectionEnabled); AMServiceEnabled=$($mpStatus.AMServiceEnabled); AntivirusEnabled=$($mpStatus.AntivirusEnabled)" `
-            -Interpretation "Whether Defender's on-access/real-time scanning engine is currently active."))
-        $results.Add((New-Check -Category "Microsoft Defender" -Check "Tamper Protection" `
-            -Status $(if ($mpStatus.IsTamperProtected) { "Enabled" } else { "Disabled" }) `
-            -Evidence "IsTamperProtected=$($mpStatus.IsTamperProtected)" `
-            -Interpretation "Blocks unauthorized changes to Defender security settings, including via admin-level scripts or direct registry edits."))
+        $results.Add((New-Check -Category "Microsoft Defender" -Check "Real-Time Protection" -Status $(if ($mpStatus.RealTimeProtectionEnabled) { "Enabled" } else { "Disabled" }) -Evidence "RealTimeProtectionEnabled=$($mpStatus.RealTimeProtectionEnabled); AMServiceEnabled=$($mpStatus.AMServiceEnabled); AntivirusEnabled=$($mpStatus.AntivirusEnabled)" -Interpretation "Whether Defender's on-access/real-time scanning engine is currently active."))
+        $results.Add((New-Check -Category "Microsoft Defender" -Check "Tamper Protection" -Status $(if ($mpStatus.IsTamperProtected) { "Enabled" } else { "Disabled" }) -Evidence "IsTamperProtected=$($mpStatus.IsTamperProtected)" -Interpretation "Blocks unauthorized changes to Defender security settings, including via admin-level scripts or direct registry edits."))
     } catch {
         $results.Add((New-Check -Category "Microsoft Defender" -Check "Real-Time Protection" -Status "Unable to Verify" -Evidence $_.Exception.Message))
     }
@@ -307,9 +285,7 @@ if (-not $mpAvailable) {
         $asrIds     = @($mpPref.AttackSurfaceReductionRules_Ids)
         $asrActions = @($mpPref.AttackSurfaceReductionRules_Actions)
         if ($asrIds.Count -eq 0) {
-            $results.Add((New-Check -Category "Microsoft Defender" -Check "Attack Surface Reduction (ASR) Rules" -Status "Not Configured" `
-                -Evidence "No ASR rule IDs present in Get-MpPreference." `
-                -Interpretation "No ASR rules are configured locally or via policy on this host."))
+            $results.Add((New-Check -Category "Microsoft Defender" -Check "Attack Surface Reduction (ASR) Rules" -Status "Not Configured" -Evidence "No ASR rule IDs present in Get-MpPreference." -Interpretation "No ASR rules are configured locally or via policy on this host."))
         } else {
             $pairs = for ($i = 0; $i -lt $asrIds.Count; $i++) {
                 $actionText = switch ([int]$asrActions[$i]) {
@@ -326,9 +302,7 @@ if (-not $mpAvailable) {
             $overall = if ($blockCount -gt 0) { "Enabled (Enforced) - $blockCount rule(s) Block, $auditCount Audit" }
                        elseif ($auditCount -gt 0) { "Audit Mode Only - $auditCount rule(s)" }
                        else { "Not Configured" }
-            $results.Add((New-Check -Category "Microsoft Defender" -Check "Attack Surface Reduction (ASR) Rules" -Status $overall `
-                -Evidence ($pairs -join "; ") `
-                -Interpretation "ASR rules block common malware/exploit behaviors. Block=enforced, Audit=logged only (not enforced), Warn=user can bypass. Reflects Defender's merged effective policy."))
+            $results.Add((New-Check -Category "Microsoft Defender" -Check "Attack Surface Reduction (ASR) Rules" -Status $overall -Evidence ($pairs -join "; ") -Interpretation "ASR rules block common malware/exploit behaviors. Block=enforced, Audit=logged only (not enforced), Warn=user can bypass. Reflects Defender's merged effective policy."))
         }
 
         $mapsText = switch ($mpPref.MAPSReporting) {
@@ -337,9 +311,7 @@ if (-not $mpAvailable) {
             2 { "Advanced" }
             default { "Unknown($($mpPref.MAPSReporting))" }
         }
-        $results.Add((New-Check -Category "Microsoft Defender" -Check "Cloud-Delivered Protection (MAPS Reporting)" -Status $mapsText `
-            -Evidence "MAPSReporting=$($mpPref.MAPSReporting); SubmitSamplesConsent=$($mpPref.SubmitSamplesConsent); CloudBlockLevel=$($mpPref.CloudBlockLevel)" `
-            -Interpretation "Controls whether Defender submits telemetry/sample data to Microsoft's cloud for enhanced detection."))
+        $results.Add((New-Check -Category "Microsoft Defender" -Check "Cloud-Delivered Protection (MAPS Reporting)" -Status $mapsText -Evidence "MAPSReporting=$($mpPref.MAPSReporting); SubmitSamplesConsent=$($mpPref.SubmitSamplesConsent); CloudBlockLevel=$($mpPref.CloudBlockLevel)" -Interpretation "Controls whether Defender submits telemetry/sample data to Microsoft's cloud for enhanced detection."))
     } catch {
         $results.Add((New-Check -Category "Microsoft Defender" -Check "Attack Surface Reduction (ASR) Rules" -Status "Unable to Verify" -Evidence $_.Exception.Message))
     }
@@ -356,13 +328,9 @@ try {
         if ($prop) { $wdigestVal = $prop.UseLogonCredential }
     }
     if ($null -eq $wdigestVal) {
-        $results.Add((New-Check -Category "Authentication Security" -Check "WDigest (UseLogonCredential)" -Status "Not Configured" `
-            -Evidence "Registry value absent." `
-            -Interpretation "No explicit setting present. Windows 8.1/Server 2012 R2+ ships with WDigest credential caching off by default, but an explicit Disabled (0) value is recommended so the posture is enforced rather than relying on the OS default."))
+        $results.Add((New-Check -Category "Authentication Security" -Check "WDigest (UseLogonCredential)" -Status "Not Configured" -Evidence "Registry value absent." -Interpretation "No explicit setting present. Windows 8.1/Server 2012 R2+ ships with WDigest credential caching off by default, but an explicit Disabled (0) value is recommended so the posture is enforced rather than relying on the OS default."))
     } elseif ($wdigestVal -eq 1) {
-        $results.Add((New-Check -Category "Authentication Security" -Check "WDigest (UseLogonCredential)" -Status "Enabled" `
-            -Evidence "UseLogonCredential=1" `
-            -Interpretation "INSECURE: WDigest caches reversible/plaintext-equivalent credentials in LSASS memory, a common credential-theft target. Should be Disabled unless a specific legacy application requires it."))
+        $results.Add((New-Check -Category "Authentication Security" -Check "WDigest (UseLogonCredential)" -Status "Enabled" -Evidence "UseLogonCredential=1" -Interpretation "INSECURE: WDigest caches reversible/plaintext-equivalent credentials in LSASS memory, a common credential-theft target. Should be Disabled unless a specific legacy application requires it."))
     } else {
         $results.Add((New-Check -Category "Authentication Security" -Check "WDigest (UseLogonCredential)" -Status "Disabled" -Evidence "UseLogonCredential=$wdigestVal"))
     }
@@ -378,11 +346,7 @@ try {
         if ($prop) { $encVal = $prop.SupportedEncryptionTypes }
     }
     if ($null -eq $encVal) {
-        $results.Add((New-Check -Category "Authentication Security" -Check "Kerberos Supported Encryption Types" -Status "Not Configured" `
-            -Evidence "SupportedEncryptionTypes registry value absent - OS/domain default negotiation applies." `
-            -Interpretation "No explicit local policy restricting Kerberos encryption types." `
-            -RequiresAdditionalEvidence $true `
-            -EvidenceGuidance "Confirm effective value via 'Network security: Configure encryption types allowed for Kerberos' in effective GPO (gpresult /h) - this can be domain-policy driven without a local registry value."))
+        $results.Add((New-Check -Category "Authentication Security" -Check "Kerberos Supported Encryption Types" -Status "Not Configured" -Evidence "SupportedEncryptionTypes registry value absent - OS/domain default negotiation applies." -Interpretation "No explicit local policy restricting Kerberos encryption types." -RequiresAdditionalEvidence $true -EvidenceGuidance "Confirm effective value via 'Network security: Configure encryption types allowed for Kerberos' in effective GPO (gpresult /h) - this can be domain-policy driven without a local registry value."))
     } else {
         $bits = [int]$encVal
         $types = @()
@@ -391,11 +355,7 @@ try {
         if ($bits -band 0x4)  { $types += "RC4-HMAC-MD5 (legacy)" }
         if ($bits -band 0x8)  { $types += "AES128-CTS-HMAC-SHA1-96" }
         if ($bits -band 0x10) { $types += "AES256-CTS-HMAC-SHA1-96" }
-        $results.Add((New-Check -Category "Authentication Security" -Check "Kerberos Supported Encryption Types" -Status "Configured" `
-            -Evidence "SupportedEncryptionTypes=0x$($bits.ToString('X')) -> $($types -join ', ')" `
-            -Interpretation "This value governs the classic AES128/AES256-SHA1 (and legacy RC4/DES) Kerberos suites. Microsoft's newer AES-SHA2 'next-generation crypto' suites (the SHA256/SHA384/SHA512-based Kerberos support referenced in the Windows Server 2025 baseline) were not confirmed to be controlled by this same value as of this script's authoring - do NOT treat this check as proof SHA256/384/512 Kerberos support is enabled or disabled." `
-            -RequiresAdditionalEvidence $true `
-            -EvidenceGuidance "Confirm SHA-2 Kerberos suite support/enforcement via current Microsoft KDC/Windows Server 2025 documentation, 'klist' on an authenticated session, or effective GPO/RSOP - do not rely on this registry check alone for that specific claim."))
+        $results.Add((New-Check -Category "Authentication Security" -Check "Kerberos Supported Encryption Types" -Status "Configured" -Evidence "SupportedEncryptionTypes=0x$($bits.ToString('X')) -> $($types -join ', ')" -Interpretation "This value governs the classic AES128/AES256-SHA1 (and legacy RC4/DES) Kerberos suites. Microsoft's newer AES-SHA2 'next-generation crypto' suites (the SHA256/SHA384/SHA512-based Kerberos support referenced in the Windows Server 2025 baseline) were not confirmed to be controlled by this same value as of this script's authoring - do NOT treat this check as proof SHA256/384/512 Kerberos support is enabled or disabled." -RequiresAdditionalEvidence $true -EvidenceGuidance "Confirm SHA-2 Kerberos suite support/enforcement via current Microsoft KDC/Windows Server 2025 documentation, 'klist' on an authenticated session, or effective GPO/RSOP - do not rely on this registry check alone for that specific claim."))
     }
 } catch {
     $results.Add((New-Check -Category "Authentication Security" -Check "Kerberos Supported Encryption Types" -Status "Unable to Verify" -Evidence $_.Exception.Message))
@@ -406,9 +366,7 @@ try {
 # ===========================================================================
 try {
     $svc = Get-CimInstance -ClassName Win32_Service -Filter "Name='WinRM'" -ErrorAction Stop
-    $results.Add((New-Check -Category "Remote Management" -Check "WinRM Service" -Status "$($svc.State) (StartMode=$($svc.StartMode))" `
-        -Evidence "State=$($svc.State); StartMode=$($svc.StartMode)" `
-        -Interpretation "Current run state and boot-time start mode of the WinRM service, queried locally and read-only - no service control action performed."))
+    $results.Add((New-Check -Category "Remote Management" -Check "WinRM Service" -Status "$($svc.State) (StartMode=$($svc.StartMode))" -Evidence "State=$($svc.State); StartMode=$($svc.StartMode)" -Interpretation "Current run state and boot-time start mode of the WinRM service, queried locally and read-only - no service control action performed."))
 } catch {
     $results.Add((New-Check -Category "Remote Management" -Check "WinRM Service" -Status "Unable to Verify" -Evidence $_.Exception.Message))
 }
@@ -426,8 +384,7 @@ try {
             }
             $httpCount = @($listenerInfo | Where-Object { $_ -match 'Transport=HTTP ' }).Count
             $status = if ($httpCount -gt 0) { "Configured - includes unencrypted HTTP listener(s)" } else { "Configured - HTTPS only" }
-            $results.Add((New-Check -Category "Remote Management" -Check "WinRM Listeners" -Status $status -Evidence ($listenerInfo -join " | ") `
-                -Interpretation "Read directly from the registry (does not require the WinRM service to be running). An HTTP (unencrypted) listener is generally a hardening gap versus HTTPS-only."))
+            $results.Add((New-Check -Category "Remote Management" -Check "WinRM Listeners" -Status $status -Evidence ($listenerInfo -join " | ") -Interpretation "Read directly from the registry (does not require the WinRM service to be running). An HTTP (unencrypted) listener is generally a hardening gap versus HTTPS-only."))
         }
     } else {
         $results.Add((New-Check -Category "Remote Management" -Check "WinRM Listeners" -Status "Not Configured" -Evidence "$listenerRoot not present."))
@@ -440,9 +397,7 @@ try {
     $svcCfgPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WSMAN\Service"
     if (Test-Path $svcCfgPath) {
         $cfg = Get-ItemProperty -Path $svcCfgPath -ErrorAction SilentlyContinue
-        $results.Add((New-Check -Category "Remote Management" -Check "WinRM Hardening (Unencrypted/Basic Auth)" -Status "Configured" `
-            -Evidence "AllowUnencrypted=$($cfg.AllowUnencrypted); auth_Basic=$($cfg.auth_Basic); auth_Kerberos=$($cfg.auth_Kerberos); auth_Negotiate=$($cfg.auth_Negotiate); auth_CredSSP=$($cfg.auth_CredSSP)" `
-            -Interpretation "0/absent generally means the more secure default; 1 for AllowUnencrypted or auth_Basic indicates a weaker/legacy configuration that should be reviewed."))
+        $results.Add((New-Check -Category "Remote Management" -Check "WinRM Hardening (Unencrypted/Basic Auth)" -Status "Configured" -Evidence "AllowUnencrypted=$($cfg.AllowUnencrypted); auth_Basic=$($cfg.auth_Basic); auth_Kerberos=$($cfg.auth_Kerberos); auth_Negotiate=$($cfg.auth_Negotiate); auth_CredSSP=$($cfg.auth_CredSSP)" -Interpretation "0/absent generally means the more secure default; 1 for AllowUnencrypted or auth_Basic indicates a weaker/legacy configuration that should be reviewed."))
     } else {
         $results.Add((New-Check -Category "Remote Management" -Check "WinRM Hardening (Unencrypted/Basic Auth)" -Status "Not Configured" -Evidence "$svcCfgPath not present (WinRM likely never configured)."))
     }
@@ -458,12 +413,8 @@ try {
         $smb = Get-SmbServerConfiguration -ErrorAction Stop
         $auditSmb1 = if ($smb.PSObject.Properties.Name -contains 'AuditSmb1Access') { $smb.AuditSmb1Access } else { $null }
         $auditStatus = if ($null -eq $auditSmb1) { "Not Applicable (property not present on this OS build)" } elseif ($auditSmb1) { "Enabled" } else { "Disabled" }
-        $results.Add((New-Check -Category "SMB & RPC Security" -Check "SMB1 Access Auditing" -Status $auditStatus `
-            -Evidence "AuditSmb1Access=$auditSmb1; EnableSMB1Protocol=$($smb.EnableSMB1Protocol)" `
-            -Interpretation "AuditSmb1Access logs any client still attempting legacy SMB1 connections, to support safely disabling SMB1. Requires Windows Server 2022+ for this property."))
-        $results.Add((New-Check -Category "SMB & RPC Security" -Check "SMB Encryption / Signing" -Status "Info" `
-            -Evidence "EncryptData=$($smb.EncryptData); RejectUnencryptedAccess=$($smb.RejectUnencryptedAccess); RequireSecuritySignature=$($smb.RequireSecuritySignature); EnableSecuritySignature=$($smb.EnableSecuritySignature)" `
-            -Interpretation "Current SMB server encryption and signing enforcement settings."))
+        $results.Add((New-Check -Category "SMB & RPC Security" -Check "SMB1 Access Auditing" -Status $auditStatus -Evidence "AuditSmb1Access=$auditSmb1; EnableSMB1Protocol=$($smb.EnableSMB1Protocol)" -Interpretation "AuditSmb1Access logs any client still attempting legacy SMB1 connections, to support safely disabling SMB1. Requires Windows Server 2022+ for this property."))
+        $results.Add((New-Check -Category "SMB & RPC Security" -Check "SMB Encryption / Signing" -Status "Info" -Evidence "EncryptData=$($smb.EncryptData); RejectUnencryptedAccess=$($smb.RejectUnencryptedAccess); RequireSecuritySignature=$($smb.RequireSecuritySignature); EnableSecuritySignature=$($smb.EnableSecuritySignature)" -Interpretation "Current SMB server encryption and signing enforcement settings."))
     } else {
         $results.Add((New-Check -Category "SMB & RPC Security" -Check "SMB1 Access Auditing" -Status "Unable to Verify" -Evidence "Get-SmbServerConfiguration cmdlet not available (SMB module missing)."))
     }
@@ -479,9 +430,7 @@ try {
         if ($prop) { $rpcVal = $prop.RpcAuthnLevelPrivacyEnabled }
     }
     $rpcStatus = if ($null -eq $rpcVal) { "Not Configured (default applies - confirm this OS build's default)" } elseif ($rpcVal -eq 1) { "Enabled (Hardened - RPC packet privacy required)" } else { "Disabled" }
-    $results.Add((New-Check -Category "SMB & RPC Security" -Check "Printer RPC Packet Privacy (PrintNightmare mitigation)" -Status $rpcStatus `
-        -Evidence "RpcAuthnLevelPrivacyEnabled=$rpcVal" `
-        -Interpretation "Requires RPC connections to the Print Spooler to use packet privacy (encryption+signing) - part of the CVE-2021-34527 (PrintNightmare) mitigation set."))
+    $results.Add((New-Check -Category "SMB & RPC Security" -Check "Printer RPC Packet Privacy (PrintNightmare mitigation)" -Status $rpcStatus -Evidence "RpcAuthnLevelPrivacyEnabled=$rpcVal" -Interpretation "Requires RPC connections to the Print Spooler to use packet privacy (encryption+signing) - part of the CVE-2021-34527 (PrintNightmare) mitigation set."))
 } catch {
     $results.Add((New-Check -Category "SMB & RPC Security" -Check "Printer RPC Packet Privacy (PrintNightmare mitigation)" -Status "Unable to Verify" -Evidence $_.Exception.Message))
 }
@@ -490,9 +439,7 @@ try {
     $papPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers\PointAndPrint"
     if (Test-Path $papPath) {
         $pap = Get-ItemProperty -Path $papPath -ErrorAction SilentlyContinue
-        $results.Add((New-Check -Category "SMB & RPC Security" -Check "Point and Print Restrictions" -Status "Configured" `
-            -Evidence "NoWarningNoElevationOnInstall=$($pap.NoWarningNoElevationOnInstall); UpdatePromptSettings=$($pap.UpdatePromptSettings); RestrictDriverInstallationToAdministrators=$($pap.RestrictDriverInstallationToAdministrators)" `
-            -Interpretation "RestrictDriverInstallationToAdministrators=1 is the key PrintNightmare hardening setting (blocks non-admins from installing print drivers). NoWarningNoElevationOnInstall=1 is the opposite (a weakening setting) and should be 0/absent."))
+        $results.Add((New-Check -Category "SMB & RPC Security" -Check "Point and Print Restrictions" -Status "Configured" -Evidence "NoWarningNoElevationOnInstall=$($pap.NoWarningNoElevationOnInstall); UpdatePromptSettings=$($pap.UpdatePromptSettings); RestrictDriverInstallationToAdministrators=$($pap.RestrictDriverInstallationToAdministrators)" -Interpretation "RestrictDriverInstallationToAdministrators=1 is the key PrintNightmare hardening setting (blocks non-admins from installing print drivers). NoWarningNoElevationOnInstall=1 is the opposite (a weakening setting) and should be 0/absent."))
     } else {
         $results.Add((New-Check -Category "SMB & RPC Security" -Check "Point and Print Restrictions" -Status "Not Configured" -Evidence "$papPath not present - policy not applied, OS defaults apply."))
     }
@@ -513,8 +460,7 @@ try {
         if ($prop) { $ssVal = $prop.EnableSmartScreen }
     }
     $ssStatus = if ($null -eq $ssVal) { "Not Configured" } elseif ($ssVal -eq 0) { "Disabled" } else { "Enabled" }
-    $results.Add((New-Check -Category "2025 Security Baseline Indicators" -Check "SmartScreen (Explorer policy)" -Status $ssStatus `
-        -Evidence "EnableSmartScreen=$ssVal" -Interpretation $baselineNote -RequiresAdditionalEvidence $true -EvidenceGuidance "Compare against baseline GPO backup / gpresult."))
+    $results.Add((New-Check -Category "2025 Security Baseline Indicators" -Check "SmartScreen (Explorer policy)" -Status $ssStatus -Evidence "EnableSmartScreen=$ssVal" -Interpretation $baselineNote -RequiresAdditionalEvidence $true -EvidenceGuidance "Compare against baseline GPO backup / gpresult."))
 } catch {
     $results.Add((New-Check -Category "2025 Security Baseline Indicators" -Check "SmartScreen (Explorer policy)" -Status "Unable to Verify" -Evidence $_.Exception.Message -RequiresAdditionalEvidence $true))
 }
@@ -527,16 +473,12 @@ try {
         $scriptingVal = $zone.'1400'
         $protectedVal = $zone.'2500'
         $decode = { param($v) if ($null -eq $v) { "Not Configured" } elseif ($v -eq 0) { "Enable" } elseif ($v -eq 1) { "Prompt" } elseif ($v -eq 3) { "Disable" } else { "Value=$v" } }
-        $results.Add((New-Check -Category "2025 Security Baseline Indicators" -Check "IE Zone (Internet) - Run ActiveX Controls" `
-            -Status (& $decode $activeXVal) -Evidence "1200=$activeXVal" -Interpretation $baselineNote -RequiresAdditionalEvidence $true))
-        $results.Add((New-Check -Category "2025 Security Baseline Indicators" -Check "IE Zone (Internet) - Active Scripting" `
-            -Status (& $decode $scriptingVal) -Evidence "1400=$scriptingVal" -Interpretation $baselineNote -RequiresAdditionalEvidence $true))
+        $results.Add((New-Check -Category "2025 Security Baseline Indicators" -Check "IE Zone (Internet) - Run ActiveX Controls" -Status (& $decode $activeXVal) -Evidence "1200=$activeXVal" -Interpretation $baselineNote -RequiresAdditionalEvidence $true))
+        $results.Add((New-Check -Category "2025 Security Baseline Indicators" -Check "IE Zone (Internet) - Active Scripting" -Status (& $decode $scriptingVal) -Evidence "1400=$scriptingVal" -Interpretation $baselineNote -RequiresAdditionalEvidence $true))
         $protStatus = if ($null -eq $protectedVal) { "Not Configured" } elseif ($protectedVal -eq 0) { "Enabled (Protected Mode ON)" } else { "Disabled (Protected Mode OFF)" }
-        $results.Add((New-Check -Category "2025 Security Baseline Indicators" -Check "IE Zone (Internet) - Protected Mode" `
-            -Status $protStatus -Evidence "2500=$protectedVal" -Interpretation $baselineNote -RequiresAdditionalEvidence $true))
+        $results.Add((New-Check -Category "2025 Security Baseline Indicators" -Check "IE Zone (Internet) - Protected Mode" -Status $protStatus -Evidence "2500=$protectedVal" -Interpretation $baselineNote -RequiresAdditionalEvidence $true))
     } else {
-        $results.Add((New-Check -Category "2025 Security Baseline Indicators" -Check "IE Zone (Internet) - ActiveX/Scripting/Protected Mode" -Status "Not Configured" `
-            -Evidence "$zonePath not present." -Interpretation $baselineNote -RequiresAdditionalEvidence $true))
+        $results.Add((New-Check -Category "2025 Security Baseline Indicators" -Check "IE Zone (Internet) - ActiveX/Scripting/Protected Mode" -Status "Not Configured" -Evidence "$zonePath not present." -Interpretation $baselineNote -RequiresAdditionalEvidence $true))
     }
 } catch {
     $results.Add((New-Check -Category "2025 Security Baseline Indicators" -Check "IE Zone (Internet) - ActiveX/Scripting/Protected Mode" -Status "Unable to Verify" -Evidence $_.Exception.Message -RequiresAdditionalEvidence $true))
@@ -559,9 +501,7 @@ try {
     $status = if ($protoEvidence -match 'SSL [23]\.0\[Enabled=1') { "Weak protocol explicitly enabled (SSL 2.0/3.0)" }
               elseif ($protoEvidence -match 'TLS 1\.[01]\[Enabled=1') { "Legacy TLS 1.0/1.1 explicitly enabled" }
               else { "No legacy SSL/TLS explicitly enabled via registry (OS default in effect where not configured)" }
-    $results.Add((New-Check -Category "2025 Security Baseline Indicators" -Check "SSL/TLS Protocol Configuration (Schannel)" -Status $status `
-        -Evidence ($protoEvidence -join " | ") -Interpretation $baselineNote -RequiresAdditionalEvidence $true `
-        -EvidenceGuidance "Registry-absent entries fall back to the OS-default protocol set for this build, which varies by Windows Server version/patch level - confirm actual negotiated protocols with a TLS scan tool if certainty is required."))
+    $results.Add((New-Check -Category "2025 Security Baseline Indicators" -Check "SSL/TLS Protocol Configuration (Schannel)" -Status $status -Evidence ($protoEvidence -join " | ") -Interpretation $baselineNote -RequiresAdditionalEvidence $true -EvidenceGuidance "Registry-absent entries fall back to the OS-default protocol set for this build, which varies by Windows Server version/patch level - confirm actual negotiated protocols with a TLS scan tool if certainty is required."))
 } catch {
     $results.Add((New-Check -Category "2025 Security Baseline Indicators" -Check "SSL/TLS Protocol Configuration (Schannel)" -Status "Unable to Verify" -Evidence $_.Exception.Message -RequiresAdditionalEvidence $true))
 }
@@ -569,21 +509,15 @@ try {
 try {
     if (Get-Command Get-WindowsOptionalFeature -ErrorAction SilentlyContinue) {
         $ieFeature = Get-WindowsOptionalFeature -Online -FeatureName Internet-Explorer-Optional-amd64 -ErrorAction Stop
-        $results.Add((New-Check -Category "2025 Security Baseline Indicators" -Check "Legacy Internet Explorer 11 Feature State" -Status "$($ieFeature.State)" `
-            -Evidence "FeatureName=Internet-Explorer-Optional-amd64; State=$($ieFeature.State)" -Interpretation $baselineNote -RequiresAdditionalEvidence $true))
+        $results.Add((New-Check -Category "2025 Security Baseline Indicators" -Check "Legacy Internet Explorer 11 Feature State" -Status "$($ieFeature.State)" -Evidence "FeatureName=Internet-Explorer-Optional-amd64; State=$($ieFeature.State)" -Interpretation $baselineNote -RequiresAdditionalEvidence $true))
     } else {
-        $results.Add((New-Check -Category "2025 Security Baseline Indicators" -Check "Legacy Internet Explorer 11 Feature State" -Status "Unable to Verify" `
-            -Evidence "Get-WindowsOptionalFeature not available (e.g. Server Core or restricted session)." -RequiresAdditionalEvidence $true))
+        $results.Add((New-Check -Category "2025 Security Baseline Indicators" -Check "Legacy Internet Explorer 11 Feature State" -Status "Unable to Verify" -Evidence "Get-WindowsOptionalFeature not available (e.g. Server Core or restricted session)." -RequiresAdditionalEvidence $true))
     }
 } catch {
     $results.Add((New-Check -Category "2025 Security Baseline Indicators" -Check "Legacy Internet Explorer 11 Feature State" -Status "Unable to Verify" -Evidence $_.Exception.Message -RequiresAdditionalEvidence $true))
 }
 
-$results.Add((New-Check -Category "2025 Security Baseline Indicators" -Check "Overall Baseline Applied?" -Status "Not Determinable From Registry Alone" `
-    -Evidence "$($results.Count) individual indicator checks captured above." `
-    -Interpretation "The full Windows Server 2025 Security Baseline covers hundreds of settings across many areas. The indicators above are a representative subset only." `
-    -RequiresAdditionalEvidence $true `
-    -EvidenceGuidance "Run 'gpresult /h report.html' on the server, or use Microsoft's free Policy Analyzer tool to diff effective local policy against the official baseline GPO backup, for an authoritative answer."))
+$results.Add((New-Check -Category "2025 Security Baseline Indicators" -Check "Overall Baseline Applied?" -Status "Not Determinable From Registry Alone" -Evidence "$($results.Count) individual indicator checks captured above." -Interpretation "The full Windows Server 2025 Security Baseline covers hundreds of settings across many areas. The indicators above are a representative subset only." -RequiresAdditionalEvidence $true -EvidenceGuidance "Run 'gpresult /h report.html' on the server, or use Microsoft's free Policy Analyzer tool to diff effective local policy against the official baseline GPO backup, for an authoritative answer."))
 
 $json = $results | ConvertTo-Json -Depth 6 -Compress
 Write-Output $json
@@ -663,21 +597,16 @@ foreach ($target in $Targets) {
         }
     } catch {
         Write-Log "VM '$vmName' not found in any connected vCenter: $($_.Exception.Message)" 'ERROR'
-        Add-ResultRow -Target $rowsForVm -VMName $vmName -IPAddress $vmIp -Category 'VM Connectivity' -Check 'VM Found in vCenter' `
-            -Status 'Unable to Verify' -Evidence $_.Exception.Message `
-            -Interpretation 'The VM name could not be resolved on any currently connected vCenter Server.'
+        Add-ResultRow -Target $rowsForVm -VMName $vmName -IPAddress $vmIp -Category 'VM Connectivity' -Check 'VM Found in vCenter' -Status 'Unable to Verify' -Evidence $_.Exception.Message -Interpretation 'The VM name could not be resolved on any currently connected vCenter Server.'
         $AllResults.AddRange($rowsForVm)
         continue
     }
 
-    Add-ResultRow -Target $rowsForVm -VMName $vmName -IPAddress $vmIp -Category 'VM Connectivity' -Check 'VM Found in vCenter' `
-        -Status 'Enabled' -Evidence "PowerState=$($vm.PowerState)"
+    Add-ResultRow -Target $rowsForVm -VMName $vmName -IPAddress $vmIp -Category 'VM Connectivity' -Check 'VM Found in vCenter' -Status 'Enabled' -Evidence "PowerState=$($vm.PowerState)"
 
     if ($vm.PowerState -ne 'PoweredOn') {
         Write-Log "$vmName is $($vm.PowerState) - skipping guest-OS checks." 'WARN'
-        Add-ResultRow -Target $rowsForVm -VMName $vmName -IPAddress $vmIp -Category 'VM Connectivity' -Check 'Power State' `
-            -Status 'Not Applicable' -Evidence "PowerState=$($vm.PowerState)" `
-            -Interpretation 'Guest-OS checks require the VM to be powered on and running VMware Tools; all remaining checks are Not Applicable for this run.'
+        Add-ResultRow -Target $rowsForVm -VMName $vmName -IPAddress $vmIp -Category 'VM Connectivity' -Check 'Power State' -Status 'Not Applicable' -Evidence "PowerState=$($vm.PowerState)" -Interpretation 'Guest-OS checks require the VM to be powered on and running VMware Tools; all remaining checks are Not Applicable for this run.'
         $AllResults.AddRange($rowsForVm)
         continue
     }
@@ -685,14 +614,11 @@ foreach ($target in $Targets) {
     $toolsStatus = $vm.ExtensionData.Guest.ToolsRunningStatus
     if ($toolsStatus -ne 'guestToolsRunning') {
         Write-Log "$vmName VMware Tools not running (status: $toolsStatus) - cannot run guest checks." 'WARN'
-        Add-ResultRow -Target $rowsForVm -VMName $vmName -IPAddress $vmIp -Category 'VM Connectivity' -Check 'VMware Tools Running' `
-            -Status 'Unable to Verify' -Evidence "ToolsRunningStatus=$toolsStatus" `
-            -Interpretation 'Invoke-VMScript requires a running VMware Tools service inside the guest. All guest-OS checks are Unable to Verify for this run.'
+        Add-ResultRow -Target $rowsForVm -VMName $vmName -IPAddress $vmIp -Category 'VM Connectivity' -Check 'VMware Tools Running' -Status 'Unable to Verify' -Evidence "ToolsRunningStatus=$toolsStatus" -Interpretation 'Invoke-VMScript requires a running VMware Tools service inside the guest. All guest-OS checks are Unable to Verify for this run.'
         $AllResults.AddRange($rowsForVm)
         continue
     }
-    Add-ResultRow -Target $rowsForVm -VMName $vmName -IPAddress $vmIp -Category 'VM Connectivity' -Check 'VMware Tools Running' `
-        -Status 'Enabled' -Evidence "ToolsRunningStatus=$toolsStatus"
+    Add-ResultRow -Target $rowsForVm -VMName $vmName -IPAddress $vmIp -Category 'VM Connectivity' -Check 'VMware Tools Running' -Status 'Enabled' -Evidence "ToolsRunningStatus=$toolsStatus"
 
     $rawOutput = $null
     try {
@@ -712,16 +638,14 @@ foreach ($target in $Targets) {
             } else {
                 'Invoke-VMScript could not run inside the guest - see Evidence for the underlying error.'
             }
-        Add-ResultRow -Target $rowsForVm -VMName $vmName -IPAddress $vmIp -Category 'VM Connectivity' -Check 'Guest Script Execution' `
-            -Status 'Unable to Verify' -Evidence $msg -Interpretation $interpretation
+        Add-ResultRow -Target $rowsForVm -VMName $vmName -IPAddress $vmIp -Category 'VM Connectivity' -Check 'Guest Script Execution' -Status 'Unable to Verify' -Evidence $msg -Interpretation $interpretation
         $AllResults.AddRange($rowsForVm)
         continue
     }
 
     if ([string]::IsNullOrWhiteSpace($rawOutput)) {
         Write-Log "$vmName returned no output from the guest script." 'ERROR'
-        Add-ResultRow -Target $rowsForVm -VMName $vmName -IPAddress $vmIp -Category 'VM Connectivity' -Check 'Guest Script Execution' `
-            -Status 'Unable to Verify' -Evidence 'Guest script returned empty output.'
+        Add-ResultRow -Target $rowsForVm -VMName $vmName -IPAddress $vmIp -Category 'VM Connectivity' -Check 'Guest Script Execution' -Status 'Unable to Verify' -Evidence 'Guest script returned empty output.'
         $AllResults.AddRange($rowsForVm)
         continue
     }
@@ -731,16 +655,13 @@ foreach ($target in $Targets) {
     } catch {
         Write-Log "$vmName - failed to parse guest script JSON output: $($_.Exception.Message)" 'ERROR'
         $truncated = $rawOutput.Substring(0, [Math]::Min(500, $rawOutput.Length))
-        Add-ResultRow -Target $rowsForVm -VMName $vmName -IPAddress $vmIp -Category 'VM Connectivity' -Check 'Guest Script Execution' `
-            -Status 'Unable to Verify' -Evidence "JSON parse failure. Raw output (truncated): $truncated"
+        Add-ResultRow -Target $rowsForVm -VMName $vmName -IPAddress $vmIp -Category 'VM Connectivity' -Check 'Guest Script Execution' -Status 'Unable to Verify' -Evidence "JSON parse failure. Raw output (truncated): $truncated"
         $AllResults.AddRange($rowsForVm)
         continue
     }
 
     foreach ($item in $parsed) {
-        Add-ResultRow -Target $rowsForVm -VMName $vmName -IPAddress $vmIp -Category $item.Category -Check $item.Check -Status $item.Status `
-            -Evidence $item.Evidence -Interpretation $item.Interpretation `
-            -RequiresAdditionalEvidence ([bool]$item.RequiresAdditionalEvidence) -EvidenceGuidance $item.EvidenceGuidance
+        Add-ResultRow -Target $rowsForVm -VMName $vmName -IPAddress $vmIp -Category $item.Category -Check $item.Check -Status $item.Status -Evidence $item.Evidence -Interpretation $item.Interpretation -RequiresAdditionalEvidence ([bool]$item.RequiresAdditionalEvidence) -EvidenceGuidance $item.EvidenceGuidance
     }
 
     $AllResults.AddRange($rowsForVm)
