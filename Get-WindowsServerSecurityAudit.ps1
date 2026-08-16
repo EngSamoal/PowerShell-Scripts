@@ -95,12 +95,20 @@ param(
 
     [string]$OutputPath = (Join-Path $PSScriptRoot 'SecurityAudit_Reports'),
 
+    # Absolute path to powershell.exe INSIDE each guest. Guest checks run via -ScriptType Bat
+    # calling this path directly rather than -ScriptType Powershell, because some VMware Tools
+    # versions fail to auto-detect PowerShell as a known interpreter (surfaces as "Could not
+    # locate 'Powershell' script interpreter... probably you do not have enough permissions" even
+    # for a fully-privileged account). Default is the standard Windows Server location; override
+    # only if a target guest has PowerShell installed somewhere non-standard.
+    [string]$GuestPowerShellPath = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe',
+
     [switch]$ExportExcel
 )
 
 # Bump this on every change so it's always possible to confirm which version of the script
 # produced a given run - printed first thing at startup and written into the log file.
-$ScriptBuild = '2026-08-16-02-interpreter-permission-note'
+$ScriptBuild = '2026-08-16-03-bat-powershell-wrapper'
 Write-Host "Get-WindowsServerSecurityAudit.ps1 - build $ScriptBuild" -ForegroundColor Magenta
 Write-Host "READ-ONLY ASSESSMENT - no configuration changes, restarts, or GPO/registry/service/Defender/WinRM writes are made by this script." -ForegroundColor Yellow
 
@@ -582,6 +590,52 @@ Write-Output $json
 '@
 
 # ---------------------------------------------------------------------------------------------
+# Bat-wrapper staging: -ScriptType Powershell relies on VMware Tools auto-detecting where
+# powershell.exe lives inside the guest, and on some Tools versions that detection is simply
+# broken (confirmed against these targets: identical failure for both a confirmed local-admin
+# account and the built-in Administrator, while -ScriptType Bat succeeded and found
+# powershell.exe at the expected path every time). Using -ScriptType Bat to invoke
+# -GuestPowerShellPath directly sidesteps that broken detection entirely.
+#
+# $GuestScript above is too large to pass as a single inline command (Windows command-line
+# length limits), so the Bat wrapper below stages it into a small temp file in the guest's own
+# %TEMP% first, runs it, then deletes that same file in the same call - nothing persists on the
+# guest after Invoke-VMScript returns. Content is base64 (UTF-16LE, matching PowerShell's
+# -EncodedCommand convention) purely so it's safe to write via `echo` without cmd.exe
+# misinterpreting any special characters in the script text - the base64 alphabet contains none.
+$EncodedGuestScript = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($GuestScript))
+$ChunkSize = 4000
+$GuestScriptChunks = for ($i = 0; $i -lt $EncodedGuestScript.Length; $i += $ChunkSize) {
+    $EncodedGuestScript.Substring($i, [Math]::Min($ChunkSize, $EncodedGuestScript.Length - $i))
+}
+
+function New-GuestBatWrapper {
+    param([string[]]$EncodedChunks, [string]$PowerShellExePath)
+
+    $tempFileName = "secaudit_$([guid]::NewGuid().ToString('N')).b64"
+    # `$p`/`$b64`/etc. below must stay literal (escaped) so they land in the loader as PowerShell
+    # variable names; only $tempFileName should be expanded here, into the loader's file path.
+    $loaderSource = @"
+`$p = Join-Path `$env:TEMP '$tempFileName'
+`$b64 = Get-Content -Raw -Path `$p
+`$bytes = [Convert]::FromBase64String(`$b64)
+`$code = [Text.Encoding]::Unicode.GetString(`$bytes)
+Invoke-Expression `$code
+"@
+    $encodedLoader = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($loaderSource))
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add('@echo off')
+    for ($i = 0; $i -lt $EncodedChunks.Count; $i++) {
+        $redirect = if ($i -eq 0) { '>' } else { '>>' }
+        $lines.Add("echo $($EncodedChunks[$i]) $redirect `"%TEMP%\$tempFileName`"")
+    }
+    $lines.Add("`"$PowerShellExePath`" -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encodedLoader")
+    $lines.Add("del `"%TEMP%\$tempFileName`" 2>nul")
+    return ($lines -join "`r`n")
+}
+
+# ---------------------------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------------------------
 $AllResults = New-Object System.Collections.Generic.List[object]
@@ -642,7 +696,8 @@ foreach ($target in $Targets) {
 
     $rawOutput = $null
     try {
-        $invokeResult = Invoke-VMScript -VM $vm -ScriptType Powershell -ScriptText $GuestScript -GuestCredential $GuestCredential -ErrorAction Stop
+        $batWrapper = New-GuestBatWrapper -EncodedChunks $GuestScriptChunks -PowerShellExePath $GuestPowerShellPath
+        $invokeResult = Invoke-VMScript -VM $vm -ScriptType Bat -ScriptText $batWrapper -GuestCredential $GuestCredential -ErrorAction Stop
         $rawOutput = $invokeResult.ScriptOutput
     } catch {
         $msg = $_.Exception.Message
@@ -651,7 +706,7 @@ foreach ($target in $Targets) {
         Write-Log "Invoke-VMScript failed for $vmName - $msg" 'ERROR'
         $interpretation =
             if ($interpreterMissing) {
-                "Guest login succeeded, but VMware Tools could not locate/run the script interpreter. This is VMware's known misleading error for an account that authenticates OK but is NOT a member of the local Administrators group (directly or via a nested domain group) on this guest - Invoke-VMScript's guest-operations API requires admin rights to do this, beyond simple logon. Verify the -GuestCredential account's local admin membership on $vmName specifically; it can differ per-VM even with one shared account."
+                "VMware Tools could not run the Bat wrapper itself (before it ever reached PowerShell) - this is a step below the interpreter-detection issue this script already works around, so something more fundamental with guest operations on this VM is failing. Confirm -GuestPowerShellPath ($GuestPowerShellPath) actually exists on $vmName, and that VMware Tools is fully installed/running (not just the minimal/legacy driver set)."
             } elseif ($authFailure) {
                 'Guest authentication failed - verify -GuestCredential/-GuestCredentialPath has a valid username and password for this VM.'
             } else {
