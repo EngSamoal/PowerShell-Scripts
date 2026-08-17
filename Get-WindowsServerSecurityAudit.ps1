@@ -90,12 +90,14 @@
     .\Get-WindowsServerSecurityAudit.ps1 -GuestCredential (Get-Credential) -Targets @([PSCustomObject]@{Name='AQ-UFM-APP01';IPAddress='10.28.9.46'}) -ExportExcel
 
 .NOTES
-    Build 2026-08-17-01 changelog (see $ScriptBuild below - always confirm this matches what's
+    Build 2026-08-17-02 changelog (see $ScriptBuild below - always confirm this matches what's
     printed on screen before trusting a run; if it doesn't, you're looking at a stale cached copy,
     close every editor/console tab that might have an old copy open and re-run the actual saved
     file):
 
-      Root-caused and fixed two distinct problems reported against the prior version:
+      Root-caused and fixed three distinct problems reported against prior versions - each one
+      verified against real evidence (parse output, smoke tests, or an actual failing run's log)
+      rather than patched from the visible symptom alone:
 
       1. "The term '-Status' is not recognized as the name of a cmdlet..." - this was NOT a typo
          to patch in place. Every Add-ResultRow / New-Check call in the prior script was written
@@ -109,24 +111,40 @@
          stripped without the lines being rejoined), PowerShell treated the wrapped remainder as a
          brand new statement - and a "statement" that starts with -Status is parsed as an attempt
          to run a command literally named "-Status", producing exactly the reported
-         CommandNotFoundException. This is a structural risk, not a one-off: any sufficiently long
-         line can be re-wrapped again in the future by the next editor/tool that touches the file.
-         Fix: every Add-ResultRow / New-Check call in this version is built as a small hashtable
-         and invoked with splatting (Some-Function @paramsHashtable). Each Key = Value pair lives
-         on its own short line inside @{ ... }, which PowerShell always treats as one literal
-         expression regardless of line breaks - there is no long single logical line left anywhere
-         in this script for a re-wrap to break.
+         CommandNotFoundException. Fix: every Add-ResultRow / New-Check call is built as a small
+         hashtable and invoked with splatting (Some-Function @paramsHashtable). Each Key = Value
+         pair lives on its own short line inside @{ ... }, which PowerShell always treats as one
+         literal expression regardless of line breaks - there is no long single logical line left
+         anywhere in this script for a re-wrap to break.
 
       2. Invoke-VMScript failing with "Could not locate '<interpreter>' script interpreter in any
          of the expected locations. Probably you do not have enough permissions to execute command
-         within guest." This version adds a fast, read-only pre-flight probe per VM (a single
-         "if exist" Bat check for $GuestPowerShellPath, before staging the full payload) so the
-         report distinguishes, per VM, between: (a) the trivial probe itself failing the same way
-         - which points at guest-side permission/token filtering (see the LocalAccountTokenFilter-
-         Policy note under -GuestCredential above) rather than anything about PowerShell's path,
-         and (b) the probe succeeding but reporting the path missing - a genuinely wrong
-         -GuestPowerShellPath for that build/SKU. Either way the report now says which one it saw
-         instead of guessing.
+         within guest." on EVERY VM (4 of 4, across two different vCenters), even with a confirmed
+         local administrator account. A build-2026-08-17-01 run's log proved this was not a
+         permissions problem: that build's pre-flight probe (a trivial one-line Bat command run
+         with the exact same credential and the exact same Invoke-VMScript/-ScriptType Bat
+         mechanism) succeeded on all 4 VMs - the log shows straight from "Processing X..." to the
+         large-payload failure, never the probe-failure message. A genuine credential/token
+         problem (e.g. UAC LocalAccountTokenFilterPolicy) would have broken the trivial probe too;
+         it didn't, on any VM. What actually differed was payload size: the old design embedded
+         the entire ~30-40KB guest check script as base64 text split across ~10+ "echo ... >>"
+         lines inside a single Invoke-VMScript -ScriptText call. VMware's guest-operations API
+         (VIX, underneath Invoke-VMScript) has a practical size ceiling for embedded -ScriptText
+         on many vSphere/Tools builds, and surfaces that same generic, misleading "not enough
+         permissions" wording when it's hit. Fix: this version never embeds the payload in
+         -ScriptText at all. Copy-VMGuestFile (a real VMware Tools guest file-transfer operation,
+         not subject to the same ScriptText size ceiling) pushes the actual .ps1 file into the
+         guest's C:\Windows\Temp; Invoke-VMScript is then only ever given a short one-line command
+         to run it, and the temp file is deleted again in the same run - nothing persists on the
+         guest afterward. The pre-flight probe from build 01 is kept (still useful, still cheap),
+         and the error-classification logic still separately calls out genuine permission/token
+         filtering as a possible cause if Copy-VMGuestFile itself (rather than the old large
+         -ScriptText payload) is ever what fails.
+
+      3. (Retained from build 01) The same probe also distinguishes a genuinely wrong
+         -GuestPowerShellPath (probe succeeds, reports the path missing) from a guest-side
+         execution problem (probe itself fails) - the report says which one it saw instead of
+         guessing.
 #>
 
 [CmdletBinding()]
@@ -158,7 +176,7 @@ param(
 
 # Bump this on every change so it's always possible to confirm which version of the script
 # produced a given run - printed first thing at startup and written into the log file.
-$ScriptBuild = '2026-08-17-01-splat-and-preflight'
+$ScriptBuild = '2026-08-17-02-guestfile-transfer'
 Write-Host "Get-WindowsServerSecurityAudit.ps1 - build $ScriptBuild" -ForegroundColor Magenta
 Write-Host "READ-ONLY ASSESSMENT - no configuration changes, restarts, or GPO/registry/service/Defender/WinRM writes are made by this script." -ForegroundColor Yellow
 
@@ -859,50 +877,28 @@ Write-Output $json
 '@
 
 # ---------------------------------------------------------------------------------------------
-# Bat-wrapper staging: -ScriptType Powershell relies on VMware Tools auto-detecting where
-# powershell.exe lives inside the guest, and on some Tools versions that detection is simply
-# broken (confirmed against these targets: identical failure for both a confirmed local-admin
-# account and the built-in Administrator, while -ScriptType Bat succeeded and found
-# powershell.exe at the expected path every time). Using -ScriptType Bat to invoke
-# -GuestPowerShellPath directly sidesteps that broken detection entirely.
+# Guest-file staging via Copy-VMGuestFile: an earlier version of this script embedded the entire
+# ~30-40KB guest check script as base64 text directly inside Invoke-VMScript's -ScriptText
+# parameter (chunked into a series of "echo ... >> file" Bat lines to work around Windows
+# command-line length limits). In real runs against multiple VMs across two different vCenters,
+# that consistently failed with "Could not locate '<x>' script interpreter... probably you do not
+# have enough permissions" - while a tiny one-line pre-flight probe using the exact same
+# credential and the exact same Invoke-VMScript/-ScriptType Bat mechanism succeeded every time on
+# every VM. Because the trivial call worked and only the large embedded payload failed, this was
+# not a permissions/credential problem - VMware's guest-operations API (VIX, underneath
+# Invoke-VMScript) has a practical size ceiling for embedded -ScriptText on many vSphere/Tools
+# builds, and returns that same generic, misleading "not enough permissions" wording when it's
+# hit, regardless of the real cause.
 #
-# $GuestScript above is too large to pass as a single inline command (Windows command-line
-# length limits), so the Bat wrapper below stages it into a small temp file in the guest's own
-# %TEMP% first, runs it, then deletes that same file in the same call - nothing persists on the
-# guest after Invoke-VMScript returns. Content is base64 (UTF-16LE, matching PowerShell's
-# -EncodedCommand convention) purely so it's safe to write via `echo` without cmd.exe
-# misinterpreting any special characters in the script text - the base64 alphabet contains none.
-$EncodedGuestScript = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($GuestScript))
-$ChunkSize = 4000
-$GuestScriptChunks = for ($i = 0; $i -lt $EncodedGuestScript.Length; $i += $ChunkSize) {
-    $EncodedGuestScript.Substring($i, [Math]::Min($ChunkSize, $EncodedGuestScript.Length - $i))
-}
-
-function New-GuestBatWrapper {
-    param([string[]]$EncodedChunks, [string]$PowerShellExePath)
-
-    $tempFileName = "secaudit_$([guid]::NewGuid().ToString('N')).b64"
-    # `$p`/`$b64`/etc. below must stay literal (escaped) so they land in the loader as PowerShell
-    # variable names; only $tempFileName should be expanded here, into the loader's file path.
-    $loaderSource = @"
-`$p = Join-Path `$env:TEMP '$tempFileName'
-`$b64 = Get-Content -Raw -Path `$p
-`$bytes = [Convert]::FromBase64String(`$b64)
-`$code = [Text.Encoding]::Unicode.GetString(`$bytes)
-Invoke-Expression `$code
-"@
-    $encodedLoader = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($loaderSource))
-
-    $lines = New-Object System.Collections.Generic.List[string]
-    $lines.Add('@echo off')
-    for ($i = 0; $i -lt $EncodedChunks.Count; $i++) {
-        $redirect = if ($i -eq 0) { '>' } else { '>>' }
-        $lines.Add("echo $($EncodedChunks[$i]) $redirect `"%TEMP%\$tempFileName`"")
-    }
-    $lines.Add("`"$PowerShellExePath`" -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encodedLoader")
-    $lines.Add("del `"%TEMP%\$tempFileName`" 2>nul")
-    return ($lines -join "`r`n")
-}
+# This version never embeds the payload in -ScriptText at all. Copy-VMGuestFile (a real VMware
+# Tools guest-file-transfer operation, not subject to the same ScriptText size ceiling) pushes the
+# actual .ps1 file into the guest; Invoke-VMScript is then only ever given a short one-line
+# command to run it. The guest-side temp file is deleted again in the same run - nothing persists
+# on the guest afterward, consistent with this being a read-only assessment (the same "stage a
+# temp file, run it, delete it" pattern the previous version already used, just via a proper file
+# transfer API instead of embedding via base64/echo).
+$LocalGuestScriptPath = Join-Path ([System.IO.Path]::GetTempPath()) "secaudit_guestscript_$([guid]::NewGuid().ToString('N')).ps1"
+Set-Content -Path $LocalGuestScriptPath -Value $GuestScript -Encoding UTF8
 
 # Cheap, read-only pre-flight probe: a single "if exist" Bat check for $GuestPowerShellPath, run
 # BEFORE staging the full payload. This exists purely to tell apart the two most common causes of
@@ -1073,37 +1069,54 @@ foreach ($target in $Targets) {
     }
 
     $rawOutput = $null
+    $copySucceeded = $false
+    $guestScriptPath = "C:\Windows\Temp\secaudit_$([guid]::NewGuid().ToString('N')).ps1"
     try {
-        $batWrapper = New-GuestBatWrapper -EncodedChunks $GuestScriptChunks -PowerShellExePath $GuestPowerShellPath
-        $invokeResult = Invoke-VMScript -VM $vm -ScriptType Bat -ScriptText $batWrapper -GuestCredential $GuestCredential -ErrorAction Stop
-        $rawOutput = $invokeResult.ScriptOutput
-    } catch {
-        $msg = $_.Exception.Message
-        $authFailure    = $msg -match 'login|credential|password|authenticat'
-        $interpreterMsg = $msg -match 'script interpreter'
-        $permissionHint = $msg -match 'enough permissions'
-        Write-Log "Invoke-VMScript failed for $vmName - $msg" 'ERROR'
-        $interpretation =
-            if ($interpreterMsg -and $permissionHint) {
-                "The pre-flight probe for this VM succeeded moments earlier, so this failure is specific to the larger payload rather than a general permissions problem. Confirm nothing changed on the guest between the probe and this call (e.g. VMware Tools service restarting), and re-run. If it recurs consistently, treat it the same as the pre-flight-probe-failure case: verify -GuestCredential is a domain admin account or the actual built-in 'Administrator' account rather than a different local admin account (see -GuestCredential help for why that distinction matters here)."
-            } elseif ($authFailure) {
-                'Guest authentication failed - verify -GuestCredential/-GuestCredentialPath has a valid username and password for this VM.'
-            } else {
-                'Invoke-VMScript could not run inside the guest - see Evidence for the underlying error.'
+        try {
+            Copy-VMGuestFile -Source $LocalGuestScriptPath -Destination $guestScriptPath -LocalToGuest -VM $vm -GuestCredential $GuestCredential -Force -ErrorAction Stop
+            $copySucceeded = $true
+            $runScript = "`"$GuestPowerShellPath`" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$guestScriptPath`""
+            $invokeResult = Invoke-VMScript -VM $vm -ScriptType Bat -ScriptText $runScript -GuestCredential $GuestCredential -ErrorAction Stop
+            $rawOutput = $invokeResult.ScriptOutput
+        } catch {
+            $msg = $_.Exception.Message
+            $authFailure    = $msg -match 'login|credential|password|authenticat'
+            $interpreterMsg = $msg -match 'script interpreter'
+            $permissionHint = $msg -match 'enough permissions'
+            $stepName = if ($copySucceeded) { 'running the staged script' } else { 'staging the script file (Copy-VMGuestFile)' }
+            Write-Log "Guest script $stepName failed for $vmName - $msg" 'ERROR'
+            $interpretation =
+                if ($copySucceeded -and $interpreterMsg -and $permissionHint) {
+                    "This happened running a short one-line command (this build no longer embeds the full script in -ScriptText), and the pre-flight probe already proved basic guest execution works with this credential - so a script-size limitation is unlikely here. Most likely a genuine permission/token problem specific to launching a process (as opposed to simple file read/write): verify -GuestCredential is a domain admin account or the actual built-in 'Administrator' account rather than a different local admin account - UAC's LocalAccountTokenFilterPolicy can filter a genuinely-admin local account's token for exactly this kind of remote process-launch call even when file operations succeed. Also confirm no endpoint security product on $vmName is blocking non-interactive powershell.exe launches."
+                } elseif (-not $copySucceeded -and $interpreterMsg -and $permissionHint) {
+                    "Copy-VMGuestFile itself failed to stage the script file on $vmName before anything tried to run - this is a file-transfer permission/path/disk-space problem, not a PowerShell-interpreter problem despite the wording. Confirm -GuestCredential can write to C:\Windows\Temp on this VM."
+                } elseif ($authFailure) {
+                    'Guest authentication failed - verify -GuestCredential/-GuestCredentialPath has a valid username and password for this VM.'
+                } else {
+                    "Invoke-VMScript/Copy-VMGuestFile could not complete inside the guest while $stepName - see Evidence for the underlying error."
+                }
+            $p = @{
+                Target         = $rowsForVm
+                VMName         = $vmName
+                IPAddress      = $vmIp
+                Category       = 'VM Connectivity'
+                Check          = if ($copySucceeded) { 'Guest Script Execution' } else { 'Guest Script Staging (Copy-VMGuestFile)' }
+                Status         = 'Unable to Verify'
+                Evidence       = $msg
+                Interpretation = $interpretation
             }
-        $p = @{
-            Target         = $rowsForVm
-            VMName         = $vmName
-            IPAddress      = $vmIp
-            Category       = 'VM Connectivity'
-            Check          = 'Guest Script Execution'
-            Status         = 'Unable to Verify'
-            Evidence       = $msg
-            Interpretation = $interpretation
+            Add-ResultRow @p
+            $AllResults.AddRange($rowsForVm)
+            continue
         }
-        Add-ResultRow @p
-        $AllResults.AddRange($rowsForVm)
-        continue
+    } finally {
+        if ($copySucceeded) {
+            try {
+                Invoke-VMScript -VM $vm -ScriptType Bat -ScriptText "del `"$guestScriptPath`" 2>nul" -GuestCredential $GuestCredential -ErrorAction Stop | Out-Null
+            } catch {
+                Write-Log "$vmName - could not remove temp guest script file ($guestScriptPath) - non-fatal, review manually if needed: $($_.Exception.Message)" 'WARN'
+            }
+        }
     }
 
     if ([string]::IsNullOrWhiteSpace($rawOutput)) {
@@ -1177,6 +1190,8 @@ foreach ($target in $Targets) {
     }
     Write-Log "$vmName processed - $($rowsForVm.Count) checks recorded."
 }
+
+Remove-Item -Path $LocalGuestScriptPath -Force -ErrorAction SilentlyContinue
 
 # ---------------------------------------------------------------------------------------------
 # Export
