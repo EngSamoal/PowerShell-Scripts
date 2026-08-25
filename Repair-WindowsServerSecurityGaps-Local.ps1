@@ -73,6 +73,15 @@
 .PARAMETER DisableWinRM
     Opt-in: fully stop and disable the WinRM service instead of the default (harden only).
 
+.PARAMETER WinRmAllowedSourceRange
+    Optional list of IP addresses/CIDR ranges (e.g. '10.1.1.0/24','10.1.2.5') that should be the
+    ONLY sources allowed to reach WinRM. When supplied (and -DisableWinRM is not used), restricts
+    the "Windows Remote Management" firewall rules' RemoteAddress to exactly this list - this is
+    the actual "restrict listener filters" hardening step. Not guessed at or defaulted: without
+    this parameter the step is reported Manual/External Required rather than assume what your
+    management subnet is, since a wrong guess here could either lock out legitimate admin access
+    or fail to restrict anything.
+
 .PARAMETER EnforceAesOnlyKerberos
     Opt-in: set Kerberos SupportedEncryptionTypes to AES-only (removes RC4/DES). Default
     behavior only adds AES support without removing anything already configured.
@@ -129,6 +138,22 @@
     as ad-hoc registry writes here would risk both silently missing some and introducing
     undocumented compatibility breaks. Use -LgpoPath/-BaselineGpoBackupPath (see above) to apply
     the genuine baseline via Microsoft's own tool instead.
+
+    KNOWN GAPS - deliberately not remediated, not an oversight:
+      Machine Identity Isolation  No registry/policy mechanism for this specific (newer) Windows
+                                  capability has been confirmed against current Microsoft
+                                  documentation. Rather than write an unverified registry value
+                                  that might do nothing (false sense of security) or something
+                                  unintended, this script does not touch it at all. Reported
+                                  Manual/External Required by the audit script; extend this
+                                  script once a confirmed mechanism is published.
+      Kerberos SHA256/SHA384/SHA512 (RFC 8009 AES-SHA2 suites)
+                                  Only the classic SupportedEncryptionTypes bitmask is remediated
+                                  here (AES128/AES256-SHA1, the long-standing Windows Kerberos
+                                  encryption types). Whether/how Windows Server 2025 exposes the
+                                  newer SHA-2-based Kerberos suites via a local registry value was
+                                  not confirmed as of this script's authoring - do not treat the
+                                  Kerberos remediation above as covering this specific requirement.
 #>
 
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
@@ -144,6 +169,7 @@ param(
     [switch]$SkipBaselineIndicators,
 
     [switch]$DisableWinRM,
+    [string[]]$WinRmAllowedSourceRange,
     [switch]$EnforceAesOnlyKerberos,
     [switch]$DisableLegacyTls,
 
@@ -155,7 +181,7 @@ param(
 )
 
 $ProgressPreference = 'SilentlyContinue'
-$ScriptBuild = '2026-08-17-01-remediation-local'
+$ScriptBuild = '2026-08-17-02-winrm-listener-filter'
 Write-Host "Repair-WindowsServerSecurityGaps-Local.ps1 - build $ScriptBuild" -ForegroundColor Magenta
 if ($Apply) {
     Write-Host "*** -Apply IS SET: this run WILL change configuration on this server. ***" -ForegroundColor Red
@@ -446,6 +472,34 @@ if (-not $SkipWinRM) {
                 ApplyBlock = {
                     Set-ItemProperty -Path $winrmSvcPath -Name AllowUnencrypted -Value 0 -Type DWord -Force
                     Set-ItemProperty -Path $winrmSvcPath -Name auth_Basic -Value 0 -Type DWord -Force
+                }
+            }
+            Invoke-Remediation @p
+        }
+
+        if (-not $WinRmAllowedSourceRange -or $WinRmAllowedSourceRange.Count -eq 0) {
+            Add-ResultRow -Category 'Remote Management' -Item 'Restrict WinRM Listener to Management Sources' -Status 'Manual/External Required' -Details "Not restricted - no -WinRmAllowedSourceRange supplied. Re-run with -WinRmAllowedSourceRange @('10.1.1.0/24') (your actual management subnet(s)/host IPs) to scope the 'Windows Remote Management' firewall rules to only those sources. Left open to any source by default rather than guessed, since a wrong assumption here could lock out legitimate admin access."
+        } elseif (-not (Get-Command Get-NetFirewallRule -ErrorAction SilentlyContinue)) {
+            Add-ResultRow -Category 'Remote Management' -Item 'Restrict WinRM Listener to Management Sources' -Status 'Unable to Verify' -Details 'Get-NetFirewallRule/Set-NetFirewallRule not available (NetSecurity module missing) - cannot inspect or restrict the WinRM firewall rules on this host.'
+        } else {
+            $p = @{
+                Category = 'Remote Management'; Item = 'Restrict WinRM Listener to Management Sources'
+                Description = "Set-NetFirewallRule on the 'Windows Remote Management' firewall rule group -RemoteAddress $($WinRmAllowedSourceRange -join ', ') - only these sources will be able to reach the WinRM listener."
+                RiskNote = 'If this list omits a host/subnet that legitimately needs WinRM access (e.g. this very management workstation, or a monitoring server), that access will be cut off. Double-check the range before applying.'
+                CheckBlock = {
+                    $rules = @(Get-NetFirewallRule -DisplayGroup 'Windows Remote Management' -ErrorAction Stop | Where-Object { $_.Enabled -eq 'True' })
+                    if ($rules.Count -eq 0) { throw "No enabled 'Windows Remote Management' firewall rules found - cannot verify/restrict scope." }
+                    $allMatch = $true
+                    foreach ($rule in $rules) {
+                        $currentAddr = @($rule | Get-NetFirewallAddressFilter -ErrorAction Stop | Select-Object -ExpandProperty RemoteAddress)
+                        $desired = @($WinRmAllowedSourceRange)
+                        if (@(Compare-Object $currentAddr $desired -SyncWindow 0).Count -ne 0) { $allMatch = $false }
+                    }
+                    $allMatch
+                }
+                ApplyBlock = {
+                    $rules = Get-NetFirewallRule -DisplayGroup 'Windows Remote Management' -ErrorAction Stop
+                    foreach ($rule in $rules) { $rule | Set-NetFirewallRule -RemoteAddress $WinRmAllowedSourceRange -ErrorAction Stop }
                 }
             }
             Invoke-Remediation @p
