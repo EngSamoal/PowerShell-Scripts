@@ -140,13 +140,6 @@
     the genuine baseline via Microsoft's own tool instead.
 
     KNOWN GAPS - deliberately not remediated, not an oversight:
-      Machine Identity Isolation  No registry/policy mechanism for this specific (newer) Windows
-                                  capability has been confirmed against current Microsoft
-                                  documentation. Rather than write an unverified registry value
-                                  that might do nothing (false sense of security) or something
-                                  unintended, this script does not touch it at all. Reported
-                                  Manual/External Required by the audit script; extend this
-                                  script once a confirmed mechanism is published.
       Kerberos SHA256/SHA384/SHA512 (RFC 8009 AES-SHA2 suites)
                                   Only the classic SupportedEncryptionTypes bitmask is remediated
                                   here (AES128/AES256-SHA1, the long-standing Windows Kerberos
@@ -176,8 +169,8 @@ param(
     [ValidateSet('Enabled', 'AuditMode')]
     [string]$AsrRuleAction = 'Enabled',
 
-    [string]$LgpoPath,
-    [string]$BaselineGpoBackupPath
+    [string]$LgpoPath = 'C:\Tools\LGPO\LGPO.exe',
+    [string]$BaselineGpoBackupPath = 'C:\Tools\Baseline\GPOs'
 )
 
 $ProgressPreference = 'SilentlyContinue'
@@ -324,6 +317,19 @@ if (-not $SkipCredentialGuard) {
         RequiresReboot = $true; RiskNote = $vbsCaveat
         CheckBlock = { $v = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\LSA' -Name LsaCfgFlags -ErrorAction SilentlyContinue; $v -and $v.LsaCfgFlags -in @(1, 2) }
         ApplyBlock = { Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\LSA' -Name LsaCfgFlags -Value 1 -Type DWord -Force }
+    }
+    Invoke-Remediation @p
+
+    $p = @{
+        Category = 'VBS & Credential Protection'; Item = 'Enable Machine Identity Isolation'
+        Description = 'Set HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceGuard MachineIdentityIsolation=2 (Enabled - Enforcement Mode; machine password becomes IUM-bound only, isolated from LSASS). This is the same registry value the "Machine Identity Isolation Configuration" option under the "Turn On Virtualization Based Security" GPO writes.'
+        RequiresReboot = $true
+        RiskNote = "$vbsCaveat Also: this policy is confirmed in Microsoft's DeviceGuard Policy CSP reference but is not confirmed generally available on every Windows Server 2025 build - if unsupported on this build, the write is a harmless no-op (verify the 'Machine Identity Isolation Configuration' dropdown is present under gpedit.msc if in doubt)."
+        CheckBlock = { $v = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceGuard' -Name MachineIdentityIsolation -ErrorAction SilentlyContinue; $v -and $v.MachineIdentityIsolation -eq 2 }
+        ApplyBlock = {
+            New-Item -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceGuard' -Force -ErrorAction SilentlyContinue | Out-Null
+            Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceGuard' -Name MachineIdentityIsolation -Value 2 -Type DWord -Force
+        }
     }
     Invoke-Remediation @p
 } else {
