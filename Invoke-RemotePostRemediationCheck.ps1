@@ -68,7 +68,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $ProgressPreference     = 'SilentlyContinue'
 
-Write-Host "Invoke-RemotePostRemediationCheck.ps1 - READ-ONLY verification  [build 2026-08-28k-na-consistency]" -ForegroundColor Magenta
+Write-Host "Invoke-RemotePostRemediationCheck.ps1 - READ-ONLY verification  [build 2026-08-28l-aligned-output]" -ForegroundColor Magenta
 Write-Host ("Running from: {0}" -f $PSCommandPath) -ForegroundColor DarkGray
 
 # =====================================================================================
@@ -610,15 +610,29 @@ function New-CentralRow {
     })
 }
 
-# Reproduces the local post-remediation-check.ps1 on-screen output EXACTLY:
-# a Cyan "=== <category header> ===" for each group, then one Show-Result line per
-# item -> "  [<STATUS padded to 8>] <Label>[ - <Detail>]" coloured OK*=Green,
-# MANUAL*=DarkYellow, everything else=Red, label in White, detail in Gray.
-# The only addition is the "##### <VM> #####" banner so multi-VM runs stay readable.
+# On-screen output, modelled on the local post-remediation-check.ps1:
+#   "  [<STATUS>] <Label>"   (OK*=Green, MANUAL*=DarkYellow, N/A*=Gray, else Red;
+#                             label White)
+# Alignment fixes vs. the local script:
+#   * the status token is right-padded to the WIDEST token in this VM's result set
+#     (min 8), so a long token like "[OK (19 rules)]" or "[NOT SET (found: 3)]"
+#     no longer pushes its label out of column;
+#   * a SHORT detail (<= $InlineDetailMax chars) is still printed inline " - ..."
+#     like the local script; a LONG justification (Machine Identity Isolation,
+#     Kerberos, etc.) is word-wrapped onto its own indented line(s) directly under
+#     the label, so it never disturbs the aligned [status]/label columns.
 function Show-VmResults {
-    param([string]$VmBanner, $Rows)
+    param([string]$VmBanner, $Rows, [int]$InlineDetailMax = 70, [int]$WrapWidth = 100)
     $HeaderColor   = 'Cyan'
     $SubPointColor = 'White'
+
+    $statusWidth = 8
+    foreach ($row in $Rows) {
+        $l = ([string]$row.LocalStatus).Length
+        if ($l -gt $statusWidth) { $statusWidth = $l }
+    }
+    $contIndent = ' ' * ($statusWidth + 5)   # 2 leading spaces + '[' + status + '] '
+
     Write-Host ""
     Write-Host ("##### $VmBanner #####") -ForegroundColor Cyan
     $lastHeader = $null
@@ -635,9 +649,24 @@ function Show-VmResults {
             'N/A*'    { 'Gray' }
             default   { 'Red' }
         }
-        Write-Host ("  [{0}]" -f $s.PadRight(8)) -ForegroundColor $statusColor -NoNewline
-        Write-Host (" {0}" -f $row.Label) -ForegroundColor $SubPointColor -NoNewline
-        if ($row.Detail) { Write-Host (" - {0}" -f $row.Detail) -ForegroundColor Gray } else { Write-Host "" }
+        Write-Host ("  [{0}] " -f $s.PadRight($statusWidth)) -ForegroundColor $statusColor -NoNewline
+        Write-Host $row.Label -ForegroundColor $SubPointColor -NoNewline
+
+        $text = if ($row.Detail) { (([string]$row.Detail) -replace '\s+', ' ').Trim() } else { '' }
+        if (-not $text) {
+            Write-Host ""
+        } elseif ($text.Length -le $InlineDetailMax) {
+            Write-Host (" - {0}" -f $text) -ForegroundColor Gray            # inline, like the local script
+        } else {
+            Write-Host ""                                                  # finish the label line
+            while ($text.Length -gt $WrapWidth) {
+                $cut = $text.LastIndexOf(' ', [Math]::Min($WrapWidth, $text.Length - 1))
+                if ($cut -le 0) { $cut = $WrapWidth }
+                Write-Host ($contIndent + $text.Substring(0, $cut).TrimEnd()) -ForegroundColor Gray
+                $text = $text.Substring($cut).TrimStart()
+            }
+            Write-Host ($contIndent + $text) -ForegroundColor Gray
+        }
     }
 }
 
