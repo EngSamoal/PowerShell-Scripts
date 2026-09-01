@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>نظام المبيعات</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="sidebar-title">نظام المبيعات</div>
+      <nav class="nav-list">
+        <button type="button" class="nav-item nav-item-active" data-screen="dashboard">الرئيسية</button>
+        <button type="button" class="nav-item" data-screen="new-sale">بيع جديد</button>
+        <button type="button" class="nav-item" data-screen="products">المنتجات</button>
+        <button type="button" class="nav-item" data-screen="customers">العملاء</button>
+        <button type="button" class="nav-item" data-screen="invoices">الفواتير</button>
+        <button type="button" class="nav-item" data-screen="expenses">المصروفات</button>
+        <button type="button" class="nav-item" data-screen="reports">التقارير</button>
+        <button type="button" class="nav-item" data-screen="backup">النسخ الاحتياطي</button>
+        <button type="button" class="nav-item" data-screen="settings">الإعدادات</button>
+      </nav>
+    </aside>
+
+    <main class="content">
+      <section id="screen-dashboard" class="screen screen-active"></section>
+      <section id="screen-new-sale" class="screen"></section>
+      <section id="screen-products" class="screen"></section>
+      <section id="screen-customers" class="screen"></section>
+      <section id="screen-invoices" class="screen"></section>
+      <section id="screen-expenses" class="screen"></section>
+      <section id="screen-reports" class="screen"></section>
+      <section id="screen-backup" class="screen"></section>
+      <section id="screen-settings" class="screen"></section>
+    </main>
+  </div>
+
+  <div id="toast-container" class="toast-container"></div>
+  <div id="modal-overlay" class="modal-overlay"></div>
+
+  <script src="js/db.js"></script>
+  <script src="js/utils.js"></script>
+  <script src="js/ui.js"></script>
+  <script src="js/settings.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
