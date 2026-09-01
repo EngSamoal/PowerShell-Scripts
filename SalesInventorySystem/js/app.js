@@ -8,7 +8,7 @@
  * and testable from day one.
  */
 
-const READY_SCREENS = new Set(['dashboard', 'settings', 'products']);
+const READY_SCREENS = new Set(['dashboard', 'settings', 'products', 'new-sale']);
 
 async function renderDashboardScreen() {
   const container = document.getElementById('screen-dashboard');
@@ -16,7 +16,7 @@ async function renderDashboardScreen() {
 
   container.innerHTML = `
     <h2 class="screen-title">الرئيسية</h2>
-    <p class="screen-hint">لا توجد بيانات مبيعات بعد — ستظهر الأرقام هنا بعد تفعيل شاشة "بيع جديد" في مرحلة لاحقة.</p>
+    <p class="screen-hint">حساب هذه الأرقام تلقائيًا من المبيعات الفعلية سيُضاف في مرحلة لاحقة من المشروع.</p>
     <div class="dashboard-grid">
       <div class="stat-card">
         <span class="stat-label">مبيعات اليوم</span>
@@ -62,6 +62,7 @@ async function showScreenById(screenId) {
     if (screenId === 'dashboard') await renderDashboardScreen();
     if (screenId === 'settings') await renderSettingsScreen();
     if (screenId === 'products') await renderProductsScreen();
+    if (screenId === 'new-sale') await renderNewSaleScreen();
     UI.showScreen(`screen-${screenId}`);
   } catch (err) {
     UI.error(friendlyError('تعذر فتح هذه الشاشة. يرجى المحاولة مرة أخرى.', err));
@@ -82,7 +83,6 @@ async function initApp() {
     wireNavigation();
 
     const placeholders = [
-      ['screen-new-sale', 'بيع جديد'],
       ['screen-customers', 'العملاء'],
       ['screen-invoices', 'الفواتير'],
       ['screen-expenses', 'المصروفات'],
