@@ -159,10 +159,3 @@ async function renderSettingsScreen() {
     }
   });
 }
-
-/** Minimal HTML-escaping for values interpolated into templates above. */
-function escapeHtml(value) {
-  return String(value ?? '').replace(/[&<>"']/g, (ch) => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-  }[ch]));
-}

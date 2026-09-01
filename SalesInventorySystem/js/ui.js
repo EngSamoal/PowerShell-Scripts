@@ -39,8 +39,7 @@ const UI = {
    */
   confirm({ title = 'تأكيد', message, confirmLabel = 'تأكيد', cancelLabel = 'إلغاء', danger = false }) {
     return new Promise((resolve) => {
-      const overlay = document.getElementById('modal-overlay');
-      overlay.innerHTML = `
+      this.showModal(`
         <div class="modal">
           <h3 class="modal-title">${title}</h3>
           <p class="modal-message">${message}</p>
@@ -49,18 +48,31 @@ const UI = {
             <button type="button" class="btn ${danger ? 'btn-danger' : 'btn-primary'}" data-action="confirm">${confirmLabel}</button>
           </div>
         </div>
-      `;
-      overlay.classList.add('modal-overlay-visible');
+      `);
 
+      const overlay = document.getElementById('modal-overlay');
       const close = (result) => {
-        overlay.classList.remove('modal-overlay-visible');
-        overlay.innerHTML = '';
+        this.closeModal();
         resolve(result);
       };
 
       overlay.querySelector('[data-action="cancel"]').addEventListener('click', () => close(false));
       overlay.querySelector('[data-action="confirm"]').addEventListener('click', () => close(true));
     });
+  },
+
+  /** Shows arbitrary modal HTML (a <div class="modal">...</div>, optionally .modal-wide). Caller wires up its own events. */
+  showModal(html) {
+    const overlay = document.getElementById('modal-overlay');
+    overlay.innerHTML = html;
+    overlay.classList.add('modal-overlay-visible');
+  },
+
+  /** Closes and clears whatever modal is currently shown. */
+  closeModal() {
+    const overlay = document.getElementById('modal-overlay');
+    overlay.classList.remove('modal-overlay-visible');
+    overlay.innerHTML = '';
   },
 
   /** Shows one screen (by id) and hides the others; highlights the matching nav item. */
