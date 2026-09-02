@@ -27,6 +27,7 @@ async function renderDashboardScreen() {
 
   container.innerHTML = `
     <h2 class="screen-title">الرئيسية</h2>
+    ${backupReminderHtml(settings)}
     <div class="dashboard-grid">
       <div class="stat-card">
         <span class="stat-label">مبيعات اليوم</span>
@@ -52,6 +53,30 @@ async function renderDashboardScreen() {
         <span class="stat-label">منتجات منخفضة المخزون</span>
         <span class="stat-value">${lowStockCount}</span>
       </div>
+    </div>
+  `;
+
+  const reminderBtn = document.getElementById('btn-backup-reminder-goto');
+  if (reminderBtn) reminderBtn.addEventListener('click', () => showScreenById('backup'));
+}
+
+/** A gentle nudge, not a nag: only shown when there's truly no recent backup, and it's just one line + a link. */
+function backupReminderHtml(settings) {
+  const BACKUP_REMINDER_DAYS = 7;
+  if (!settings.lastBackupAt) {
+    return `
+      <div class="backup-reminder">
+        <span>لم تقم بأخذ أي نسخة احتياطية بعد. يُنصح بأخذ نسخة للحفاظ على بياناتك.</span>
+        <button type="button" id="btn-backup-reminder-goto" class="link-btn">أخذ نسخة احتياطية الآن</button>
+      </div>
+    `;
+  }
+  const daysSince = Math.floor((Date.now() - new Date(settings.lastBackupAt).getTime()) / 86400000);
+  if (daysSince < BACKUP_REMINDER_DAYS) return '';
+  return `
+    <div class="backup-reminder">
+      <span>آخر نسخة احتياطية كانت منذ ${daysSince} يومًا. يُنصح بأخذ نسخة جديدة.</span>
+      <button type="button" id="btn-backup-reminder-goto" class="link-btn">أخذ نسخة احتياطية الآن</button>
     </div>
   `;
 }
@@ -98,4 +123,20 @@ async function initApp() {
   }
 }
 
+/**
+ * Safety net for anything a screen's own try/catch missed — the user must
+ * never see a raw "Uncaught TypeError" or a silently broken screen.
+ */
+function installGlobalErrorHandlers() {
+  window.addEventListener('error', (event) => {
+    console.error('Unhandled error:', event.error || event.message);
+    UI.error('تعذر إتمام العملية. يرجى المحاولة مرة أخرى.');
+  });
+  window.addEventListener('unhandledrejection', (event) => {
+    console.error('Unhandled promise rejection:', event.reason);
+    UI.error('تعذر إتمام العملية. يرجى المحاولة مرة أخرى.');
+  });
+}
+
+installGlobalErrorHandlers();
 document.addEventListener('DOMContentLoaded', initApp);

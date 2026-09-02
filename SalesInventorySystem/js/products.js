@@ -674,6 +674,10 @@ async function openProductFormModal(existingProduct) {
 
   document.getElementById('product-form').addEventListener('submit', async (event) => {
     event.preventDefault();
+    const submitBtn = event.target.querySelector('button[type="submit"]');
+    if (submitBtn.disabled) return; // already submitting — ignore a rapid double-click
+    submitBtn.disabled = true;
+
     const formData = new FormData(event.target);
     const values = Object.fromEntries(formData.entries());
     const fields = {
@@ -701,6 +705,7 @@ async function openProductFormModal(existingProduct) {
         const errorBox = document.getElementById('product-form-errors');
         errorBox.hidden = false;
         errorBox.innerHTML = `<ul>${result.errors.map((e) => `<li>${escapeHtml(e)}</li>`).join('')}</ul>`;
+        submitBtn.disabled = false;
         return;
       }
 
@@ -709,6 +714,7 @@ async function openProductFormModal(existingProduct) {
       renderProductsTableBody(settings);
     } catch (err) {
       UI.error(friendlyError('تعذر حفظ المنتج. يرجى المحاولة مرة أخرى.', err));
+      submitBtn.disabled = false;
     }
   });
 }
@@ -764,6 +770,10 @@ function openStockAdjustmentModal(product) {
 
   document.getElementById('stock-adjust-form').addEventListener('submit', async (event) => {
     event.preventDefault();
+    const submitBtn = event.target.querySelector('button[type="submit"]');
+    if (submitBtn.disabled) return; // already submitting — ignore a rapid double-click
+    submitBtn.disabled = true;
+
     const formData = new FormData(event.target);
     const values = Object.fromEntries(formData.entries());
     const quantity = Math.round(Number(values.quantity));
@@ -772,6 +782,7 @@ function openStockAdjustmentModal(product) {
     if (Number.isNaN(quantity) || quantity <= 0) {
       errorBox.hidden = false;
       errorBox.innerHTML = '<ul><li>يرجى إدخال كمية أكبر من صفر.</li></ul>';
+      submitBtn.disabled = false;
       return;
     }
 
@@ -781,6 +792,7 @@ function openStockAdjustmentModal(product) {
     if (result.errors.length > 0) {
       errorBox.hidden = false;
       errorBox.innerHTML = `<ul>${result.errors.map((e) => `<li>${escapeHtml(e)}</li>`).join('')}</ul>`;
+      submitBtn.disabled = false;
       return;
     }
 

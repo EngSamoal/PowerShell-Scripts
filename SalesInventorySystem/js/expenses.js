@@ -315,6 +315,10 @@ function openExpenseFormModal(existingExpense, settings) {
 
   document.getElementById('expense-form').addEventListener('submit', async (event) => {
     event.preventDefault();
+    const submitBtn = event.target.querySelector('button[type="submit"]');
+    if (submitBtn.disabled) return; // already submitting — ignore a rapid double-click
+    submitBtn.disabled = true;
+
     const formData = new FormData(event.target);
     const fields = Object.fromEntries(formData.entries());
 
@@ -324,6 +328,7 @@ function openExpenseFormModal(existingExpense, settings) {
         const errorBox = document.getElementById('expense-form-errors');
         errorBox.hidden = false;
         errorBox.innerHTML = `<ul>${result.errors.map((err) => `<li>${escapeHtml(err)}</li>`).join('')}</ul>`;
+        submitBtn.disabled = false;
         return;
       }
       UI.closeModal();
@@ -332,6 +337,7 @@ function openExpenseFormModal(existingExpense, settings) {
       renderProfitSummary(settings);
     } catch (err) {
       UI.error(friendlyError('تعذر حفظ المصروف. يرجى المحاولة مرة أخرى.', err));
+      submitBtn.disabled = false;
     }
   });
 }

@@ -175,6 +175,15 @@ function wireAddProductPanel(activeProducts, settings) {
   document.getElementById('sale-product-select').addEventListener('change', () => updateLinePreview(activeProducts, settings));
   document.getElementById('sale-line-qty').addEventListener('input', () => updateLinePreview(activeProducts, settings));
 
+  // Enter in the quantity field adds the line — matches the fast, repeated-entry
+  // pattern this screen is meant for, without needing to reach for the mouse.
+  document.getElementById('sale-line-qty').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      addLineToCart(activeProducts, settings);
+    }
+  });
+
   populateSelect('');
 
   document.getElementById('btn-add-to-cart').addEventListener('click', () => addLineToCart(activeProducts, settings));

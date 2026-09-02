@@ -226,6 +226,10 @@ function openCustomerFormModal(existingCustomer, onSaved) {
 
   document.getElementById('customer-form').addEventListener('submit', async (event) => {
     event.preventDefault();
+    const submitBtn = event.target.querySelector('button[type="submit"]');
+    if (submitBtn.disabled) return; // already submitting — ignore a rapid double-click
+    submitBtn.disabled = true;
+
     const formData = new FormData(event.target);
     const fields = Object.fromEntries(formData.entries());
 
@@ -235,6 +239,7 @@ function openCustomerFormModal(existingCustomer, onSaved) {
         const errorBox = document.getElementById('customer-form-errors');
         errorBox.hidden = false;
         errorBox.innerHTML = `<ul>${result.errors.map((e) => `<li>${escapeHtml(e)}</li>`).join('')}</ul>`;
+        submitBtn.disabled = false;
         return;
       }
       UI.closeModal();
@@ -242,6 +247,7 @@ function openCustomerFormModal(existingCustomer, onSaved) {
       if (onSaved) onSaved(isEdit ? existingCustomer.id : result.id);
     } catch (err) {
       UI.error(friendlyError('تعذر حفظ بيانات العميل. يرجى المحاولة مرة أخرى.', err));
+      submitBtn.disabled = false;
     }
   });
 }

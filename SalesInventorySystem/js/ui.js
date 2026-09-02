@@ -86,3 +86,21 @@ const UI = {
     });
   },
 };
+
+/**
+ * Escape safely backs out of whatever modal is open — every modal's
+ * cancel/close button is styled .btn-secondary (its submit/confirm action
+ * is always .btn-primary or .btn-danger), so clicking it here reuses that
+ * button's own handler rather than closing the overlay directly. That
+ * matters for UI.confirm(): its cancel button resolves the pending
+ * promise with false — closing the overlay without it would leave an
+ * `await UI.confirm(...)` call hanging forever.
+ */
+document.addEventListener('keydown', (event) => {
+  if (event.key !== 'Escape') return;
+  const overlay = document.getElementById('modal-overlay');
+  if (!overlay || !overlay.classList.contains('modal-overlay-visible')) return;
+  const dismissBtn = overlay.querySelector('.btn-secondary');
+  if (dismissBtn) dismissBtn.click();
+  else UI.closeModal();
+});
