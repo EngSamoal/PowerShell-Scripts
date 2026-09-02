@@ -154,6 +154,8 @@ param(
     [switch]  $SkipSmbRpc,
     [switch]  $SkipBaselineIndicators,
     [switch]  $SkipBaselineGpoApply,
+    [switch]  $SkipExtendedBaseline,       # skip the whole "7. Extended Baseline (Cybersecurity Review)" category
+    [switch]  $SkipExtendedManualItems,    # in category 7, do not emit the secedit / patch "Manual/External Required" rows
 
     [switch]  $DisableWinRM,
     [string[]]$WinRmAllowedSourceRange,
@@ -161,6 +163,10 @@ param(
     [switch]  $EnforceAesOnlyKerberos,
     [switch]  $TreatAllAsWorkgroup,
     [switch]  $DisableLegacyTls,
+
+    [ValidateRange(0, 50)]
+    [int]     $CachedLogonsCount = 4,      # category 7: target for Winlogon\CachedLogonsCount (use 0 on a workgroup to clear Qualys QID 90007)
+    [string[]]$WinRmFilterRange,           # category 7: IPv4 range(s) for the WinRM listener IPv4Filter/IPv6Filter (else that item is Manual/External Required)
 
     [ValidateSet('Enabled', 'AuditMode')]
     [string]  $AsrRuleAction = 'Enabled',
@@ -174,14 +180,14 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference     = 'SilentlyContinue'
-$ScriptBuild = '2026-08-28k-na-consistency'
+$ScriptBuild = '2026-09-02b-merged-no-unused-accts'
 
 # =====================================================================================
 # 0. Banner
 # =====================================================================================
 Write-Host ("Invoke-RemoteSecurityGapRemediation.ps1  [build $ScriptBuild]") -ForegroundColor Magenta
 Write-Host ("Running from: {0}" -f $PSCommandPath) -ForegroundColor DarkGray
-Write-Host ("If the build above is not '2026-08-28k-na-consistency' you are running an OLD copy - update it.") -ForegroundColor DarkGray
+Write-Host ("If the build above is not '2026-09-02b-merged-no-unused-accts' you are running an OLD copy - update it.") -ForegroundColor DarkGray
 if ($Apply) {
     Write-Host "*** -Apply IS SET: validated guests WILL have configuration changed. ***" -ForegroundColor Red
     Write-Host "    This tool never snapshots, reboots, or alters any VM/vSphere setting." -ForegroundColor Yellow
@@ -827,6 +833,214 @@ try {
     } else {
         Add-ResultRow -Category '2025 Security Baseline' -Item 'All items' -Status 'Skipped (category)' -Details '-SkipBaselineIndicators was passed'
     }
+
+    # ===========================================================================
+    # 7. Extended Baseline (Cybersecurity Review)
+    #    Qualys / CS-review findings layered on top of the original 6 areas.
+    #    Same dry-run / -Apply / reboot-flag model and result format.
+    # ===========================================================================
+    if (-not $SkipExtendedBaseline) {
+        $CAT = '7. Extended Baseline (Cybersecurity Review)'
+
+        # 7.1 HVCI - Enabled WITH UEFI lock
+        $hvciPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity'
+        Invoke-Remediation -Category $CAT -Item 'HVCI - UEFI lock' `
+            -Description "Set $hvciPath Locked=1 (HVCI 'Enabled with UEFI lock'; keeps Enabled=1)" `
+            -RequiresReboot $true `
+            -RiskNote 'UEFI lock makes HVCI hard to disable later without firmware/physical access (intentional). Only effective once HVCI itself (Enabled=1) is on - see category 1.' `
+            -ExpectedValue 'Locked=1 (and Enabled=1)' `
+            -CurrentStateBlock { "$(Get-RegValueString $hvciPath 'Enabled'); $(Get-RegValueString $hvciPath 'Locked')" } `
+            -CheckBlock { $v = Get-ItemProperty -Path $hvciPath -ErrorAction SilentlyContinue; $v -and $v.Enabled -eq 1 -and $v.Locked -eq 1 } `
+            -ApplyBlock {
+                New-Item -Path $hvciPath -Force -ErrorAction SilentlyContinue | Out-Null
+                Set-ItemProperty -Path $hvciPath -Name Enabled -Value 1 -Type DWord -Force
+                Set-ItemProperty -Path $hvciPath -Name Locked  -Value 1 -Type DWord -Force
+            }
+
+        # 7.2 Kernel-mode Hardware-enforced Stack Protection - ENFORCEMENT (not audit)
+        $kssPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\KernelShadowStacks'
+        Invoke-Remediation -Category $CAT -Item 'Kernel-mode HW-enforced Stack Protection - enforcement' `
+            -Description "Set $kssPath Enabled=1, AuditMode=0 (enforcement mode)" `
+            -RequiresReboot $true `
+            -RiskNote 'Enforcement can block old / incompatible kernel drivers that violate shadow-stack rules. Pilot in AuditMode (AuditMode=1) first if driver compatibility is unknown.' `
+            -ExpectedValue 'Enabled=1, AuditMode=0' `
+            -CurrentStateBlock { "$(Get-RegValueString $kssPath 'Enabled'); $(Get-RegValueString $kssPath 'AuditMode')" } `
+            -CheckBlock { $v = Get-ItemProperty -Path $kssPath -ErrorAction SilentlyContinue; $v -and $v.Enabled -eq 1 -and $v.AuditMode -eq 0 } `
+            -ApplyBlock {
+                New-Item -Path $kssPath -Force -ErrorAction SilentlyContinue | Out-Null
+                Set-ItemProperty -Path $kssPath -Name Enabled   -Value 1 -Type DWord -Force
+                Set-ItemProperty -Path $kssPath -Name AuditMode  -Value 0 -Type DWord -Force
+            }
+
+        # 7.3 LSASS Protected Process (RunAsPPL) - WITH UEFI lock
+        $lsaPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\LSA'
+        Invoke-Remediation -Category $CAT -Item 'LSASS RunAsPPL - UEFI lock' `
+            -Description "Set $lsaPath RunAsPPL=1 (LSA runs as a protected process, UEFI-locked). 2 = enabled without lock." `
+            -RequiresReboot $true `
+            -RiskNote 'Blocks unsigned / non-Microsoft LSA plugins and SSPs (some SSO / smart-card / EDR agents). Confirm all LSA-integrating agents are WHQL-signed first. UEFI lock is hard to revert.' `
+            -ExpectedValue 'RunAsPPL=1' `
+            -CurrentStateBlock { Get-RegValueString $lsaPath 'RunAsPPL' } `
+            -CheckBlock { $v = Get-ItemProperty -Path $lsaPath -Name RunAsPPL -ErrorAction SilentlyContinue; $v -and $v.RunAsPPL -eq 1 } `
+            -ApplyBlock {
+                Set-ItemProperty -Path $lsaPath -Name RunAsPPL      -Value 1 -Type DWord -Force
+                Set-ItemProperty -Path $lsaPath -Name RunAsPPLBoot  -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue
+            }
+
+        # 7.4 PowerShell Script Block Logging (+ invocation logging)
+        $sblPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging'
+        Invoke-Remediation -Category $CAT -Item 'PowerShell Script Block (and Invocation) Logging' `
+            -Description "Set $sblPath EnableScriptBlockLogging=1, EnableScriptBlockInvocationLogging=1" `
+            -RiskNote 'Invocation logging is verbose (start/stop of every script block, event 4104) - size the PowerShell/Operational log and forwarding accordingly. CS review explicitly requires it enabled.' `
+            -ExpectedValue 'EnableScriptBlockLogging=1, EnableScriptBlockInvocationLogging=1' `
+            -CurrentStateBlock { "$(Get-RegValueString $sblPath 'EnableScriptBlockLogging'); $(Get-RegValueString $sblPath 'EnableScriptBlockInvocationLogging')" } `
+            -CheckBlock { $v = Get-ItemProperty -Path $sblPath -ErrorAction SilentlyContinue; $v -and $v.EnableScriptBlockLogging -eq 1 -and $v.EnableScriptBlockInvocationLogging -eq 1 } `
+            -ApplyBlock {
+                New-Item -Path $sblPath -Force -ErrorAction SilentlyContinue | Out-Null
+                Set-ItemProperty -Path $sblPath -Name EnableScriptBlockLogging           -Value 1 -Type DWord -Force
+                Set-ItemProperty -Path $sblPath -Name EnableScriptBlockInvocationLogging -Value 1 -Type DWord -Force
+            }
+
+        # 7.5 WinRM "Allow remote server management through WinRM" / auto config = Disabled
+        $winrmPol = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WinRM\Service'
+        Invoke-Remediation -Category $CAT -Item 'WinRM auto-configuration disabled' `
+            -Description "Set $winrmPol AllowAutoConfig=0 ('Allow remote server management through WinRM' = Disabled)" `
+            -RiskNote 'Stops policy-driven creation of the WinRM listener. If any tooling manages this host over WinRM, confirm it uses another path first.' `
+            -ExpectedValue 'AllowAutoConfig=0 (or not configured)' `
+            -CurrentStateBlock { Get-RegValueString $winrmPol 'AllowAutoConfig' } `
+            -CheckBlock { $v = Get-ItemProperty -Path $winrmPol -Name AllowAutoConfig -ErrorAction SilentlyContinue; (-not $v) -or $v.AllowAutoConfig -eq 0 } `
+            -ApplyBlock {
+                New-Item -Path $winrmPol -Force -ErrorAction SilentlyContinue | Out-Null
+                Set-ItemProperty -Path $winrmPol -Name AllowAutoConfig -Value 0 -Type DWord -Force
+            }
+
+        # 7.6 WinRM IPv4Filter / IPv6Filter  (only if -WinRmFilterRange was supplied)
+        if ($WinRmFilterRange -and $WinRmFilterRange.Count -gt 0) {
+            $filterValue = ($WinRmFilterRange -join ',')
+            Invoke-Remediation -Category $CAT -Item 'WinRM listener IPv4/IPv6 filter' `
+                -Description "Set $winrmPol IPv4Filter/IPv6Filter = '$filterValue' (currently '*')" `
+                -RiskNote 'Wrong range can cut off legitimate WinRM management. Value applies to the listener the next time it is (re)created.' `
+                -ExpectedValue "IPv4Filter/IPv6Filter = $filterValue" `
+                -CurrentStateBlock { "$(Get-RegValueString $winrmPol 'IPv4Filter'); $(Get-RegValueString $winrmPol 'IPv6Filter')" } `
+                -CheckBlock { $v = Get-ItemProperty -Path $winrmPol -ErrorAction SilentlyContinue; $v -and $v.IPv4Filter -eq $filterValue -and $v.IPv6Filter -eq $filterValue } `
+                -ApplyBlock {
+                    New-Item -Path $winrmPol -Force -ErrorAction SilentlyContinue | Out-Null
+                    Set-ItemProperty -Path $winrmPol -Name IPv4Filter -Value $filterValue -Type String -Force
+                    Set-ItemProperty -Path $winrmPol -Name IPv6Filter -Value $filterValue -Type String -Force
+                }
+        } else {
+            Add-ResultRow -Category $CAT -Item 'WinRM listener IPv4/IPv6 filter' -Status 'Manual/External Required' `
+                -Details "Not changed - no -WinRmFilterRange supplied. To scope the WinRM listener filter, set $winrmPol IPv4Filter and IPv6Filter to your management range, e.g. '10.50.10.1-10.50.10.254' (currently '*'). Re-run with -WinRmFilterRange '<range>' to apply." `
+                -DetectedValue "$(Get-RegValueString $winrmPol 'IPv4Filter'); $(Get-RegValueString $winrmPol 'IPv6Filter')" -ExpectedValue 'Scoped to management range'
+        }
+
+        # 7.7 Kerberos PKINIT hash algorithms SHA256 / SHA384 / SHA512 = Supported (3)
+        $pkBase = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PKINITHashAlgorithms'
+        foreach ($alg in 'SHA256', 'SHA384', 'SHA512') {
+            $algPath = Join-Path $pkBase $alg
+            Invoke-Remediation -Category $CAT -Item "PKINIT hash $alg = Supported" `
+                -Description "Set $algPath Support=3 (Supported). 1 = Default." `
+                -RiskNote 'Only functionally used with Active Directory / AD CS smart-card (PKINIT) logon. On a workgroup server this is a benchmark-value fix only. Verify via the GPO "Configure hash types allowed for Kerberos PKINIT".' `
+                -ExpectedValue 'Support=3' `
+                -CurrentStateBlock { Get-RegValueString $algPath 'Support' }.GetNewClosure() `
+                -CheckBlock { $v = Get-ItemProperty -Path $algPath -Name Support -ErrorAction SilentlyContinue; $v -and $v.Support -eq 3 }.GetNewClosure() `
+                -ApplyBlock {
+                    New-Item -Path $algPath -Force -ErrorAction SilentlyContinue | Out-Null
+                    Set-ItemProperty -Path $algPath -Name Support -Value 3 -Type DWord -Force
+                }.GetNewClosure()
+        }
+
+        # 7.8 Windows Ink Workspace - Disabled
+        $inkPath = 'HKLM:\SOFTWARE\Policies\Microsoft\WindowsInkWorkspace'
+        Invoke-Remediation -Category $CAT -Item 'Windows Ink Workspace disabled' `
+            -Description "Set $inkPath AllowWindowsInkWorkspace=0 (Disabled). 1 = on but no access above lock." `
+            -ExpectedValue 'AllowWindowsInkWorkspace=0' `
+            -CurrentStateBlock { Get-RegValueString $inkPath 'AllowWindowsInkWorkspace' } `
+            -CheckBlock { $v = Get-ItemProperty -Path $inkPath -Name AllowWindowsInkWorkspace -ErrorAction SilentlyContinue; $v -and $v.AllowWindowsInkWorkspace -eq 0 } `
+            -ApplyBlock {
+                New-Item -Path $inkPath -Force -ErrorAction SilentlyContinue | Out-Null
+                Set-ItemProperty -Path $inkPath -Name AllowWindowsInkWorkspace -Value 0 -Type DWord -Force
+            }
+
+        # 7.9 Advanced audit: "Audit Policy Change" = Success and Failure
+        Invoke-Remediation -Category $CAT -Item 'Audit "Audit Policy Change" = Success and Failure' `
+            -Description 'auditpol /set /subcategory:"Audit Policy Change" /success:enable /failure:enable' `
+            -ExpectedValue 'Success and Failure' `
+            -CurrentStateBlock {
+                try {
+                    $csv = (& auditpol /get /subcategory:"Audit Policy Change" /r 2>$null | ConvertFrom-Csv)
+                    $row = $csv | Where-Object { $_.Subcategory -eq 'Audit Policy Change' } | Select-Object -First 1
+                    "Inclusion Setting=$($row.'Inclusion Setting')"
+                } catch { 'unknown' }
+            } `
+            -CheckBlock {
+                $csv = (& auditpol /get /subcategory:"Audit Policy Change" /r 2>$null | ConvertFrom-Csv)
+                $row = $csv | Where-Object { $_.Subcategory -eq 'Audit Policy Change' } | Select-Object -First 1
+                $row -and $row.'Inclusion Setting' -eq 'Success and Failure'
+            } `
+            -ApplyBlock {
+                $out = & auditpol /set /subcategory:"Audit Policy Change" /success:enable /failure:enable 2>&1
+                if ($LASTEXITCODE -ne 0) { throw "auditpol exited $LASTEXITCODE. Output: $out" }
+            }
+
+        # 7.10 Cached logons count
+        $wlPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+        Invoke-Remediation -Category $CAT -Item "Cached logons count = $CachedLogonsCount" `
+            -Description "Set $wlPath CachedLogonsCount='$CachedLogonsCount' (REG_SZ). Qualys QID 90007; 0 clears it on a workgroup server." `
+            -RiskNote 'A value of 0 means no cached domain logons - only matters if this host is ever domain-joined and loses DC connectivity. Fine for workgroup.' `
+            -ExpectedValue "CachedLogonsCount=$CachedLogonsCount" `
+            -CurrentStateBlock { Get-RegValueString $wlPath 'CachedLogonsCount' } `
+            -CheckBlock { $v = Get-ItemProperty -Path $wlPath -Name CachedLogonsCount -ErrorAction SilentlyContinue; $v -and ([string]$v.CachedLogonsCount) -eq ([string]$CachedLogonsCount) } `
+            -ApplyBlock { Set-ItemProperty -Path $wlPath -Name CachedLogonsCount -Value ([string]$CachedLogonsCount) -Type String -Force }
+
+        # 7.11 Credential Guard policy value - detect a GPO that disables it
+        $dgPol = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceGuard'
+        $dgVal = (Get-ItemProperty -Path $dgPol -Name LsaCfgFlags -ErrorAction SilentlyContinue).LsaCfgFlags
+        $lsaVal = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\LSA' -Name LsaCfgFlags -ErrorAction SilentlyContinue).LsaCfgFlags
+        if ($dgVal -eq 0) {
+            Add-ResultRow -Category $CAT -Item 'Credential Guard - policy override' -Status 'Manual/External Required' `
+                -Details "A policy is DISABLING Credential Guard: $dgPol\LsaCfgFlags = 0. Change the GPO 'Computer Configuration > Administrative Templates > System > Device Guard > Turn On Virtualization Based Security > Credential Guard Configuration' to 'Enabled with UEFI lock' (or remove that setting), then gpupdate /force and reboot. Workgroup membership does not justify disabling Credential Guard." `
+                -DetectedValue "Policies\...\DeviceGuard\LsaCfgFlags=0; Control\LSA\LsaCfgFlags=$([string]$lsaVal)" -ExpectedValue 'LsaCfgFlags=1 (Enabled with UEFI lock)' -RequiresReboot $true
+        } else {
+            Invoke-Remediation -Category $CAT -Item 'Credential Guard - policy value' `
+                -Description "Set $dgPol LsaCfgFlags=1 (Enabled with UEFI lock) so it survives Group Policy refresh" `
+                -RequiresReboot $true `
+                -RiskNote 'Only meaningful once VBS is available (Secure Boot + virtualization exposed to the VM). UEFI lock is hard to revert.' `
+                -ExpectedValue 'LsaCfgFlags=1' `
+                -CurrentStateBlock { "Policies=$([string]((Get-ItemProperty -Path $dgPol -Name LsaCfgFlags -ErrorAction SilentlyContinue).LsaCfgFlags)); Control\LSA=$([string]((Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\LSA' -Name LsaCfgFlags -ErrorAction SilentlyContinue).LsaCfgFlags))" } `
+                -CheckBlock { $v = Get-ItemProperty -Path $dgPol -Name LsaCfgFlags -ErrorAction SilentlyContinue; $v -and $v.LsaCfgFlags -eq 1 } `
+                -ApplyBlock {
+                    New-Item -Path $dgPol -Force -ErrorAction SilentlyContinue | Out-Null
+                    Set-ItemProperty -Path $dgPol -Name LsaCfgFlags -Value 1 -Type DWord -Force
+                }
+        }
+
+        # Manual / external items (Local Security Policy + patching) - report only.
+        if (-not $SkipExtendedManualItems) {
+            Add-ResultRow -Category $CAT -Item 'Deny access to this computer from the network (user right)' -Status 'Manual/External Required' `
+                -Details 'secedit: [Privilege Rights] SeDenyNetworkLogonRight = *S-1-5-32-546,*S-1-5-113,*S-1-5-114  (Guests, Local account, Local account and member of Administrators group). Export with "secedit /export /cfg secpol.txt", edit that line, apply with "secedit /configure /db secedit.sdb /cfg secpol.txt /areas USER_RIGHTS".' `
+                -ExpectedValue 'Guests + Local account + Local account & Administrators' -DetectedValue 'Only BUILTIN\Guests assigned'
+            Add-ResultRow -Category $CAT -Item 'Deny logon through Remote Desktop Services (user right)' -Status 'Manual/External Required' `
+                -Details 'secedit: [Privilege Rights] SeDenyRemoteInteractiveLogonRight = *S-1-5-32-546,*S-1-5-113  (Guests, Local account). Same export/edit/apply as above.' `
+                -ExpectedValue 'Guests + Local account' -DetectedValue 'Only BUILTIN\Guests assigned'
+            Add-ResultRow -Category $CAT -Item 'Allow Administrator account lockout' -Status 'Manual/External Required' `
+                -Details 'secedit: [System Access] AllowAdministratorLockout = 1, and set an account lockout threshold (e.g. "net accounts /lockoutthreshold:10 /lockoutduration:15 /lockoutwindow:15"). Provide secpol.txt as evidence.' `
+                -ExpectedValue 'Enabled (1)' -DetectedValue 'Not Applicable / not configured'
+            Add-ResultRow -Category $CAT -Item 'Rename built-in Guest account (QID 105228)' -Status 'Manual/External Required' `
+                -Details 'secedit: [System Access] NewGuestName = "<non-obvious name>"  (or: Rename-LocalUser -Name Guest -NewName "<name>"). The Guest account should also stay Disabled.' `
+                -ExpectedValue 'Guest renamed' -DetectedValue 'Built-in Guest not renamed'
+            Add-ResultRow -Category $CAT -Item 'August 2026 Windows Update (QID 92439)' -Status 'Manual/External Required' `
+                -Details 'Install KB5120228 and KB5120233 (build 26100.33158 -> 26100.33222 / 26100.33296). Patch via Windows Update / WSUS, then re-run Get-HotFix as evidence. Out of scope of configuration hardening.' `
+                -ExpectedValue 'Build >= 26100.33222' -DetectedValue 'Build 26100.33158'
+            Add-ResultRow -Category $CAT -Item 'QID 92446 - Defender EoP zero-day' -Status 'Manual/External Required' `
+                -Details 'No Microsoft patch was available at assessment time. Track the MSRC advisory; apply the update as soon as it ships. Keep Defender platform / signatures current in the meantime.' `
+                -ExpectedValue 'Patched when available' -DetectedValue 'No patch at assessment time'
+            Add-ResultRow -Category $CAT -Item 'Third-party agent vulnerabilities' -Status 'Manual/External Required' `
+                -Details 'Upgrade to non-vulnerable versions with the respective owners: Splunk Universal Forwarder (SVD-2026-*), Azure Connected Machine Agent (.NET/Go/gRPC), ServiceNow Agent (Ruby gem/Go/gRPC), Binalyze AIR (Go stdlib/gRPC/crypto).' `
+                -ExpectedValue 'Agents on fixed versions' -DetectedValue 'Vulnerable agent builds present'
+        }
+    } else {
+        Add-ResultRow -Category '7. Extended Baseline (Cybersecurity Review)' -Item 'All items' -Status 'Skipped (category)' -Details '-SkipExtendedBaseline was passed'
+    }
 } catch {
     $fatal = $_.Exception.Message
     Write-GuestLog "FATAL: $fatal" 'ERROR'
@@ -904,6 +1118,19 @@ function New-RemediationPayload {
         $rangesLiteral = '@()'
     }
 
+    # Category 7: sanitise -WinRmFilterRange (IPv4 addresses / ranges only) into a literal.
+    $winRmFilterLiteral = '@()'
+    if ($WinRmFilterRange -and $WinRmFilterRange.Count -gt 0) {
+        $fparts = foreach ($entry in $WinRmFilterRange) {
+            $clean = ($entry -replace '[^0-9A-Fa-f\.:/\-]', '')
+            if ($clean -ne $entry -or [string]::IsNullOrWhiteSpace($clean)) {
+                throw "WinRmFilterRange entry '$entry' contains characters outside [0-9A-Fa-f.:/-] - refused."
+            }
+            ConvertTo-PsSingleQuoted $clean
+        }
+        $winRmFilterLiteral = '@(' + ($fparts -join ',') + ')'
+    }
+
     $inject = @"
 `$Apply                  = $(ConvertTo-PsBool $EffectiveApply)
 `$SkipCredentialGuard    = $(ConvertTo-PsBool $SkipCredentialGuard)
@@ -913,6 +1140,10 @@ function New-RemediationPayload {
 `$SkipSmbRpc             = $(ConvertTo-PsBool $SkipSmbRpc)
 `$SkipBaselineIndicators = $(ConvertTo-PsBool $SkipBaselineIndicators)
 `$SkipBaselineGpoApply   = $(ConvertTo-PsBool $SkipBaselineGpoApply)
+`$SkipExtendedBaseline   = $(ConvertTo-PsBool $SkipExtendedBaseline)
+`$SkipExtendedManualItems = $(ConvertTo-PsBool $SkipExtendedManualItems)
+`$CachedLogonsCount      = $([int]$CachedLogonsCount)
+`$WinRmFilterRange       = $winRmFilterLiteral
 `$DisableWinRM           = $(ConvertTo-PsBool $DisableWinRM)
 `$WinRmAllowedSourceRange = $rangesLiteral
 `$EnforceAesOnlyKerberos = $(ConvertTo-PsBool $EnforceAesOnlyKerberos)

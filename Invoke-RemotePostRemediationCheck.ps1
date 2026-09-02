@@ -61,6 +61,16 @@ param(
     # without relying on in-guest domain auto-detection.
     [switch] $TreatAllAsWorkgroup,
 
+    # Category 7 (Extended Baseline): value at or below which Winlogon\CachedLogonsCount
+    # is treated Compliant. Default 4 (CIS). Qualys QID 90007 only fully clears at 0 on
+    # a workgroup server - match whatever -CachedLogonsCount you passed to the
+    # remediation script.
+    [ValidateRange(0, 50)]
+    [int]    $CachedLogonsTarget = 4,
+
+    # Skip the whole "7. Extended Baseline (Cybersecurity Review)" verification block.
+    [switch] $SkipExtendedBaseline,
+
     [ValidateRange(30, 3600)]
     [int]    $ToolsWaitSecs = 180
 )
@@ -68,8 +78,9 @@ param(
 $ErrorActionPreference = 'Stop'
 $ProgressPreference     = 'SilentlyContinue'
 
-Write-Host "Invoke-RemotePostRemediationCheck.ps1 - READ-ONLY verification  [build 2026-08-28l-aligned-output]" -ForegroundColor Magenta
+Write-Host "Invoke-RemotePostRemediationCheck.ps1 - READ-ONLY verification  [build 2026-09-02b-postcheck-extended-baseline]" -ForegroundColor Magenta
 Write-Host ("Running from: {0}" -f $PSCommandPath) -ForegroundColor DarkGray
+Write-Host ("If the build above is not '2026-09-02b-postcheck-extended-baseline' you are running an OLD copy - update it.") -ForegroundColor DarkGray
 
 # =====================================================================================
 # 1. Pre-flight
@@ -119,6 +130,8 @@ Write-Log "Post-check run started. VMs=$($vmNames.Count)."
 # =====================================================================================
 $PayloadTemplate = @'
 $ProgressPreference = 'SilentlyContinue'
+$CachedLogonsTarget   = {{CACHED_TARGET}}
+$SkipExtendedBaseline = {{SKIP_EXTENDED_BASELINE}}
 
 # Each row carries BOTH representations:
 #   Header / Label / LocalStatus / Detail  -> reproduce the local post-remediation-check.ps1
@@ -404,6 +417,189 @@ try {
         -Detail 'Not verifiable by registry check - confirm via gpresult /h or re-run LGPO.exe /g' `
         -Category '2025 Security Baseline' -Item 'Full Windows Server 2025 Security Baseline GPO Applied' `
         -Detected 'Not verifiable by registry check' -Expected 'Baseline GPO linked / applied'
+
+    # ==========================================================================
+    # 7. Extended Baseline (Cybersecurity Review) - verifies the same items the
+    #    remediation script's Category 7 remediates. READ-ONLY: Get-* / registry
+    #    reads / "auditpol /get" / Get-LocalUser only.
+    # ==========================================================================
+    if (-not $SkipExtendedBaseline) {
+        $CC = '7. Extended Baseline (Cybersecurity Review)'
+
+        $H = '7. Extended Baseline (Cybersecurity Review) - VBS / LSA / logging'
+        # HVCI - Enabled with UEFI lock
+        $p = 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity'
+        $en = Get-RegVal $p 'Enabled'; $lk = Get-RegVal $p 'Locked'
+        Add-Row -Header $H -Label 'HVCI - Enabled with UEFI lock' `
+            -LocalStatus $(if ($en.Found -and $en.Value -eq 1 -and $lk.Found -and $lk.Value -eq 1) { 'OK' } else { 'NOT SET' }) `
+            -Category $CC -Item 'HVCI - UEFI lock' `
+            -Detected ("Enabled={0}; Locked={1}" -f $(if ($en.Found) { $en.Value } else { '(ns)' }), $(if ($lk.Found) { $lk.Value } else { '(ns)' })) `
+            -Expected 'Enabled=1 and Locked=1'
+
+        # Kernel-mode HW-enforced Stack Protection - enforcement (not Audit)
+        $p = 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\KernelShadowStacks'
+        $en = Get-RegVal $p 'Enabled'; $am = Get-RegVal $p 'AuditMode'
+        Add-Row -Header $H -Label 'Kernel-mode HW Stack Protection - enforcement' `
+            -LocalStatus $(if ($en.Found -and $en.Value -eq 1 -and $am.Found -and $am.Value -eq 0) { 'OK' } else { 'NOT SET' }) `
+            -Detail $(if ($en.Found -and $en.Value -eq 1 -and $am.Found -and $am.Value -eq 1) { 'currently in Audit mode - control expects Enforcement' } else { '' }) `
+            -Category $CC -Item 'Kernel-mode HW-enforced Stack Protection' `
+            -Detected ("Enabled={0}; AuditMode={1}" -f $(if ($en.Found) { $en.Value } else { '(ns)' }), $(if ($am.Found) { $am.Value } else { '(ns)' })) `
+            -Expected 'Enabled=1 and AuditMode=0'
+
+        # LSASS RunAsPPL - UEFI lock (value 1, not 2)
+        $v = Get-RegVal 'HKLM:\SYSTEM\CurrentControlSet\Control\LSA' 'RunAsPPL'
+        Add-Row -Header $H -Label 'LSASS RunAsPPL - UEFI lock' `
+            -LocalStatus $(if ($v.Found -and $v.Value -eq 1) { 'OK' } else { "NOT SET (found: $(if ($v.Found) { $v.Value } else { '' }))" }) `
+            -Detail $(if ($v.Found -and $v.Value -eq 2) { 'RunAsPPL=2 = enabled WITHOUT UEFI lock; control expects 1 (with lock)' } else { '' }) `
+            -Category $CC -Item 'LSASS RunAsPPL - UEFI lock' `
+            -Detected ("RunAsPPL={0}" -f $(if ($v.Found) { $v.Value } else { '(not set)' })) -Expected 'RunAsPPL=1'
+
+        # PowerShell Script Block (+ Invocation) Logging
+        $p = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging'
+        $sb = Get-RegVal $p 'EnableScriptBlockLogging'; $si = Get-RegVal $p 'EnableScriptBlockInvocationLogging'
+        Add-Row -Header $H -Label 'Script Block + Invocation Logging' `
+            -LocalStatus $(if ($sb.Found -and $sb.Value -eq 1 -and $si.Found -and $si.Value -eq 1) { 'OK' } else { 'NOT SET' }) `
+            -Category $CC -Item 'PowerShell Script Block (and Invocation) Logging' `
+            -Detected ("EnableScriptBlockLogging={0}; EnableScriptBlockInvocationLogging={1}" -f $(if ($sb.Found) { $sb.Value } else { '(ns)' }), $(if ($si.Found) { $si.Value } else { '(ns)' })) `
+            -Expected 'both = 1'
+
+        # Credential Guard - policy value / GPO override
+        $dg = Get-RegVal 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceGuard' 'LsaCfgFlags'
+        $lc = Get-RegVal 'HKLM:\SYSTEM\CurrentControlSet\Control\LSA' 'LsaCfgFlags'
+        if ($dg.Found -and $dg.Value -eq 0) {
+            Add-Row -Header $H -Label 'Credential Guard - policy value' -LocalStatus 'NOT SET' `
+                -Detail 'A GPO is DISABLING Credential Guard (Policies\...\DeviceGuard\LsaCfgFlags=0). Set "Turn On VBS > Credential Guard Configuration" to "Enabled with UEFI lock".' `
+                -Category $CC -Item 'Credential Guard - policy value' `
+                -Detected ("Policies\...\DeviceGuard\LsaCfgFlags=0; Control\LSA\LsaCfgFlags={0}" -f $(if ($lc.Found) { $lc.Value } else { '(ns)' })) `
+                -Expected 'LsaCfgFlags=1 (Enabled with UEFI lock)'
+        } else {
+            Add-Row -Header $H -Label 'Credential Guard - policy value' `
+                -LocalStatus $(if ($dg.Found -and $dg.Value -eq 1 -and $lc.Found -and $lc.Value -in @(1, 2)) { 'OK' } else { 'NOT SET' }) `
+                -Category $CC -Item 'Credential Guard - policy value' `
+                -Detected ("Policies\...\DeviceGuard\LsaCfgFlags={0}; Control\LSA\LsaCfgFlags={1}" -f $(if ($dg.Found) { $dg.Value } else { '(ns)' }), $(if ($lc.Found) { $lc.Value } else { '(ns)' })) `
+                -Expected 'Policies LsaCfgFlags=1 and Control\LSA LsaCfgFlags in {1,2}'
+        }
+
+        $H = '7. Extended Baseline (Cybersecurity Review) - WinRM / Kerberos PKINIT / Ink / Audit / Cached logons'
+        # WinRM auto-configuration disabled
+        $wp = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WinRM\Service'
+        $ac = Get-RegVal $wp 'AllowAutoConfig'
+        Add-Row -Header $H -Label 'WinRM auto-configuration disabled' `
+            -LocalStatus $(if ((-not $ac.Found) -or $ac.Value -eq 0) { 'OK' } else { 'NOT SET' }) `
+            -Category $CC -Item 'WinRM auto-configuration disabled' `
+            -Detected ("AllowAutoConfig={0}" -f $(if ($ac.Found) { $ac.Value } else { '(not configured)' })) -Expected '0 or not configured'
+
+        # WinRM listener IPv4/IPv6 filter
+        $f4 = Get-RegVal $wp 'IPv4Filter'; $f6 = Get-RegVal $wp 'IPv6Filter'
+        $f4v = if ($f4.Found) { [string]$f4.Value } else { '' }
+        $f6v = if ($f6.Found) { [string]$f6.Value } else { '' }
+        $filterOpen = ($f4v -eq '*' -or $f4v -eq '') -and ($f6v -eq '*' -or $f6v -eq '')
+        Add-Row -Header $H -Label 'WinRM listener IPv4/IPv6 filter' `
+            -LocalStatus $(if ($filterOpen) { 'MANUAL' } else { 'OK' }) `
+            -Detail $(if ($filterOpen) { "IPv4Filter='$f4v', IPv6Filter='$f6v' - open to all. Scope to a management range (-WinRmFilterRange on the remediation script)." } else { "IPv4Filter='$f4v'; IPv6Filter='$f6v'" }) `
+            -Category $CC -Item 'WinRM listener IPv4/IPv6 filter' `
+            -Detected ("IPv4Filter='{0}'; IPv6Filter='{1}'" -f $f4v, $f6v) -Expected 'Scoped to a management IP range (not * / blank)'
+
+        # PKINIT hash SHA256 / SHA384 / SHA512 = Supported (3)
+        foreach ($alg in 'SHA256', 'SHA384', 'SHA512') {
+            $v = Get-RegVal ("HKLM:\SOFTWARE\Policies\Microsoft\Windows\PKINITHashAlgorithms\{0}" -f $alg) 'Support'
+            Add-Row -Header $H -Label ("PKINIT hash {0} = Supported" -f $alg) `
+                -LocalStatus $(if ($v.Found -and $v.Value -eq 3) { 'OK' } else { 'NOT SET' }) `
+                -Detail 'Benchmark value only - no AD / PKINIT smart-card logon in a workgroup.' `
+                -Category $CC -Item ("PKINIT hash {0}" -f $alg) `
+                -Detected ("Support={0}" -f $(if ($v.Found) { $v.Value } else { '(not set / default)' })) -Expected 'Support=3 (Supported)'
+        }
+
+        # Windows Ink Workspace disabled
+        $v = Get-RegVal 'HKLM:\SOFTWARE\Policies\Microsoft\WindowsInkWorkspace' 'AllowWindowsInkWorkspace'
+        Add-Row -Header $H -Label 'Windows Ink Workspace disabled' `
+            -LocalStatus $(if ($v.Found -and $v.Value -eq 0) { 'OK' } else { 'NOT SET' }) `
+            -Category $CC -Item 'Windows Ink Workspace disabled' `
+            -Detected ("AllowWindowsInkWorkspace={0}" -f $(if ($v.Found) { $v.Value } else { '(not configured)' })) -Expected 'AllowWindowsInkWorkspace=0'
+
+        # Audit "Audit Policy Change" = Success and Failure
+        try {
+            $csv = (& auditpol /get /subcategory:"Audit Policy Change" /r 2>$null | ConvertFrom-Csv)
+            $row = $csv | Where-Object { $_.Subcategory -eq 'Audit Policy Change' } | Select-Object -First 1
+            $inc = if ($row) { [string]$row.'Inclusion Setting' } else { '(unknown)' }
+            Add-Row -Header $H -Label 'Audit "Audit Policy Change"' `
+                -LocalStatus $(if ($inc -eq 'Success and Failure') { 'OK' } else { 'NOT SET' }) `
+                -Category $CC -Item 'Audit "Audit Policy Change"' `
+                -Detected ("Inclusion Setting={0}" -f $inc) -Expected 'Success and Failure'
+        } catch {
+            Add-Row -Header $H -Label 'Audit "Audit Policy Change"' -LocalStatus 'NOT SET' -Detail 'auditpol read failed' `
+                -Category $CC -Item 'Audit "Audit Policy Change"' -NormStatus 'Unable to Check' `
+                -Detected 'auditpol /get failed' -Expected 'Success and Failure'
+        }
+
+        # Cached logons count
+        $v = Get-RegVal 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' 'CachedLogonsCount'
+        $clc = if ($v.Found) { [int]$v.Value } else { $null }
+        Add-Row -Header $H -Label 'Cached logons count' `
+            -LocalStatus $(if ($null -ne $clc -and $clc -le $CachedLogonsTarget) { 'OK' } else { 'NOT SET' }) `
+            -Detail $(if ($null -ne $clc -and $clc -gt 0) { "value $clc - Qualys QID 90007 only clears at 0 on a workgroup server" } else { '' }) `
+            -Category $CC -Item 'Cached logons count' `
+            -Detected ("CachedLogonsCount={0}" -f $(if ($v.Found) { $v.Value } else { '(not set)' })) -Expected ("<= {0}" -f $CachedLogonsTarget)
+
+        $H = '7. Extended Baseline (Cybersecurity Review) - Local Security Policy / patch (verify with evidence)'
+        # Built-in Guest account renamed (checkable via well-known SID -501)
+        try {
+            $guest = Get-LocalUser -ErrorAction Stop | Where-Object { $_.SID.Value -like '*-501' } | Select-Object -First 1
+            if ($guest) {
+                Add-Row -Header $H -Label 'Built-in Guest account renamed (QID 105228)' `
+                    -LocalStatus $(if ($guest.Name -ne 'Guest') { 'OK' } else { 'NOT SET' }) `
+                    -Detail ("Guest account name = '{0}', Enabled = {1}" -f $guest.Name, $guest.Enabled) `
+                    -Category $CC -Item 'Built-in Guest account renamed' `
+                    -Detected ("Name='{0}'; Enabled={1}" -f $guest.Name, $guest.Enabled) -Expected "Renamed (not 'Guest') and Disabled"
+            } else {
+                Add-Row -Header $H -Label 'Built-in Guest account renamed (QID 105228)' -LocalStatus 'MANUAL' -Detail 'Built-in Guest (SID -501) not found - verify manually' `
+                    -Category $CC -Item 'Built-in Guest account renamed' -Detected 'SID -501 account not found' -Expected 'Renamed and Disabled'
+            }
+        } catch {
+            Add-Row -Header $H -Label 'Built-in Guest account renamed (QID 105228)' -LocalStatus 'MANUAL' -Detail 'Get-LocalUser not available - verify with secedit export' `
+                -Category $CC -Item 'Built-in Guest account renamed' -NormStatus 'Manual Verification Required' -Detected 'unable to read local users' -Expected 'Renamed and Disabled'
+        }
+
+        # User rights + admin lockout: not readable without a secedit export
+        Add-Row -Header $H -Label 'Deny access to this computer from the network' -LocalStatus 'MANUAL' `
+            -Detail 'Verify SeDenyNetworkLogonRight includes Guests + Local account + Local account & Administrators (secedit /export /cfg secpol.txt).' `
+            -Category $CC -Item 'Deny access from network (user right)' -Detected 'Not readable without secedit export' -Expected '*S-1-5-32-546,*S-1-5-113,*S-1-5-114'
+        Add-Row -Header $H -Label 'Deny logon through Remote Desktop Services' -LocalStatus 'MANUAL' `
+            -Detail 'Verify SeDenyRemoteInteractiveLogonRight includes Guests + Local account (secedit /export).' `
+            -Category $CC -Item 'Deny logon through RDS (user right)' -Detected 'Not readable without secedit export' -Expected '*S-1-5-32-546,*S-1-5-113'
+        Add-Row -Header $H -Label 'Allow Administrator account lockout' -LocalStatus 'MANUAL' `
+            -Detail 'Verify [System Access] AllowAdministratorLockout = 1 and an account lockout threshold is set (secedit /export / "net accounts").' `
+            -Category $CC -Item 'Allow Administrator account lockout' -Detected 'Not readable without secedit export' -Expected 'Enabled (1)'
+
+        # August 2026 Windows update - checkable via build revision (UBR)
+        try {
+            $cv  = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop
+            $bld = [int]$cv.CurrentBuildNumber
+            $ubr = [int]$cv.UBR
+            $fullBuild = "$bld.$ubr"
+            $patched = ($bld -gt 26100) -or ($bld -eq 26100 -and $ubr -ge 33222)
+            Add-Row -Header $H -Label 'August 2026 Windows Update (QID 92439)' `
+                -LocalStatus $(if ($patched) { 'OK' } else { 'NOT SET' }) `
+                -Detail $(if ($patched) { '' } else { 'install KB5120228 / KB5120233 via Windows Update, then re-scan' }) `
+                -Category $CC -Item 'August 2026 Windows Update' `
+                -Detected ("OS build {0}" -f $fullBuild) -Expected 'build >= 26100.33222'
+        } catch {
+            Add-Row -Header $H -Label 'August 2026 Windows Update (QID 92439)' -LocalStatus 'MANUAL' -Detail 'could not read OS build revision' `
+                -Category $CC -Item 'August 2026 Windows Update' -NormStatus 'Manual Verification Required' -Detected 'UBR unreadable' -Expected 'build >= 26100.33222'
+        }
+
+        Add-Row -Header $H -Label 'QID 92446 - Defender EoP zero-day' -LocalStatus 'MANUAL' `
+            -Detail 'No Microsoft patch at assessment time - track MSRC advisory, apply when released; keep Defender platform/signatures current.' `
+            -Category $CC -Item 'QID 92446 - Defender EoP zero-day' -Detected 'No patch at assessment time' -Expected 'Patched when available'
+        Add-Row -Header $H -Label 'Third-party agent vulnerabilities' -LocalStatus 'MANUAL' `
+            -Detail 'Splunk UF / Azure Arc agent / ServiceNow agent / Binalyze AIR - upgrade with the respective owners (Go / gRPC / .NET / Ruby vulns).' `
+            -Category $CC -Item 'Third-party agent vulnerabilities' -Detected 'Vulnerable agent builds present' -Expected 'Agents on fixed versions'
+    } else {
+        Add-Row -Header '7. Extended Baseline (Cybersecurity Review)' -Label 'Extended Baseline verification' -LocalStatus 'N/A' `
+            -Detail '-SkipExtendedBaseline was passed - Category 7 was not verified this run.' `
+            -Category '7. Extended Baseline (Cybersecurity Review)' -Item 'All items' -NormStatus 'Not Applicable' `
+            -Detected 'Skipped by operator' -Expected 'n/a'
+    }
 
 } catch {
     $fatal = $_.Exception.Message
@@ -706,6 +902,8 @@ foreach ($vmName in $vmNames) {
 
         Write-Log "'$vmName': staging + running read-only verification payload." 'INFO'
         $payloadForGuest = $PayloadTemplate.Replace('{{TREAT_ALL_AS_WORKGROUP}}', $(if ($TreatAllAsWorkgroup) { '$true' } else { '$false' }))
+        $payloadForGuest = $payloadForGuest.Replace('{{CACHED_TARGET}}', ([string][int]$CachedLogonsTarget))
+        $payloadForGuest = $payloadForGuest.Replace('{{SKIP_EXTENDED_BASELINE}}', $(if ($SkipExtendedBaseline) { '$true' } else { '$false' }))
         $scriptOutput = Invoke-LargeGuestPayload -VM $vm -Server $srv -Credential $GuestCredential -PayloadText $payloadForGuest -ToolsWaitSecs $ToolsWaitSecs
 
         $envelope = Read-EnvelopeFromScriptOutput -Output $scriptOutput -StartMarker '<<<SECGAP-ENVELOPE-B64>>>' -EndMarker '<<<END-SECGAP-ENVELOPE>>>'
