@@ -8,8 +8,13 @@
 
 const BACKUP_STORE_NAMES = [
   'products', 'customers', 'invoices', 'invoiceItems',
-  'expenses', 'stockAdjustments', 'settings', 'counters', 'auditLog',
+  'expenses', 'stockAdjustments', 'settings', 'counters', 'auditLog', 'returns',
 ];
+// Stores that must be present for a file to be recognized as a valid backup at
+// all — 'returns' (added after backups already existed) is deliberately left
+// out of this list, so a backup taken before it existed still restores fine;
+// restoreFromPayload() below treats any missing store as simply empty.
+const REQUIRED_BACKUP_STORE_NAMES = ['products', 'customers', 'invoices', 'invoiceItems', 'expenses', 'settings'];
 const BACKUP_APP_NAME = 'SalesInventorySystem';
 const BACKUP_VERSION = 1;
 
@@ -44,7 +49,7 @@ function validateBackupPayload(payload) {
   if (!payload.stores || typeof payload.stores !== 'object') {
     return [...errors, 'ملف النسخة الاحتياطية تالف أو غير مكتمل.'];
   }
-  for (const name of BACKUP_STORE_NAMES) {
+  for (const name of REQUIRED_BACKUP_STORE_NAMES) {
     if (!Array.isArray(payload.stores[name])) {
       errors.push('ملف النسخة الاحتياطية تالف أو غير مكتمل (بيانات مفقودة).');
       break;
@@ -92,7 +97,8 @@ async function restoreFromPayload(payload) {
     for (const name of BACKUP_STORE_NAMES) {
       const store = tx.objectStore(name);
       await requestToPromise(store.clear());
-      for (const record of payload.stores[name]) {
+      const records = payload.stores[name] || []; // absent in an older backup taken before this store existed
+      for (const record of records) {
         store.put(record);
       }
     }

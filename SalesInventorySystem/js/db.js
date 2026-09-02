@@ -7,7 +7,7 @@
  */
 
 const DB_NAME = 'SalesSystemDB';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 
 let dbInstance = null;
 
@@ -81,6 +81,12 @@ function openDatabase() {
         const auditLog = db.createObjectStore('auditLog', { keyPath: 'id', autoIncrement: true });
         auditLog.createIndex('date', 'date', { unique: false });
         auditLog.createIndex('entityType', 'entityType', { unique: false });
+      }
+
+      if (!db.objectStoreNames.contains('returns')) {
+        const returns = db.createObjectStore('returns', { keyPath: 'id', autoIncrement: true });
+        returns.createIndex('invoiceId', 'invoiceId', { unique: false });
+        returns.createIndex('date', 'date', { unique: false });
       }
     };
 

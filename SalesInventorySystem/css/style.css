@@ -449,6 +449,13 @@ body {
   color: var(--color-primary);
 }
 
+.returns-history {
+  margin: 0 0 16px;
+  padding-inline-start: 18px;
+  font-size: 14px;
+  color: var(--color-text-muted);
+}
+
 .invoice-detail-preview {
   max-height: 60vh;
   overflow-y: auto;
@@ -532,6 +539,17 @@ body {
 .badge-warning {
   background: #fdecea;
   color: var(--color-danger);
+}
+
+.badge-danger {
+  background: #fdecea;
+  color: var(--color-danger);
+  font-weight: 700;
+}
+
+.badge-info {
+  background: #eaf2fd;
+  color: #1e5f9e;
 }
 
 .link-btn {

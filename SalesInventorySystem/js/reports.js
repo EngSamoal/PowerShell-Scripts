@@ -45,7 +45,9 @@ function defaultRangeForType(type) {
 async function invoicesInDateRange(dateFrom, dateTo) {
   const invoices = await listAllInvoices();
   return invoices.filter((inv) => (
-    inv.status === 'completed'
+    // Not just 'completed': a partially-returned invoice's still-net figures must keep
+    // counting as real revenue. Only a fully voided invoice is excluded outright.
+    inv.status !== 'voided'
     && (!dateFrom || inv.date >= dateFrom)
     && (!dateTo || inv.date <= dateTo)
   ));

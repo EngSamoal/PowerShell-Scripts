@@ -16,7 +16,9 @@ async function renderDashboardScreen() {
     computeProfitSummary(monthStart, today),
   ]);
 
-  const completedInvoices = invoices.filter((inv) => inv.status === 'completed');
+  // Not just 'completed': a partially-returned invoice's still-net figures must keep
+  // counting as real revenue. Only a fully voided invoice is excluded outright.
+  const completedInvoices = invoices.filter((inv) => inv.status !== 'voided');
   const todaysInvoices = completedInvoices.filter((inv) => inv.date === today);
   const salesToday = todaysInvoices.reduce((sum, inv) => sum + inv.grandTotalHalalas, 0);
   const salesMonth = completedInvoices
