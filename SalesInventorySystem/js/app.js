@@ -8,7 +8,7 @@
  * and testable from day one.
  */
 
-const READY_SCREENS = new Set(['dashboard', 'settings', 'products', 'new-sale']);
+const READY_SCREENS = new Set(['dashboard', 'settings', 'products', 'new-sale', 'invoices']);
 
 async function renderDashboardScreen() {
   const container = document.getElementById('screen-dashboard');
@@ -63,6 +63,7 @@ async function showScreenById(screenId) {
     if (screenId === 'settings') await renderSettingsScreen();
     if (screenId === 'products') await renderProductsScreen();
     if (screenId === 'new-sale') await renderNewSaleScreen();
+    if (screenId === 'invoices') await renderInvoicesScreen();
     UI.showScreen(`screen-${screenId}`);
   } catch (err) {
     UI.error(friendlyError('تعذر فتح هذه الشاشة. يرجى المحاولة مرة أخرى.', err));
@@ -84,7 +85,6 @@ async function initApp() {
 
     const placeholders = [
       ['screen-customers', 'العملاء'],
-      ['screen-invoices', 'الفواتير'],
       ['screen-expenses', 'المصروفات'],
       ['screen-reports', 'التقارير'],
       ['screen-backup', 'النسخ الاحتياطي'],

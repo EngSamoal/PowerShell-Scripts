@@ -185,3 +185,190 @@ function printReceipt(html) {
   document.getElementById('print-area').innerHTML = html;
   window.print();
 }
+
+// ---- Data access for the "الفواتير" screen -------------------------------------
+
+async function listAllInvoices() {
+  return dbGetAll('invoices');
+}
+
+async function getInvoiceById(id) {
+  return dbGet('invoices', id);
+}
+
+async function getInvoiceItemsByInvoiceId(invoiceId) {
+  return dbGetAllByIndex('invoiceItems', 'invoiceId', invoiceId);
+}
+
+/** One query for every invoice's line items, grouped by invoiceId — avoids an N+1 read when rendering the whole list. */
+async function groupAllInvoiceItemsByInvoiceId() {
+  const allItems = await dbGetAll('invoiceItems');
+  const map = new Map();
+  for (const item of allItems) {
+    if (!map.has(item.invoiceId)) map.set(item.invoiceId, []);
+    map.get(item.invoiceId).push(item);
+  }
+  return map;
+}
+
+/** "قطاعي" / "جملة" / "مختلط" — derived from the invoice's own line items, never stored, so it can never drift out of sync. */
+function invoiceSaleTypeSummary(items) {
+  const hasRetail = items.some((i) => i.saleType === 'retail');
+  const hasWholesale = items.some((i) => i.saleType === 'wholesale');
+  if (hasRetail && hasWholesale) return 'مختلط';
+  if (hasWholesale) return 'جملة';
+  return 'قطاعي';
+}
+
+/** Adapts a stored invoice record (date/createdAt) into the shape renderInvoiceReceiptHtml() expects (dateDisplay). */
+function invoiceToReceiptData(invoice) {
+  return { ...invoice, dateDisplay: formatDateTimeForDisplay(new Date(invoice.createdAt)) };
+}
+
+// ---- Rendering: "الفواتير" screen -----------------------------------------------
+
+const invoicesScreenState = { search: '', dateFrom: '', dateTo: '', paymentStatusFilter: 'all' };
+
+const PAYMENT_STATUS_BADGE_CLASS = { paid: 'badge-success', unpaid: 'badge-warning', partial: 'badge-muted' };
+
+async function renderInvoicesScreen() {
+  const container = document.getElementById('screen-invoices');
+
+  container.innerHTML = `
+    <h2 class="screen-title">الفواتير</h2>
+    <div class="toolbar">
+      <input type="search" id="invoice-search" class="toolbar-search" placeholder="ابحث برقم الفاتورة...">
+      <label class="toolbar-inline"><span>من</span><input type="date" id="invoice-date-from"></label>
+      <label class="toolbar-inline"><span>إلى</span><input type="date" id="invoice-date-to"></label>
+      <select id="invoice-status-filter" class="toolbar-select">
+        <option value="all">كل حالات الدفع</option>
+        <option value="paid">مدفوع</option>
+        <option value="unpaid">غير مدفوع</option>
+        <option value="partial">مدفوع جزئيًا</option>
+      </select>
+    </div>
+    <div class="table-wrap">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>رقم الفاتورة</th><th>التاريخ</th><th>نوع البيع</th>
+            <th>قيمة المنتجات</th><th>الرسوم</th><th>الإجمالي</th><th>حالة الدفع</th><th>إجراءات</th>
+          </tr>
+        </thead>
+        <tbody id="invoices-table-body"></tbody>
+      </table>
+      <p id="invoices-empty-message" class="table-empty-message" hidden>لا توجد فواتير مطابقة.</p>
+    </div>
+  `;
+
+  document.getElementById('invoice-search').value = invoicesScreenState.search;
+  document.getElementById('invoice-date-from').value = invoicesScreenState.dateFrom;
+  document.getElementById('invoice-date-to').value = invoicesScreenState.dateTo;
+  document.getElementById('invoice-status-filter').value = invoicesScreenState.paymentStatusFilter;
+
+  document.getElementById('invoice-search').addEventListener('input', (e) => {
+    invoicesScreenState.search = e.target.value;
+    renderInvoicesTableBody();
+  });
+  document.getElementById('invoice-date-from').addEventListener('change', (e) => {
+    invoicesScreenState.dateFrom = e.target.value;
+    renderInvoicesTableBody();
+  });
+  document.getElementById('invoice-date-to').addEventListener('change', (e) => {
+    invoicesScreenState.dateTo = e.target.value;
+    renderInvoicesTableBody();
+  });
+  document.getElementById('invoice-status-filter').addEventListener('change', (e) => {
+    invoicesScreenState.paymentStatusFilter = e.target.value;
+    renderInvoicesTableBody();
+  });
+
+  await renderInvoicesTableBody();
+}
+
+async function renderInvoicesTableBody() {
+  const tbody = document.getElementById('invoices-table-body');
+  const emptyMessage = document.getElementById('invoices-empty-message');
+  if (!tbody) return;
+
+  const settings = await getSettings();
+  const [invoices, itemsByInvoice] = await Promise.all([listAllInvoices(), groupAllInvoiceItemsByInvoiceId()]);
+
+  const search = invoicesScreenState.search.trim().toLowerCase();
+  const filtered = invoices.filter((inv) => {
+    if (search && !inv.invoiceNumber.toLowerCase().includes(search)) return false;
+    if (invoicesScreenState.dateFrom && inv.date < invoicesScreenState.dateFrom) return false;
+    if (invoicesScreenState.dateTo && inv.date > invoicesScreenState.dateTo) return false;
+    if (invoicesScreenState.paymentStatusFilter !== 'all' && inv.paymentStatus !== invoicesScreenState.paymentStatusFilter) return false;
+    return true;
+  });
+
+  filtered.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+
+  if (filtered.length === 0) {
+    tbody.innerHTML = '';
+    emptyMessage.hidden = false;
+    return;
+  }
+  emptyMessage.hidden = true;
+
+  tbody.innerHTML = filtered.map((inv) => {
+    const items = itemsByInvoice.get(inv.id) || [];
+    return `
+      <tr>
+        <td>${escapeHtml(inv.invoiceNumber)}</td>
+        <td>${escapeHtml(inv.date)}</td>
+        <td>${invoiceSaleTypeSummary(items)}</td>
+        <td>${formatCurrency(inv.subtotalHalalas, settings.currencySymbol)}</td>
+        <td>${formatCurrency(inv.feePercentHalalas + inv.feeFixedHalalas, settings.currencySymbol)}</td>
+        <td>${formatCurrency(inv.grandTotalHalalas, settings.currencySymbol)}</td>
+        <td><span class="badge ${PAYMENT_STATUS_BADGE_CLASS[inv.paymentStatus]}">${PAYMENT_STATUS_LABELS[inv.paymentStatus]}</span></td>
+        <td class="table-actions">
+          <button type="button" class="link-btn" data-action="open" data-id="${inv.id}">فتح</button>
+          <button type="button" class="link-btn" data-action="print" data-id="${inv.id}">طباعة</button>
+        </td>
+      </tr>
+    `;
+  }).join('');
+
+  tbody.querySelectorAll('[data-action="open"]').forEach((btn) => {
+    btn.addEventListener('click', () => openInvoiceDetailModal(Number(btn.dataset.id)));
+  });
+  tbody.querySelectorAll('[data-action="print"]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const invoice = invoices.find((i) => i.id === Number(btn.dataset.id));
+      const items = itemsByInvoice.get(invoice.id) || [];
+      printReceipt(renderInvoiceReceiptHtml(invoiceToReceiptData(invoice), items, settings));
+    });
+  });
+}
+
+// ---- Rendering: invoice detail modal (reopen / reprint) --------------------------
+
+async function openInvoiceDetailModal(invoiceId) {
+  const [invoice, items, settings] = await Promise.all([
+    getInvoiceById(invoiceId),
+    getInvoiceItemsByInvoiceId(invoiceId),
+    getSettings(),
+  ]);
+  if (!invoice) {
+    UI.error('تعذر العثور على الفاتورة.');
+    return;
+  }
+
+  const receiptHtml = renderInvoiceReceiptHtml(invoiceToReceiptData(invoice), items, settings);
+
+  UI.showModal(`
+    <div class="modal modal-wide">
+      <h3 class="modal-title">تفاصيل الفاتورة</h3>
+      <div class="invoice-detail-preview">${receiptHtml}</div>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-secondary" id="invoice-detail-close">إغلاق</button>
+        <button type="button" class="btn btn-primary" id="invoice-detail-print">طباعة</button>
+      </div>
+    </div>
+  `);
+
+  document.getElementById('invoice-detail-close').addEventListener('click', () => UI.closeModal());
+  document.getElementById('invoice-detail-print').addEventListener('click', () => printReceipt(receiptHtml));
+}
