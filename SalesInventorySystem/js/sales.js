@@ -20,6 +20,7 @@ async function renderNewSaleScreen() {
   const settings = await getSettings();
   const allProducts = await listAllProducts();
   const activeProducts = allProducts.filter((p) => p.status === 'active').sort((a, b) => a.name.localeCompare(b.name, 'ar'));
+  const customers = await listAllCustomers();
 
   if (activeProducts.length === 0) {
     container.innerHTML = `
@@ -92,6 +93,15 @@ async function renderNewSaleScreen() {
         </div>
 
         <fieldset class="form-section">
+          <legend>العميل (اختياري)</legend>
+          <label class="form-field">
+            <span>العميل</span>
+            <select id="sale-customer-select"></select>
+          </label>
+          <button type="button" id="btn-add-customer-inline" class="btn btn-secondary">+ عميل جديد</button>
+        </fieldset>
+
+        <fieldset class="form-section">
           <legend>الدفع</legend>
           <label class="form-field">
             <span>طريقة الدفع</span>
@@ -130,6 +140,7 @@ async function renderNewSaleScreen() {
   `;
 
   wireAddProductPanel(activeProducts, settings);
+  wireCustomerSection(customers);
   wirePaymentSection(settings);
   renderCartTable(settings);
 
@@ -267,6 +278,32 @@ function addLineToCart(activeProducts, settings) {
   updateLinePreview(activeProducts, settings);
 }
 
+// ---- Customer picker ------------------------------------------------------------
+
+function wireCustomerSection(customers) {
+  const select = document.getElementById('sale-customer-select');
+
+  const populate = (selectedId) => {
+    select.innerHTML = '<option value="">بدون عميل</option>'
+      + customers.map((c) => `<option value="${c.id}">${escapeHtml(c.name)}</option>`).join('');
+    if (selectedId) select.value = String(selectedId);
+  };
+  populate();
+
+  document.getElementById('btn-add-customer-inline').addEventListener('click', () => {
+    openCustomerFormModal(null, async (newId) => {
+      const newCustomer = await getCustomerById(newId);
+      customers.push(newCustomer);
+      populate(newId);
+    });
+  });
+}
+
+function selectedCustomerId() {
+  const value = document.getElementById('sale-customer-select').value;
+  return value ? Number(value) : null;
+}
+
 // ---- Cart + summary ------------------------------------------------------------
 
 function renderCartTable(settings) {
@@ -358,7 +395,8 @@ async function handleCompleteSale(settings) {
     const notes = document.getElementById('sale-notes').value;
     const paidAmountHalalas = paymentStatus === 'partial' ? sarToHalalas(document.getElementById('sale-paid-amount').value || 0) : undefined;
 
-    const meta = { customerId: null, paymentMethod, paymentStatus, paidAmountHalalas, notes };
+    const customerId = selectedCustomerId();
+    const meta = { customerId, paymentMethod, paymentStatus, paidAmountHalalas, notes };
     const result = await createInvoice(saleState.cart, meta, settings);
 
     if (result.errors.length > 0) {
@@ -368,16 +406,17 @@ async function handleCompleteSale(settings) {
       return;
     }
 
-    renderSaleSuccessView(result, saleState.cart, settings);
+    const customer = customerId ? await getCustomerById(customerId) : null;
+    renderSaleSuccessView(result, saleState.cart, settings, customer);
   } catch (err) {
     UI.error(friendlyError('تعذر إتمام عملية البيع. يرجى المحاولة مرة أخرى.', err));
     releaseGuard();
   }
 }
 
-function renderSaleSuccessView(invoiceResult, items, settings) {
+function renderSaleSuccessView(invoiceResult, items, settings, customer) {
   const container = document.getElementById('screen-new-sale');
-  const receiptHtml = renderInvoiceReceiptHtml(invoiceResult, items, settings);
+  const receiptHtml = renderInvoiceReceiptHtml(invoiceResult, items, settings, customer);
 
   container.innerHTML = `
     <div class="sale-success">

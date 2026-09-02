@@ -143,14 +143,15 @@ async function createInvoice(cartItems, meta, settings) {
   }
 }
 
-/** Builds the printable receipt HTML for a just-created (or reopened) invoice. Reused by the Invoices screen in a later phase. */
-function renderInvoiceReceiptHtml(invoice, items, settings) {
+/** Builds the printable receipt/invoice HTML for a just-created (or reopened) invoice. Shared by "بيع جديد" and the Invoices screen. */
+function renderInvoiceReceiptHtml(invoice, items, settings, customer) {
   return `
     <div class="receipt">
       <h2>${escapeHtml(settings.businessName || 'نظام المبيعات')}</h2>
       ${settings.phone ? `<p>${escapeHtml(settings.phone)}</p>` : ''}
       <p>فاتورة رقم: ${escapeHtml(invoice.invoiceNumber)}</p>
       <p>التاريخ: ${escapeHtml(invoice.dateDisplay)}</p>
+      ${customer ? `<p>العميل: ${escapeHtml(customer.name)}${customer.phone ? ' — ' + escapeHtml(customer.phone) : ''}</p>` : ''}
       <table class="receipt-table">
         <thead><tr><th>المنتج</th><th>النوع</th><th>الكمية</th><th>السعر</th><th>الإجمالي</th></tr></thead>
         <tbody>
@@ -237,7 +238,7 @@ async function renderInvoicesScreen() {
   container.innerHTML = `
     <h2 class="screen-title">الفواتير</h2>
     <div class="toolbar">
-      <input type="search" id="invoice-search" class="toolbar-search" placeholder="ابحث برقم الفاتورة...">
+      <input type="search" id="invoice-search" class="toolbar-search" placeholder="ابحث برقم الفاتورة أو اسم العميل...">
       <label class="toolbar-inline"><span>من</span><input type="date" id="invoice-date-from"></label>
       <label class="toolbar-inline"><span>إلى</span><input type="date" id="invoice-date-to"></label>
       <select id="invoice-status-filter" class="toolbar-select">
@@ -246,12 +247,14 @@ async function renderInvoicesScreen() {
         <option value="unpaid">غير مدفوع</option>
         <option value="partial">مدفوع جزئيًا</option>
       </select>
+      <div class="toolbar-spacer"></div>
+      <button type="button" id="btn-export-invoices" class="btn btn-secondary">تصدير Excel</button>
     </div>
     <div class="table-wrap">
       <table class="data-table">
         <thead>
           <tr>
-            <th>رقم الفاتورة</th><th>التاريخ</th><th>نوع البيع</th>
+            <th>رقم الفاتورة</th><th>التاريخ</th><th>العميل</th><th>نوع البيع</th>
             <th>قيمة المنتجات</th><th>الرسوم</th><th>الإجمالي</th><th>حالة الدفع</th><th>إجراءات</th>
           </tr>
         </thead>
@@ -282,8 +285,39 @@ async function renderInvoicesScreen() {
     invoicesScreenState.paymentStatusFilter = e.target.value;
     renderInvoicesTableBody();
   });
+  document.getElementById('btn-export-invoices').addEventListener('click', async () => {
+    try {
+      await exportVisibleInvoicesToExcel();
+      UI.success('تم تصدير ملف الفواتير بنجاح.');
+    } catch (err) {
+      UI.error(friendlyError('تعذر تصدير الملف. يرجى المحاولة مرة أخرى.', err));
+    }
+  });
 
   await renderInvoicesTableBody();
+}
+
+/** Builds the id → customer map once per render, and a "بدون عميل" fallback for invoices with no customer attached. */
+async function buildCustomerLookup() {
+  const customers = await listAllCustomers();
+  const byId = new Map(customers.map((c) => [c.id, c]));
+  return byId;
+}
+
+function getFilteredInvoices(invoices, itemsByInvoice, customersById) {
+  const search = invoicesScreenState.search.trim().toLowerCase();
+  return invoices.filter((inv) => {
+    if (search) {
+      const customerName = inv.customerId ? (customersById.get(inv.customerId)?.name || '') : '';
+      const matchesNumber = inv.invoiceNumber.toLowerCase().includes(search);
+      const matchesCustomer = customerName.toLowerCase().includes(search);
+      if (!matchesNumber && !matchesCustomer) return false;
+    }
+    if (invoicesScreenState.dateFrom && inv.date < invoicesScreenState.dateFrom) return false;
+    if (invoicesScreenState.dateTo && inv.date > invoicesScreenState.dateTo) return false;
+    if (invoicesScreenState.paymentStatusFilter !== 'all' && inv.paymentStatus !== invoicesScreenState.paymentStatusFilter) return false;
+    return true;
+  }).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 }
 
 async function renderInvoicesTableBody() {
@@ -292,18 +326,11 @@ async function renderInvoicesTableBody() {
   if (!tbody) return;
 
   const settings = await getSettings();
-  const [invoices, itemsByInvoice] = await Promise.all([listAllInvoices(), groupAllInvoiceItemsByInvoiceId()]);
+  const [invoices, itemsByInvoice, customersById] = await Promise.all([
+    listAllInvoices(), groupAllInvoiceItemsByInvoiceId(), buildCustomerLookup(),
+  ]);
 
-  const search = invoicesScreenState.search.trim().toLowerCase();
-  const filtered = invoices.filter((inv) => {
-    if (search && !inv.invoiceNumber.toLowerCase().includes(search)) return false;
-    if (invoicesScreenState.dateFrom && inv.date < invoicesScreenState.dateFrom) return false;
-    if (invoicesScreenState.dateTo && inv.date > invoicesScreenState.dateTo) return false;
-    if (invoicesScreenState.paymentStatusFilter !== 'all' && inv.paymentStatus !== invoicesScreenState.paymentStatusFilter) return false;
-    return true;
-  });
-
-  filtered.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  const filtered = getFilteredInvoices(invoices, itemsByInvoice, customersById);
 
   if (filtered.length === 0) {
     tbody.innerHTML = '';
@@ -314,10 +341,12 @@ async function renderInvoicesTableBody() {
 
   tbody.innerHTML = filtered.map((inv) => {
     const items = itemsByInvoice.get(inv.id) || [];
+    const customer = inv.customerId ? customersById.get(inv.customerId) : null;
     return `
       <tr>
         <td>${escapeHtml(inv.invoiceNumber)}</td>
         <td>${escapeHtml(inv.date)}</td>
+        <td>${customer ? escapeHtml(customer.name) : '—'}</td>
         <td>${invoiceSaleTypeSummary(items)}</td>
         <td>${formatCurrency(inv.subtotalHalalas, settings.currencySymbol)}</td>
         <td>${formatCurrency(inv.feePercentHalalas + inv.feeFixedHalalas, settings.currencySymbol)}</td>
@@ -338,9 +367,35 @@ async function renderInvoicesTableBody() {
     btn.addEventListener('click', async () => {
       const invoice = invoices.find((i) => i.id === Number(btn.dataset.id));
       const items = itemsByInvoice.get(invoice.id) || [];
-      printReceipt(renderInvoiceReceiptHtml(invoiceToReceiptData(invoice), items, settings));
+      const customer = invoice.customerId ? customersById.get(invoice.customerId) : null;
+      printReceipt(renderInvoiceReceiptHtml(invoiceToReceiptData(invoice), items, settings, customer));
     });
   });
+}
+
+/** Exports whatever the current search/date/status filters are showing — "export what I'm looking at". */
+async function exportVisibleInvoicesToExcel() {
+  const settings = await getSettings();
+  const [invoices, itemsByInvoice, customersById] = await Promise.all([
+    listAllInvoices(), groupAllInvoiceItemsByInvoiceId(), buildCustomerLookup(),
+  ]);
+  const filtered = getFilteredInvoices(invoices, itemsByInvoice, customersById);
+
+  const headers = ['رقم الفاتورة', 'التاريخ', 'العميل', 'نوع البيع', 'قيمة المنتجات', 'رسوم النسبة', 'الرسم الثابت', 'الإجمالي', 'طريقة الدفع', 'حالة الدفع', 'المدفوع', 'المتبقي', 'ملاحظات'];
+  const rows = filtered.map((inv) => {
+    const items = itemsByInvoice.get(inv.id) || [];
+    const customer = inv.customerId ? customersById.get(inv.customerId) : null;
+    return [
+      inv.invoiceNumber, inv.date, customer ? customer.name : '',
+      invoiceSaleTypeSummary(items),
+      halalasToSar(inv.subtotalHalalas), halalasToSar(inv.feePercentHalalas), halalasToSar(inv.feeFixedHalalas),
+      halalasToSar(inv.grandTotalHalalas), PAYMENT_METHOD_LABELS[inv.paymentMethod] || inv.paymentMethod,
+      PAYMENT_STATUS_LABELS[inv.paymentStatus] || inv.paymentStatus,
+      halalasToSar(inv.paidAmountHalalas), halalasToSar(inv.remainingAmountHalalas), inv.notes,
+    ];
+  });
+
+  exportRowsToExcel(`الفواتير_${formatDateForStorage()}.xlsx`, 'الفواتير', headers, rows);
 }
 
 // ---- Rendering: invoice detail modal (reopen / reprint) --------------------------
@@ -356,7 +411,8 @@ async function openInvoiceDetailModal(invoiceId) {
     return;
   }
 
-  const receiptHtml = renderInvoiceReceiptHtml(invoiceToReceiptData(invoice), items, settings);
+  const customer = invoice.customerId ? await getCustomerById(invoice.customerId) : null;
+  const receiptHtml = renderInvoiceReceiptHtml(invoiceToReceiptData(invoice), items, settings, customer);
 
   UI.showModal(`
     <div class="modal modal-wide">
