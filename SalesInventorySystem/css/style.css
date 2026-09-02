@@ -388,6 +388,10 @@ body {
   font-family: inherit;
 }
 
+.report-summary-grid {
+  margin-bottom: 18px;
+}
+
 .profit-summary-title {
   margin-top: 26px;
 }
