@@ -106,6 +106,7 @@ async function createInvoice(cartItems, meta, settings) {
 
       const invoiceItemsStore = tx.objectStore('invoiceItems');
       for (const item of cartItems) {
+        const unitCostHalalas = item.unitCostHalalas || 0;
         invoiceItemsStore.add({
           invoiceId,
           productId: item.productId,
@@ -116,6 +117,10 @@ async function createInvoice(cartItems, meta, settings) {
           unitPriceHalalas: item.unitPriceHalalas,
           lineTotalHalalas: item.lineTotalHalalas,
           unitsPerLine: item.unitsPerLine,
+          // Cost snapshot at sale time (per base unit, and for the whole line) — so a later
+          // change to the product's purchase cost never alters a past invoice's profit.
+          unitCostHalalas,
+          lineCostHalalas: unitCostHalalas * item.unitsPerLine,
         });
       }
 

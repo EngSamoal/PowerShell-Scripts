@@ -8,39 +8,56 @@
  * and testable from day one.
  */
 
-const READY_SCREENS = new Set(['dashboard', 'settings', 'products', 'new-sale', 'invoices', 'customers']);
+const READY_SCREENS = new Set(['dashboard', 'settings', 'products', 'new-sale', 'invoices', 'customers', 'expenses']);
 
 async function renderDashboardScreen() {
   const container = document.getElementById('screen-dashboard');
   const settings = await getSettings();
 
+  const today = formatDateForStorage();
+  const monthStart = `${today.slice(0, 7)}-01`;
+
+  const [invoices, products, monthProfit] = await Promise.all([
+    listAllInvoices(),
+    listAllProducts(),
+    computeProfitSummary(monthStart, today),
+  ]);
+
+  const completedInvoices = invoices.filter((inv) => inv.status === 'completed');
+  const todaysInvoices = completedInvoices.filter((inv) => inv.date === today);
+  const salesToday = todaysInvoices.reduce((sum, inv) => sum + inv.grandTotalHalalas, 0);
+  const salesMonth = completedInvoices
+    .filter((inv) => inv.date >= monthStart && inv.date <= today)
+    .reduce((sum, inv) => sum + inv.grandTotalHalalas, 0);
+  const unpaidTotal = completedInvoices.reduce((sum, inv) => sum + inv.remainingAmountHalalas, 0);
+  const lowStockCount = products.filter((p) => p.status === 'active' && p.totalUnits <= p.minStockUnits).length;
+
   container.innerHTML = `
     <h2 class="screen-title">الرئيسية</h2>
-    <p class="screen-hint">حساب هذه الأرقام تلقائيًا من المبيعات الفعلية سيُضاف في مرحلة لاحقة من المشروع.</p>
     <div class="dashboard-grid">
       <div class="stat-card">
         <span class="stat-label">مبيعات اليوم</span>
-        <span class="stat-value">0.00 ${settings.currencySymbol}</span>
+        <span class="stat-value">${formatCurrency(salesToday, settings.currencySymbol)}</span>
       </div>
       <div class="stat-card">
         <span class="stat-label">مبيعات الشهر</span>
-        <span class="stat-value">0.00 ${settings.currencySymbol}</span>
+        <span class="stat-value">${formatCurrency(salesMonth, settings.currencySymbol)}</span>
       </div>
       <div class="stat-card">
         <span class="stat-label">عدد الفواتير اليوم</span>
-        <span class="stat-value">0</span>
+        <span class="stat-value">${todaysInvoices.length}</span>
       </div>
       <div class="stat-card">
-        <span class="stat-label">الربح</span>
-        <span class="stat-value">0.00 ${settings.currencySymbol}</span>
+        <span class="stat-label">الربح الصافي (هذا الشهر)</span>
+        <span class="stat-value">${formatCurrency(monthProfit.netProfitHalalas, settings.currencySymbol)}</span>
       </div>
       <div class="stat-card">
         <span class="stat-label">مبالغ غير مدفوعة</span>
-        <span class="stat-value">0.00 ${settings.currencySymbol}</span>
+        <span class="stat-value">${formatCurrency(unpaidTotal, settings.currencySymbol)}</span>
       </div>
       <div class="stat-card">
         <span class="stat-label">منتجات منخفضة المخزون</span>
-        <span class="stat-value">0</span>
+        <span class="stat-value">${lowStockCount}</span>
       </div>
     </div>
   `;
@@ -65,6 +82,7 @@ async function showScreenById(screenId) {
     if (screenId === 'new-sale') await renderNewSaleScreen();
     if (screenId === 'invoices') await renderInvoicesScreen();
     if (screenId === 'customers') await renderCustomersScreen();
+    if (screenId === 'expenses') await renderExpensesScreen();
     UI.showScreen(`screen-${screenId}`);
   } catch (err) {
     UI.error(friendlyError('تعذر فتح هذه الشاشة. يرجى المحاولة مرة أخرى.', err));
@@ -85,7 +103,6 @@ async function initApp() {
     wireNavigation();
 
     const placeholders = [
-      ['screen-expenses', 'المصروفات'],
       ['screen-reports', 'التقارير'],
       ['screen-backup', 'النسخ الاحتياطي'],
     ];

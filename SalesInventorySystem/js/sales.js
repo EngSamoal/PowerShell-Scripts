@@ -271,6 +271,7 @@ function addLineToCart(activeProducts, settings) {
     unitPriceHalalas: price,
     lineTotalHalalas: price * qty,
     unitsPerLine,
+    unitCostHalalas: product.unitCostHalalas,
   });
 
   qtyInput.value = 1;
