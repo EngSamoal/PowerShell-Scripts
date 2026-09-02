@@ -1,14 +1,7 @@
 /**
  * app.js — application entry point: opens the database, wires up
  * navigation, and renders the initial screen.
- *
- * Phase 1 only implements "الرئيسية" (a placeholder) and "الإعدادات"
- * (fully working). Other menu items show a "قيد التطوير" placeholder
- * until their phase is built, so the whole navigation shell is usable
- * and testable from day one.
  */
-
-const READY_SCREENS = new Set(['dashboard', 'settings', 'products', 'new-sale', 'invoices', 'customers', 'expenses', 'reports']);
 
 async function renderDashboardScreen() {
   const container = document.getElementById('screen-dashboard');
@@ -63,17 +56,6 @@ async function renderDashboardScreen() {
   `;
 }
 
-function renderPlaceholderScreen(screenId, title) {
-  const container = document.getElementById(screenId);
-  if (!container) return;
-  container.innerHTML = `
-    <h2 class="screen-title">${title}</h2>
-    <div class="placeholder-box">
-      <p>هذه الشاشة قيد التطوير وستُضاف في مرحلة لاحقة من المشروع.</p>
-    </div>
-  `;
-}
-
 async function showScreenById(screenId) {
   try {
     if (screenId === 'dashboard') await renderDashboardScreen();
@@ -84,6 +66,7 @@ async function showScreenById(screenId) {
     if (screenId === 'customers') await renderCustomersScreen();
     if (screenId === 'expenses') await renderExpensesScreen();
     if (screenId === 'reports') await renderReportsScreen();
+    if (screenId === 'backup') await renderBackupScreen();
     UI.showScreen(`screen-${screenId}`);
   } catch (err) {
     UI.error(friendlyError('تعذر فتح هذه الشاشة. يرجى المحاولة مرة أخرى.', err));
@@ -102,11 +85,6 @@ async function initApp() {
   try {
     await openDatabase();
     wireNavigation();
-
-    const placeholders = [
-      ['screen-backup', 'النسخ الاحتياطي'],
-    ];
-    placeholders.forEach(([id, title]) => renderPlaceholderScreen(id, title));
 
     await showScreenById('dashboard');
   } catch (err) {

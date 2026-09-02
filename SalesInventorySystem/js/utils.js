@@ -54,7 +54,10 @@ function formatDateForStorage(date) {
 /** Formats a Date as a readable Arabic-friendly date + time string. */
 function formatDateTimeForDisplay(date) {
   const d = date || new Date();
-  return d.toLocaleString('ar-SA', {
+  // "ar-SA" alone defaults to the Hijri calendar in Chrome, which would show a
+  // different year than the Gregorian one already used in invoice numbers
+  // (INV-2026-...) and date storage — force Gregorian explicitly.
+  return d.toLocaleString('ar-SA-u-ca-gregory', {
     year: 'numeric',
     month: '2-digit',
     day: '2-digit',

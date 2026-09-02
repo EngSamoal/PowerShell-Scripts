@@ -388,6 +388,14 @@ body {
   font-family: inherit;
 }
 
+.backup-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  max-width: 360px;
+  margin-top: 20px;
+}
+
 .report-summary-grid {
   margin-bottom: 18px;
 }
