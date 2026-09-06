@@ -129,6 +129,7 @@ $ColumnAliases = [ordered]@{
     StartDate      = @('Start Patching Date', 'Patching Date', 'Patch Date', 'Start Date', 'Scheduled Date', 'Patching Start Date', 'Completion Date', 'Date', 'Activity Date', 'Maintenance Date')
     Status         = @('Patching Status', 'Patch Status', 'Status', 'Result', 'Outcome', 'State', 'Compliance Status', 'Patch State', 'Activity Status')
     Remarks        = @('Issues in the source excel sheet', 'Issue', 'Issues', 'Remarks', 'Remark', 'Comments', 'Comment', 'Notes', 'Note', 'Reason', 'Root Cause', 'RootCause', 'Failure Reason', 'FailureReason', 'Error', 'Error Details', 'Details', 'Description', 'Observation', 'Findings', 'Justification')
+    Excluded       = @('Excluded', 'Exclude', 'Exclusion', 'Excluded by Management', 'Management Decision', 'Descoped', 'Out of Scope', 'Exempted', 'Exception')
 }
 
 # Fields that MUST be present for the script to run.
@@ -153,6 +154,9 @@ $SiteNameMap = @{
     'HA'  = 'SEVEN Alhamra'
 }
 
+# Text shown directly under the report title.  -EngineerName overrides it.
+$ImplementedBy = 'Asset IT Operations'
+
 # ======================================================================
 # 2. STATUS NORMALISATION  --  adjust the keyword lists if needed
 # ----------------------------------------------------------------------
@@ -166,8 +170,9 @@ $SiteNameMap = @{
 # ======================================================================
 $StatusKeywords = @{
     Failed    = @('failed', 'fail', 'failure', 'error', 'errored', 'unsuccessful', 'aborted', 'rollback', 'rolledback', 'cancelled', 'canceled')
+    Excluded  = @('excluded', 'exclude', 'exclusion', 'exempt', 'exempted', 'exemption', 'descoped', 'descope', 'outofscope', 'notinscope', 'removedfromscope', 'waived', 'waiver', 'perManagement', 'managementexclusion')
     Completed = @('completed', 'complete', 'done', 'success', 'successful', 'successfullypatched', 'patchedsuccessfully', 'patched', 'patchingcompleted', 'installed', 'applied', 'closed', 'resolved', 'compliant', 'uptodate', 'fullypatched', 'ok', 'pass', 'passed', 'green')
-    Pending   = @('pending', 'notstarted', 'yettostart', 'tobestarted', 'tobedone', 'scheduled', 'planned', 'inprogress', 'wip', 'workinprogress', 'ongoing', 'incomplete', 'partiallycompleted', 'partial', 'onhold', 'hold', 'deferred', 'postponed', 'rescheduled', 'excluded', 'skipped', 'queued', 'inqueue', 'open', 'new', 'rebootpending', 'pendingreboot', 'amber', 'yellow')
+    Pending   = @('pending', 'notstarted', 'yettostart', 'tobestarted', 'tobedone', 'scheduled', 'planned', 'inprogress', 'wip', 'workinprogress', 'ongoing', 'incomplete', 'partiallycompleted', 'partial', 'onhold', 'hold', 'deferred', 'postponed', 'rescheduled', 'skipped', 'queued', 'inqueue', 'open', 'new', 'rebootpending', 'pendingreboot', 'amber', 'yellow')
 }
 
 # ======================================================================
@@ -267,6 +272,7 @@ function Get-StatusBucket {
     param([string]$Raw)
     $n = Get-NormalKey $Raw
     if ($n -eq '') { return 'Unknown' }
+    foreach ($kw in $StatusKeywords.Excluded)  { if ($n.Contains($kw)) { return 'Excluded' } }
     if ($n -match 'not(completed|complete|done|patched|installed|applied|started|successful)') { return 'Pending' }
     foreach ($kw in $StatusKeywords.Failed)    { if ($n.Contains($kw)) { return 'Failed' } }
     foreach ($kw in $StatusKeywords.Completed) { if ($n.Contains($kw)) { return 'Completed' } }
@@ -372,7 +378,7 @@ function Get-OsFamily {
 }
 
 function Get-DonutSvg {
-    param([int]$Completed, [int]$Pending, [int]$Failed, [int]$Unknown, [int]$Total)
+    param([int]$Completed, [int]$Pending, [int]$Failed, [int]$Unknown, [int]$Excluded, [int]$Total)
     $P = $Palette
     $cx = 100; $cy = 100; $rr = 80
     $circ = [math]::Round(2 * [math]::PI * $rr, 3)
@@ -380,7 +386,8 @@ function Get-DonutSvg {
         @{ v = $Completed; c = $P.Green },
         @{ v = $Pending;   c = $P.Amber },
         @{ v = $Failed;    c = $P.Red },
-        @{ v = $Unknown;   c = $P.Grey }
+        @{ v = $Excluded;  c = $P.Grey },
+        @{ v = $Unknown;   c = '#B0B7C0' }
     ) | Where-Object { $_.v -gt 0 }
     $segs = ''
     $acc = 0.0
@@ -395,7 +402,7 @@ function Get-DonutSvg {
     } else {
         $segs = "      <circle cx='$cx' cy='$cy' r='$rr' fill='none' stroke='$($P.Line)' stroke-width='34'></circle>`n"
     }
-    return "<svg viewBox='0 0 200 200' width='230' height='230' role='img' aria-label='Patching status donut'>`n$segs      <text x='100' y='94' text-anchor='middle' font-size='30' font-weight='800' fill='#1F2933'>$Total</text>`n      <text x='100' y='118' text-anchor='middle' font-size='12' fill='#6B7683'>VMs</text>`n    </svg>"
+    return "<svg viewBox='0 0 200 200' width='300' height='300' role='img' aria-label='Patching status donut'>`n$segs      <text x='100' y='92' text-anchor='middle' font-size='32' font-weight='800' fill='#1F2933'>$Total</text>`n      <text x='100' y='116' text-anchor='middle' font-size='11' fill='#6B7683'>VMs</text>`n    </svg>"
 }
 
 # ======================================================================
@@ -415,37 +422,51 @@ function Build-DashboardHtml {
     $blocksHtml = ''
     foreach ($b in $Ctx.Blocks) {
         $total = [int]$b.Total; $completed = [int]$b.Completed; $failed = [int]$b.Failed
-        $pending = [int]$b.Pending; $unknown = [int]$b.Unknown
+        $pending = [int]$b.Pending; $unknown = [int]$b.Unknown; $excluded = [int]$b.Excluded
         $sCls = $b.StatusClass
         $sTxt = ConvertTo-HtmlSafe $b.StatusText
         $sCol = switch ($sCls) { 'good' { $P.Green } 'warn' { $P.Amber } default { $P.Red } }
         $famU = ([string]$b.Family).ToUpperInvariant()
         $pendLbl = if ($unknown -gt 0) { "incl. $unknown unknown" } else { 'Not started / in progress' }
-        $donut = Get-DonutSvg -Completed $completed -Pending $pending -Failed $failed -Unknown $unknown -Total $total
+        $donut = Get-DonutSvg -Completed $completed -Pending $pending -Failed $failed -Unknown $unknown -Excluded $excluded -Total $total
+        $exclLegend = if ($excluded -gt 0) { "`n            <span><i style=""background:$($P.Grey)""></i>Excluded <b>$excluded</b></span>" } else { '' }
 
-        # -- completed VMs : VM Name | Patching Date | Implementer --
+        # -- completed VMs : scrollable table  VM Name | Patching Date --
         $doneRows = ''
-        foreach ($v in $b.CompletedVMs) {
-            $d = if ($v.Date -is [datetime]) { $v.Date.ToString('yyyy-MM-dd') } else { '&ndash;' }
-            $doneRows += "              <tr><td>$([string](ConvertTo-HtmlSafe $v.HostName))</td><td>$d</td><td>$([string](ConvertTo-HtmlSafe $v.Engineer))</td></tr>`n"
+        foreach ($v in ($b.CompletedVMs | Sort-Object HostName)) {
+            $d = if ($v.Date -is [datetime]) { $v.Date.ToString('yyyy-MM-dd') } else { 'NA' }
+            $doneRows += "            <tr><td>$([string](ConvertTo-HtmlSafe $v.HostName))</td><td>$d</td></tr>`n"
         }
-        if (-not $doneRows) { $doneRows = "              <tr><td colspan='3' class='muted'>No completed VMs.</td></tr>`n" }
+        if ($doneRows) {
+            $doneSection = @"
+        <p class="mini-cap">Completed VMs ($completed)</p>
+        <div class="scroll-wrap">
+          <table class="lst"><thead><tr><th>VM Name</th><th>Patching Date</th></tr></thead>
+          <tbody>
+$doneRows          </tbody></table>
+        </div>
+"@
+        } else {
+            $doneSection = '        <div class="muted">No completed VMs.</div>'
+        }
 
-        # -- pending VMs : VM Name | Implementer --
+        # -- pending / not-started VMs : scrollable table  VM Name  ("NA" when none) --
         $pendRows = ''
-        foreach ($v in $b.PendingVMs) {
-            $pendRows += "          <tr><td>$([string](ConvertTo-HtmlSafe $v.HostName))</td><td>$([string](ConvertTo-HtmlSafe $v.Engineer))</td></tr>`n"
+        foreach ($v in ($b.PendingVMs | Sort-Object HostName)) {
+            $pendRows += "          <tr><td>$([string](ConvertTo-HtmlSafe $v.HostName))</td></tr>`n"
         }
         if ($pendRows) {
+            $pendCount = $b.PendingVMs.Count
             $pendSection = @"
-      <div class="mini-wrap">
-        <table class="mini"><thead><tr><th>VM Name</th><th>Implementer</th></tr></thead>
+      <p class="mini-cap">$pendCount VM(s)</p>
+      <div class="scroll-wrap">
+        <table class="lst"><thead><tr><th>VM Name</th></tr></thead>
         <tbody>
 $pendRows        </tbody></table>
       </div>
 "@
         } else {
-            $pendSection = '      <div class="all-clear">&#10004;&nbsp; No Pending / Not Started VMs</div>'
+            $pendSection = '      <div class="na-box">NA</div>'
         }
 
         # -- OS breakdown bars --
@@ -474,11 +495,11 @@ $pendRows        </tbody></table>
                     $issue = '<span class="muted">Not specified in sheet</span>'
                 }
             }
-            $exRows += "            <tr><td>$([string](ConvertTo-HtmlSafe $e.HostName))</td><td>$([string](ConvertTo-HtmlSafe $e.IP))</td><td>$([string](ConvertTo-HtmlSafe $e.OS))</td><td>$([string](ConvertTo-HtmlSafe $e.TechOwner))</td><td>$([string](ConvertTo-HtmlSafe $e.Engineer))</td><td><span class=""badge b-red"">Failed</span></td><td>$issue</td></tr>`n"
+            $exRows += "            <tr><td>$([string](ConvertTo-HtmlSafe $e.HostName))</td><td>$([string](ConvertTo-HtmlSafe $e.IP))</td><td>$([string](ConvertTo-HtmlSafe $e.OS))</td><td>$([string](ConvertTo-HtmlSafe $e.TechOwner))</td><td><span class=""badge b-red"">Failed</span></td><td>$issue</td></tr>`n"
         }
         if ($exRows) {
             $exSection = @"
-      <table class="ex-table"><thead><tr><th>HostName</th><th>IP Address</th><th>OS</th><th>Technical Owner</th><th>Engineer</th><th>Status</th><th>Issues in the source Excel sheet</th></tr></thead>
+      <table class="ex-table"><thead><tr><th>HostName</th><th>IP Address</th><th>OS</th><th>Technical Owner</th><th>Status</th><th>Issue</th></tr></thead>
         <tbody>
 $exRows        </tbody></table>
 "@
@@ -503,30 +524,27 @@ $exRows        </tbody></table>
       <div class="kpi-card"><div class="kpi-accent" style="background:$($P.Amber)"></div>
         <div class="kpi-label">Pending</div><div class="kpi-value" style="color:$($P.Amber)">$pending</div>
         <div class="kpi-sub">$pendLbl</div></div>
+      <div class="kpi-card"><div class="kpi-accent" style="background:$($P.Grey)"></div>
+        <div class="kpi-label">Excluded</div><div class="kpi-value" style="color:$($P.Grey)">$excluded</div>
+        <div class="kpi-sub">Excluded as per management</div></div>
       <div class="kpi-card"><div class="kpi-accent" style="background:$sCol"></div>
         <div class="kpi-label">Overall Status</div><div class="kpi-status $sCls">$sTxt</div>
-        <div class="kpi-sub">Completed vs. failed / pending</div></div>
+        <div class="kpi-sub">On in-scope VMs (Total &minus; Excluded)</div></div>
     </div>
 
     <div class="panel">
       <h2>Patching Status Overview</h2>
-      <div class="charts">
-        <div class="chart-box">
+      <div class="so-grid">
+        <div class="donut-box">
     $donut
           <div class="legend">
             <span><i style="background:$($P.Green)"></i>Completed <b>$completed</b></span>
             <span><i style="background:$($P.Amber)"></i>Pending <b>$pending</b></span>
-            <span><i style="background:$($P.Red)"></i>Failed <b>$failed</b></span>
+            <span><i style="background:$($P.Red)"></i>Failed <b>$failed</b></span>$exclLegend
           </div>
         </div>
-        <div class="list-box">
-          <p class="mini-cap">Completed VMs ($completed)</p>
-          <div class="mini-wrap">
-            <table class="mini"><thead><tr><th>VM Name</th><th>Patching Date</th><th>Implementer</th></tr></thead>
-            <tbody>
-$doneRows            </tbody></table>
-          </div>
-        </div>
+        <div class="done-box">
+$doneSection        </div>
       </div>
     </div>
 
@@ -576,7 +594,7 @@ $css = @'
   .os-band{font-size:30px;font-weight:800;letter-spacing:2px;text-transform:uppercase;color:#0F2A43;
        margin:40px 0 6px;padding-bottom:8px;border-bottom:3px solid #1D4E79;}
   .os-block:first-of-type .os-band{margin-top:14px;}
-  .kpi{display:grid;grid-template-columns:repeat(5,1fr);gap:16px;margin:14px 0 10px;}
+  .kpi{display:grid;grid-template-columns:repeat(6,1fr);gap:14px;margin:14px 0 10px;}
   .kpi-card{position:relative;background:#fff;border:1px solid var(--line);border-radius:12px;
        padding:18px 16px 16px;overflow:hidden;box-shadow:0 2px 6px rgba(31,41,51,.04);}
   .kpi-accent{position:absolute;top:0;left:0;right:0;height:5px;}
@@ -588,18 +606,20 @@ $css = @'
   .panel{background:#fff;border:1px solid var(--line);border-radius:12px;padding:20px 22px;margin-top:18px;
        box-shadow:0 2px 6px rgba(31,41,51,.04);}
   h2{font-size:15px;text-transform:uppercase;letter-spacing:.7px;margin:0 0 16px;color:#334155;}
-  .charts{display:grid;grid-template-columns:260px 1fr;gap:24px;align-items:start;}
-  .chart-box{display:flex;flex-direction:column;align-items:center;}
-  .list-box{display:flex;flex-direction:column;min-width:0;}
-  .legend{display:flex;flex-wrap:wrap;gap:10px 16px;margin-top:14px;font-size:12.5px;justify-content:center;}
+  .so-grid{display:grid;grid-template-columns:330px 1fr;gap:28px;align-items:start;}
+  .donut-box{display:flex;flex-direction:column;align-items:center;}
+  .done-box{display:flex;flex-direction:column;min-width:0;}
+  .legend{display:flex;flex-wrap:wrap;gap:10px 18px;margin-top:14px;font-size:13px;justify-content:center;}
   .legend i{display:inline-block;width:12px;height:12px;border-radius:3px;margin-right:6px;vertical-align:middle;}
   .legend b{margin-left:4px;}
-  .mini-cap{font-size:11.5px;font-weight:700;text-transform:uppercase;letter-spacing:.4px;color:var(--muted);margin:0 0 8px;}
-  .mini-wrap{max-height:360px;overflow-y:auto;border:1px solid var(--line);border-radius:8px;}
-  table.mini{width:100%;border-collapse:collapse;font-size:12px;}
-  .mini th{position:sticky;top:0;background:#EEF2F7;color:#334155;text-align:left;padding:7px 10px;font-weight:700;}
-  .mini td{padding:5px 10px;border-bottom:1px solid var(--line);}
-  .mini tr:nth-child(even){background:#FAFBFD;}
+  .mini-cap{font-size:11.5px;font-weight:700;text-transform:uppercase;letter-spacing:.4px;color:var(--muted);margin:0 0 10px;}
+  .scroll-wrap{max-height:300px;overflow-y:auto;border:1px solid var(--line);border-radius:8px;}
+  table.lst{width:100%;border-collapse:collapse;font-size:12px;}
+  .lst th{position:sticky;top:0;background:#EEF2F7;color:#334155;text-align:left;padding:7px 10px;font-weight:700;}
+  .lst td{padding:5px 10px;border-bottom:1px solid var(--line);white-space:nowrap;}
+  .lst tr:nth-child(even){background:#FAFBFD;}
+  .na-box{background:#F4F6F9;border:1px solid var(--line);color:var(--muted);font-weight:800;font-size:15px;
+       letter-spacing:1px;padding:16px;border-radius:10px;text-align:center;}
   .os-row{display:grid;grid-template-columns:230px 1fr 46px;align-items:center;gap:12px;margin-bottom:9px;font-size:13px;}
   .os-name{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#334155;}
   .os-bar{background:#EEF2F7;border-radius:6px;height:16px;overflow:hidden;}
@@ -618,16 +638,16 @@ $css = @'
   .dq{margin-top:10px;} .dq summary{cursor:pointer;font-weight:700;color:#C77700;}
   .dq ul{margin:10px 0 0;padding-left:20px;} .dq li{margin-bottom:4px;}
   .dq-clean{margin-top:10px;color:#1F8A4C;font-size:13px;font-weight:600;}
-  @media (max-width:960px){.kpi{grid-template-columns:repeat(2,1fr);}.charts{grid-template-columns:1fr;}
+  @media (max-width:960px){.kpi{grid-template-columns:repeat(3,1fr);}.so-grid{grid-template-columns:1fr;}
        .report-h1{font-size:26px;}.os-row{grid-template-columns:140px 1fr 40px;}}
   @media print{
      body{background:#fff;}
      .wrap{max-width:100%;padding:0;}
      header.hero,.kpi-card,.panel{box-shadow:none;}
      header.hero{-webkit-print-color-adjust:exact;print-color-adjust:exact;}
-     .panel,.kpi-card,.ex-table tr,.mini tr{page-break-inside:avoid;}
+     .panel,.kpi-card,.ex-table tr,.lst tr{page-break-inside:avoid;}
      .os-block + .os-block{page-break-before:always;}
-     .mini-wrap{max-height:none;overflow:visible;}
+     .scroll-wrap{max-height:none;overflow:visible;}
      *{-webkit-print-color-adjust:exact;print-color-adjust:exact;}
   }
 '@
@@ -648,7 +668,7 @@ $css
 
   <header class="hero">
     <h1 class="report-h1">$safeTitle</h1>
-    <p class="engineer">Implemented by: <b>$safeEng</b></p>
+    <p class="engineer"><b>$safeEng</b></p>
     <p class="report-month">$safeMon</p>
   </header>
 
@@ -796,6 +816,7 @@ try {
         $to = ConvertTo-Text (Get-Prop $row $cols.TechnicalOwner)
         $en = ConvertTo-Text (Get-Prop $row $cols.Engineer)
         $rm = ConvertTo-Text (Get-Prop $row $cols.Remarks)
+        $xc = ConvertTo-Text (Get-Prop $row $cols.Excluded)
         $sr = Resolve-SiteName (ConvertTo-Text (Get-Prop $row $cols.SiteName))
         $dr = Get-Prop $row $cols.StartDate
 
@@ -805,6 +826,9 @@ try {
         if ($h -eq '') { $noHost++; $dq.Add("Row $rowNo has no HostName (status '$st').") ; $h = '(missing hostname)' }
 
         $bucket = Get-StatusBucket $st
+        # an explicit "Excluded" column (truthy value) overrides the status bucket
+        $xk = Get-NormalKey $xc
+        if ($xk -in @('y', 'yes', 'true', '1', 'x', 'excluded', 'exclude', 'exempt', 'exempted', 'outofscope', 'descoped', 'notinscope', 'permanagement')) { $bucket = 'Excluded' }
         if ($bucket -eq 'Unknown') {
             $unknownStatus++
             if ($st -ne '') { $dq.Add("Row $rowNo - unrecognised status '$st' (not counted as completed).") }
@@ -930,9 +954,11 @@ try {
         $failed    = @($recs | Where-Object { $_.Bucket -eq 'Failed'    }).Count
         $pending   = @($recs | Where-Object { $_.Bucket -eq 'Pending'   }).Count
         $unknown   = @($recs | Where-Object { $_.Bucket -eq 'Unknown'   }).Count
-        $compliance = if ($total -gt 0) { [math]::Round(100.0 * $completed / $total, 1) } else { 0 }
+        $excluded  = @($recs | Where-Object { $_.Bucket -eq 'Excluded'  }).Count
+        $inScope   = $total - $excluded
+        $compliance = if ($inScope -gt 0) { [math]::Round(100.0 * $completed / $inScope, 1) } else { 0 }
 
-        if     ($total -eq 0)                          { $sTxt = 'No Data';                     $sCls = 'bad' }
+        if     ($inScope -eq 0)                        { $sTxt = 'No In-Scope VMs';             $sCls = 'warn' }
         elseif ($failed -gt 0 -or $unknown -gt 0)      { $sTxt = 'Attention Required';          $sCls = 'bad' }
         elseif ($compliance -ge 100)                   { $sTxt = 'Fully Compliant';             $sCls = 'good' }
         elseif ($compliance -ge $ComplianceThreshold)  { $sTxt = 'On Track - Minor Exceptions'; $sCls = 'warn' }
@@ -950,9 +976,11 @@ try {
             $fFailed    = @($fr | Where-Object { $_.Bucket -eq 'Failed'    }).Count
             $fPending   = @($fr | Where-Object { $_.Bucket -eq 'Pending'   }).Count
             $fUnknown   = @($fr | Where-Object { $_.Bucket -eq 'Unknown'   }).Count
-            $fComp      = if ($fTotal -gt 0) { [math]::Round(100.0 * $fCompleted / $fTotal, 1) } else { 0 }
+            $fExcluded  = @($fr | Where-Object { $_.Bucket -eq 'Excluded'  }).Count
+            $fInScope   = $fTotal - $fExcluded
+            $fComp      = if ($fInScope -gt 0) { [math]::Round(100.0 * $fCompleted / $fInScope, 1) } else { 0 }
 
-            if     ($fTotal -eq 0)                         { $fTxt = 'No Data';                     $fCls = 'bad' }
+            if     ($fInScope -eq 0)                       { $fTxt = 'No In-Scope VMs';             $fCls = 'warn' }
             elseif ($fFailed -gt 0 -or $fUnknown -gt 0)    { $fTxt = 'Attention Required';          $fCls = 'bad' }
             elseif ($fComp -ge 100)                        { $fTxt = 'Fully Compliant';             $fCls = 'good' }
             elseif ($fComp -ge $ComplianceThreshold)       { $fTxt = 'On Track - Minor Exceptions'; $fCls = 'warn' }
@@ -969,20 +997,23 @@ try {
 
             $blocks.Add([pscustomobject]@{
                 Family       = $fam
-                Total = $fTotal; Completed = $fCompleted; Failed = $fFailed; Pending = $fPending; Unknown = $fUnknown
+                Total = $fTotal; Completed = $fCompleted; Failed = $fFailed; Pending = $fPending; Unknown = $fUnknown; Excluded = $fExcluded
                 Compliance   = $fComp; StatusText = $fTxt; StatusClass = $fCls
                 OsBreakdown  = @($fOs)
                 CompletedVMs = @($fr | Where-Object { $_.Bucket -eq 'Completed' } | Sort-Object HostName)
-                PendingVMs   = @($fr | Where-Object { $_.Bucket -eq 'Pending' -or $_.Bucket -eq 'Unknown' } | Sort-Object HostName)
+                PendingVMs   = @($fr | Where-Object {
+                        $k = Get-NormalKey $_.StatusText
+                        ($_.Bucket -eq 'Unknown') -or ($k -like '*pending*') -or ($k -like '*notstarted*') -or ($k -like '*notyetstarted*') -or ($k -like '*yettostart*') -or ($k -like '*tobestarted*')
+                    } | Sort-Object HostName)
                 Exceptions   = @($fr | Where-Object { $_.Bucket -eq 'Failed' } | Sort-Object HostName)
             })
-            Write-Log ("  [{0,-7}] Total={1} Completed={2} Failed={3} Pending={4} Unknown={5} ({6}%)" -f $fam, $fTotal, $fCompleted, $fFailed, $fPending, $fUnknown, $fComp)
+            Write-Log ("  [{0,-7}] Total={1} Completed={2} Failed={3} Pending={4} Unknown={5} Excluded={6}  in-scope compliance {7}%" -f $fam, $fTotal, $fCompleted, $fFailed, $fPending, $fUnknown, $fExcluded, $fComp)
         }
         if ($blocks.Count -eq 0) { $dq.Add('No VMs could be classified by operating system.'); continue }
 
         $ctx = @{
             Title           = 'Monthly Infrastructure Patching Executive Report'
-            EngineerDisplay = $engDisplay
+            EngineerDisplay = $(if ($EngineerName) { $EngineerName } else { $ImplementedBy })
             MonthDisplay    = $monthDisplay
             Threshold       = $ComplianceThreshold
             Blocks          = $blocks.ToArray()
