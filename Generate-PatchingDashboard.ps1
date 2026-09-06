@@ -134,6 +134,25 @@ $ColumnAliases = [ordered]@{
 $RequiredFields = @('HostName', 'Status')
 
 # ======================================================================
+# 1b. SITE CODE -> FULL SITE NAME  --  add / edit your codes here
+# ----------------------------------------------------------------------
+# If the workbook (Site column) or the Excel file name contains a short
+# code, it is expanded to the full site name for the dashboard header.
+# Matching is case-insensitive; the code may appear on its own ("SF") or
+# as a separate token ("SF - Prod", "Site: SF", "SixFlags(SF)").
+# Unknown values are used exactly as they appear in the sheet.
+# ======================================================================
+$SiteNameMap = @{
+    'SF'  = 'Six Flags'
+    'AQ'  = 'Aquarabia'
+    'AQA' = 'Aquarabia'
+    'AMC' = 'AMC'
+    'TB'  = 'SEVEN Tabuk'
+    'AB'  = 'SEVEN Abha'
+    'HA'  = 'SEVEN Alhamra'
+}
+
+# ======================================================================
 # 2. STATUS NORMALISATION  --  adjust the keyword lists if needed
 # ----------------------------------------------------------------------
 # Every raw status is lower-cased and stripped of non-alphanumerics, then
@@ -302,6 +321,19 @@ function New-Slug {
     }
     if (-not $parts) { return $Fallback }
     return ($parts -join '-')
+}
+
+function Resolve-SiteName {
+    # Expand a short site code (SF, AQ, AMC, TB, AB, HA ...) to its full name
+    # using $SiteNameMap. Falls back to the original text when nothing matches.
+    param([string]$Raw)
+    $r = ([string]$Raw).Trim()
+    if ($r -eq '') { return $r }
+    if ($SiteNameMap.ContainsKey($r.ToUpperInvariant())) { return $SiteNameMap[$r.ToUpperInvariant()] }
+    foreach ($tok in ($r -split '[^A-Za-z0-9]+')) {
+        if ($tok -and $SiteNameMap.ContainsKey($tok.ToUpperInvariant())) { return $SiteNameMap[$tok.ToUpperInvariant()] }
+    }
+    return $r
 }
 
 function Get-MonthLabel {
@@ -710,7 +742,7 @@ try {
         $os = ConvertTo-Text (Get-Prop $row $cols.OS)
         $to = ConvertTo-Text (Get-Prop $row $cols.TechnicalOwner)
         $en = ConvertTo-Text (Get-Prop $row $cols.Engineer)
-        $sr = ConvertTo-Text (Get-Prop $row $cols.SiteName)
+        $sr = Resolve-SiteName (ConvertTo-Text (Get-Prop $row $cols.SiteName))
         $dr = Get-Prop $row $cols.StartDate
 
         if (($h -eq '') -and ($st -eq '') -and ($ip -eq '') -and ($os -eq '') -and ($to -eq '') -and ($en -eq '') -and ($sr -eq '')) {
@@ -757,8 +789,9 @@ try {
 
     # ---- 5. group by site -----------------------------------
     if ($SiteName) {
-        $groups = @([pscustomobject]@{ Key = 'override'; Records = $records; DisplayName = $SiteName })
-        Write-Log "Site name overridden via -SiteName: '$SiteName'." 'WARN'
+        $ovr = Resolve-SiteName $SiteName
+        $groups = @([pscustomobject]@{ Key = 'override'; Records = $records; DisplayName = $ovr })
+        Write-Log "Site name overridden via -SiteName: '$SiteName' -> '$ovr'." 'WARN'
     }
     else {
         $siteGroups = $records | Group-Object {
@@ -775,10 +808,20 @@ try {
             elseif ($distinctNames.Count -eq 1) { $disp = $distinctNames[0] }
             elseif ($distinctNames.Count -gt 1) { $disp = 'MULTIPLE SITES' }
             else {
-                $disp = Get-MonthLabelFromString ([System.IO.Path]::GetFileNameWithoutExtension($InputExcel))
-                $fileGuess = New-Slug ([System.IO.Path]::GetFileNameWithoutExtension($InputExcel)) 'UNKNOWN SITE'
-                $disp = if ($fileGuess -and $fileGuess -ne 'Report') { ($fileGuess -replace '-', ' ') } else { 'SITE NAME NOT SPECIFIED' }
-                $dq.Add("Site Name absent from workbook - using '$disp' (from file name). Pass -SiteName to override.")
+                $baseName = [System.IO.Path]::GetFileNameWithoutExtension($InputExcel)
+                $codeHit  = $null
+                foreach ($tok in ($baseName -split '[^A-Za-z0-9]+')) {
+                    if ($tok -and $SiteNameMap.ContainsKey($tok.ToUpperInvariant())) { $codeHit = $SiteNameMap[$tok.ToUpperInvariant()]; break }
+                }
+                if ($codeHit) {
+                    $disp = $codeHit
+                    $dq.Add("Site Name absent from workbook - resolved site code in file name to '$disp'.")
+                }
+                else {
+                    $fileGuess = New-Slug $baseName 'UNKNOWN SITE'
+                    $disp = if ($fileGuess -and $fileGuess -ne 'Report') { ($fileGuess -replace '-', ' ') } else { 'SITE NAME NOT SPECIFIED' }
+                    $dq.Add("Site Name absent from workbook - using '$disp' (from file name). Pass -SiteName to override.")
+                }
             }
             $groups = @([pscustomobject]@{ Key = 'all'; Records = $records; DisplayName = $disp })
         }
