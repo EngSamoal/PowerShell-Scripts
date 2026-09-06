@@ -482,6 +482,24 @@ $exBody          </tbody>
         $exSection = '<div class="all-clear">&#10004;&nbsp; No Exceptions &ndash; All Scheduled Servers Successfully Patched</div>'
     }
 
+    # ---- compact server list (VM name + status) under the donut --
+    $srvItems = ''
+    foreach ($sv in $Ctx.Servers) {
+        $dotClass = switch ($sv.Bucket) {
+            'Completed' { 's-green' } 'Failed' { 's-red' } 'Pending' { 's-amber' } default { 's-grey' }
+        }
+        $svName = [string](ConvertTo-HtmlSafe $sv.HostName)
+        $svStat = [string](ConvertTo-HtmlSafe $sv.StatusText)
+        $srvItems += "            <div class=""srv-item""><span class=""srv-dot $dotClass""></span><span class=""srv-name"" title=""$svName"">$svName</span><span class=""srv-stat"">$svStat</span></div>`n"
+    }
+    $serverList = @"
+        <div class="srv-wrap">
+          <div class="srv-title">Servers in this cycle ($total)</div>
+          <div class="srv-grid">
+$srvItems          </div>
+        </div>
+"@
+
     # ---- data-quality notes -------------------------------------
     $dq = ''
     if ($Ctx.DataQuality.Count -gt 0) {
@@ -526,6 +544,15 @@ $css = @'
   .legend{display:flex;flex-wrap:wrap;gap:14px 20px;margin-top:14px;font-size:13px;justify-content:center;}
   .legend i{display:inline-block;width:12px;height:12px;border-radius:3px;margin-right:7px;vertical-align:middle;}
   .legend b{margin-left:5px;}
+  .srv-wrap{width:100%;margin-top:22px;border-top:1px solid var(--line);padding-top:16px;}
+  .srv-title{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);margin-bottom:10px;text-align:center;}
+  .srv-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:2px 20px;}
+  .srv-item{display:flex;align-items:center;gap:8px;font-size:11.5px;padding:3px 0;border-bottom:1px dotted #EDF1F6;}
+  .srv-dot{flex:0 0 auto;width:8px;height:8px;border-radius:50%;}
+  .srv-dot.s-green{background:#1F8A4C;} .srv-dot.s-amber{background:#C77700;}
+  .srv-dot.s-red{background:#C0392B;} .srv-dot.s-grey{background:#6B7683;}
+  .srv-name{flex:1 1 auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#334155;font-weight:600;}
+  .srv-stat{flex:0 0 auto;color:var(--muted);}
   .os-row{display:grid;grid-template-columns:230px 1fr 46px;align-items:center;gap:12px;margin-bottom:9px;font-size:13px;}
   .os-name{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#334155;}
   .os-bar{background:#EEF2F7;border-radius:6px;height:16px;overflow:hidden;}
@@ -552,6 +579,8 @@ $css = @'
      header.hero,.kpi-card,section.panel{box-shadow:none;}
      header.hero{-webkit-print-color-adjust:exact;print-color-adjust:exact;}
      section.panel,.kpi-card,.ex-table tr{page-break-inside:avoid;}
+     .srv-grid{grid-template-columns:repeat(3,1fr);}
+     .srv-item{page-break-inside:avoid;}
      *{-webkit-print-color-adjust:exact;print-color-adjust:exact;}
   }
 '@
@@ -587,7 +616,8 @@ $kpiCards
 $svgSegs          <text x="100" y="94" text-anchor="middle" font-size="30" font-weight="800" fill="#1F2933">$total</text>
           <text x="100" y="118" text-anchor="middle" font-size="12" fill="#6B7683">SERVERS</text>
         </svg>
-$legend      </div>
+$legend
+$serverList      </div>
     </div>
   </section>
 
@@ -908,6 +938,7 @@ try {
             StatusText = $sTxt; StatusClass = $sCls
             OsBreakdown = @($osBreak)
             Exceptions  = @($exceptions)
+            Servers     = @($recs | Sort-Object HostName)
             DataQuality = @($dq | Select-Object -Unique)
             Generated   = (Get-Date).ToString('yyyy-MM-dd HH:mm')
             SourceFile  = [System.IO.Path]::GetFileName($InputExcel)
@@ -933,42 +964,4 @@ try {
             foreach ($cand in @(
                     "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
                     "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe",
-                    "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
-                    "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe")) {
-                if (Test-Path -LiteralPath $cand) { $browser = $cand; break }
-            }
-            if ($browser) {
-                try {
-                    $uri = ([System.Uri](Resolve-Path -LiteralPath $outFile).Path).AbsoluteUri
-                    & $browser --headless=new --disable-gpu --no-pdf-header-footer "--print-to-pdf=$pdfFile" $uri 2>$null
-                    Start-Sleep -Seconds 2
-                    if (Test-Path -LiteralPath $pdfFile) { Write-Log "PDF written: $pdfFile" 'OK' }
-                    else { Write-Log "PDF was not produced by $browser." 'WARN'; $pdfFile = $null }
-                } catch { Write-Log "PDF export failed: $($_.Exception.Message)" 'WARN'; $pdfFile = $null }
-            } else {
-                Write-Log "No headless Edge/Chrome found - skipping PDF. Open the HTML and 'Print > Save as PDF'." 'WARN'
-                $pdfFile = $null
-            }
-        }
-
-        $generated.Add([pscustomobject]@{ Site = $siteDisplay; Html = $outFile; Pdf = $pdfFile; Compliance = $compliance; Status = $sTxt })
-        if ($Open) { Invoke-Item -LiteralPath $outFile }
-    }
-
-    Write-Log "==== Completed. $($generated.Count) dashboard(s) generated. ===="
-    Write-Host ''
-    $generated | Format-Table Site, Compliance, Status, Html -AutoSize | Out-Host
-    $generated  # return objects to the pipeline
-}
-catch {
-    $script:ExitCode = 1
-    Write-Log $_.Exception.Message 'ERROR'
-    Write-Log ($_.ScriptStackTrace) 'ERROR'
-    Write-Host ''
-    Write-Host "FAILED: $($_.Exception.Message)" -ForegroundColor Red
-}
-finally {
-    if ($script:LogFile) { Write-Host "Log file: $script:LogFile" -ForegroundColor DarkGray }
-}
-
-exit $script:ExitCode
+                    "$env:ProgramFiles\
