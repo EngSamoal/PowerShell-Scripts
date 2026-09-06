@@ -510,11 +510,12 @@ $exRows        </tbody></table>
         $blocksHtml += @"
   <section class="os-block">
     <div class="os-band">OS &ndash; $famU</div>
+    <div class="os-sub">$total of $($Ctx.GrandTotal) VMs in this workbook are $famU</div>
 
     <div class="kpi">
       <div class="kpi-card"><div class="kpi-accent" style="background:$($P.SlateHi)"></div>
-        <div class="kpi-label">Total VMs (All)</div><div class="kpi-value">$total</div>
-        <div class="kpi-sub">Scheduled this cycle</div></div>
+        <div class="kpi-label">Total $famU VMs</div><div class="kpi-value">$total</div>
+        <div class="kpi-sub">of $($Ctx.GrandTotal) VMs in this report</div></div>
       <div class="kpi-card"><div class="kpi-accent" style="background:$($P.Green)"></div>
         <div class="kpi-label">Completed</div><div class="kpi-value" style="color:$($P.Green)">$completed</div>
         <div class="kpi-sub">Successfully patched</div></div>
@@ -566,6 +567,25 @@ $exSection
 "@
     }
 
+    # ---- brief combined summary (all OS families) ----------------
+    $o = $Ctx.Overall
+    $oCol = switch ($o.StatusClass) { 'good' { $P.Green } 'warn' { $P.Amber } default { $P.Red } }
+    $summaryHtml = @"
+  <div class="panel summary">
+    <h2>Overall Summary &mdash; All Operating Systems</h2>
+    <div class="sum-row">
+      <div class="sum"><span>Total VMs</span><b>$($o.Total)</b></div>
+      <div class="sum"><span>Completed</span><b style="color:$($P.Green)">$($o.Completed)</b></div>
+      <div class="sum"><span>Failed</span><b style="color:$($P.Red)">$($o.Failed)</b></div>
+      <div class="sum"><span>Pending</span><b style="color:$($P.Amber)">$($o.Pending)</b></div>
+      <div class="sum"><span>Excluded</span><b style="color:$($P.Grey)">$($o.Excluded)</b></div>
+      <div class="sum"><span>Overall Status</span><b class="$($o.StatusClass)">$([string](ConvertTo-HtmlSafe $o.StatusText))</b></div>
+    </div>
+    <p class="sum-note">$($o.Families) &nbsp;|&nbsp; status is measured on $($o.InScope) in-scope VMs (Total &minus; Excluded).</p>
+  </div>
+
+"@
+
     # ---- data-quality notes -------------------------------------
     $dq = ''
     if ($Ctx.DataQuality.Count -gt 0) {
@@ -592,8 +612,9 @@ $css = @'
   .engineer b{color:#fff;}
   .report-month{font-size:20px;font-weight:700;margin:6px 0 0;color:#fff;}
   .os-band{font-size:30px;font-weight:800;letter-spacing:2px;text-transform:uppercase;color:#0F2A43;
-       margin:40px 0 6px;padding-bottom:8px;border-bottom:3px solid #1D4E79;}
+       margin:40px 0 4px;padding-bottom:8px;border-bottom:3px solid #1D4E79;}
   .os-block:first-of-type .os-band{margin-top:14px;}
+  .os-sub{font-size:12px;color:var(--muted);margin:0 0 6px;font-weight:600;}
   .kpi{display:grid;grid-template-columns:repeat(6,1fr);gap:14px;margin:14px 0 10px;}
   .kpi-card{position:relative;background:#fff;border:1px solid var(--line);border-radius:12px;
        padding:18px 16px 16px;overflow:hidden;box-shadow:0 2px 6px rgba(31,41,51,.04);}
@@ -620,6 +641,15 @@ $css = @'
   .lst tr:nth-child(even){background:#FAFBFD;}
   .na-box{background:#F4F6F9;border:1px solid var(--line);color:var(--muted);font-weight:800;font-size:15px;
        letter-spacing:1px;padding:16px;border-radius:10px;text-align:center;}
+  .summary{padding:30px 32px;}
+  .summary h2{font-size:20px;margin-bottom:22px;}
+  .sum-row{display:flex;flex-wrap:wrap;gap:24px 56px;align-items:flex-end;}
+  .sum{display:flex;flex-direction:column;gap:4px;}
+  .sum span{color:var(--muted);text-transform:uppercase;letter-spacing:.5px;font-weight:700;font-size:13px;}
+  .sum b{font-size:46px;font-weight:800;color:#1F2933;line-height:1;}
+  .sum b.good{color:#1F8A4C;} .sum b.warn{color:#C77700;} .sum b.bad{color:#C0392B;}
+  .sum b.bad,.sum b.good,.sum b.warn{font-size:30px;}
+  .sum-note{font-size:13.5px;color:var(--muted);margin:20px 0 0;}
   .os-row{display:grid;grid-template-columns:230px 1fr 46px;align-items:center;gap:12px;margin-bottom:9px;font-size:13px;}
   .os-name{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#334155;}
   .os-bar{background:#EEF2F7;border-radius:6px;height:16px;overflow:hidden;}
@@ -673,6 +703,7 @@ $css
   </header>
 
 $blocksHtml
+$summaryHtml
   <footer>
 $dqSection
     <p style="margin-top:14px;">
@@ -1011,11 +1042,19 @@ try {
         }
         if ($blocks.Count -eq 0) { $dq.Add('No VMs could be classified by operating system.'); continue }
 
+        $famSummary = ($blocks | ForEach-Object { '{0} {1}' -f $_.Family, $_.Total }) -join '  &middot;  '
+
         $ctx = @{
             Title           = 'Monthly Infrastructure Patching Executive Report'
             EngineerDisplay = $(if ($EngineerName) { $EngineerName } else { $ImplementedBy })
             MonthDisplay    = $monthDisplay
+            GrandTotal      = $total
             Threshold       = $ComplianceThreshold
+            Overall         = @{
+                Total = $total; Completed = $completed; Failed = $failed; Pending = $pending
+                Excluded = $excluded; InScope = $inScope
+                StatusText = $sTxt; StatusClass = $sCls; Families = $famSummary
+            }
             Blocks          = $blocks.ToArray()
             DataQuality     = @($dq | Select-Object -Unique)
             Generated       = (Get-Date).ToString('yyyy-MM-dd HH:mm')
