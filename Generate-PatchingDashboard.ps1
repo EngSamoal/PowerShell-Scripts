@@ -126,7 +126,7 @@ $ColumnAliases = [ordered]@{
     IPAddress      = @('IP Address', 'IPAddress', 'IP', 'IP Addr', 'Address', 'Mgmt IP', 'Management IP', 'Primary IP')
     OS             = @('OS', 'Operating System', 'OS Name', 'OS Version', 'Platform', 'Image', 'OS(Provide Image)', 'OS (Provide Image)')
     Engineer       = @('Update Engineer', 'Engineer', 'Implementer', 'Implemented By', 'Patching Engineer', 'Patch Engineer', 'Performed By', 'Executed By', 'Assigned To', 'Owner Engineer', 'Resource', 'Applied By')
-    StartDate      = @('Start Patching Date', 'Patching Date', 'Patch Date', 'Start Date', 'Scheduled Date', 'Patching Start Date', 'Completion Date', 'Date', 'Activity Date', 'Maintenance Date')
+    StartDate      = @('Patching starting Date', 'Patching Starting Date', 'Start Patching Date', 'Patching Start Date', 'Patching Date', 'Patch Date', 'Patched On', 'Patched Date', 'Start Date', 'Scheduled Date', 'Completion Date', 'Completed On', 'Activity Date', 'Maintenance Date', 'Date')
     Status         = @('Patching Status', 'Patch Status', 'Status', 'Result', 'Outcome', 'State', 'Compliance Status', 'Patch State', 'Activity Status')
     Remarks        = @('Issues in the source excel sheet', 'Issue', 'Issues', 'Remarks', 'Remark', 'Comments', 'Comment', 'Notes', 'Note', 'Reason', 'Root Cause', 'RootCause', 'Failure Reason', 'FailureReason', 'Error', 'Error Details', 'Details', 'Description', 'Observation', 'Findings', 'Justification')
     Excluded       = @('Excluded', 'Exclude', 'Exclusion', 'Excluded by Management', 'Management Decision', 'Descoped', 'Out of Scope', 'Exempted', 'Exception')
@@ -294,25 +294,30 @@ function Resolve-Columns {
         $k = Get-NormalKey $p
         if ($k -and -not $lookup.ContainsKey($k)) { $lookup[$k] = $p }
     }
-    $result = @{}
+    $result  = @{}
+    $claimed = @{}   # a real header can only be assigned to ONE canonical field
     foreach ($field in $Aliases.Keys) {
         $match = $null
+        # 1. exact (normalised) match
         foreach ($alias in $Aliases[$field]) {
             $ak = Get-NormalKey $alias
             if ($ak -eq '') { continue }
-            if ($lookup.ContainsKey($ak)) { $match = $lookup[$ak]; break }
+            if ($lookup.ContainsKey($ak) -and -not $claimed.ContainsKey($lookup[$ak])) { $match = $lookup[$ak]; break }
         }
+        # 2. starts-with / contains fallback (contains needs a >=5 char alias so
+        #    short generic words like "date" cannot match "update", etc.)
         if (-not $match) {
-            # start-with / contains fallback for long headers
             foreach ($alias in $Aliases[$field]) {
                 $ak = Get-NormalKey $alias
-                if ($ak.Length -lt 2) { continue }
+                if ($ak.Length -lt 3) { continue }
                 foreach ($k in $lookup.Keys) {
-                    if ($k.StartsWith($ak) -or ($ak.Length -ge 4 -and $k.Contains($ak))) { $match = $lookup[$k]; break }
+                    if ($claimed.ContainsKey($lookup[$k])) { continue }
+                    if ($k -eq $ak -or $k.StartsWith($ak) -or ($ak.Length -ge 5 -and $k.Contains($ak))) { $match = $lookup[$k]; break }
                 }
                 if ($match) { break }
             }
         }
+        if ($match) { $claimed[$match] = $true }
         $result[$field] = $match
     }
     return $result
@@ -612,7 +617,6 @@ $exRows        </tbody></table>
         $blocksHtml += @"
   <section class="os-block">
     <div class="os-band">OS &ndash; $famU</div>
-    <div class="os-sub">$total $famU VM(s) in play on $DayText (open at the start of the day)</div>
 
     <div class="kpi">
       <div class="kpi-card"><div class="kpi-accent" style="background:$($P.SlateHi)"></div>
