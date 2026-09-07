@@ -1136,7 +1136,7 @@ try {
         foreach ($d in $dayList) {
             $dayIdx++
             $isFirst = ($dayIdx -eq 1)
-            if ($d -is [datetime]) { $dayName = $d.ToString('dddd'); $dateText = $d.ToString('d MMM yyyy') }
+            if ($d -is [datetime]) { $dayName = $d.ToString('dddd'); $dateText = $d.ToString('dddd, d MMMM yyyy') }
             else                   { $dayName = ''; $dateText = $monthDisplay }
 
             # ---- per-OS blocks for this day ----
