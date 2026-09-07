@@ -621,7 +621,7 @@ $exRows        </tbody></table>
     <div class="kpi">
       <div class="kpi-card"><div class="kpi-accent" style="background:$($P.SlateHi)"></div>
         <div class="kpi-label">Total $famU VMs</div><div class="kpi-value">$total</div>
-        <div class="kpi-sub">open at start of $DayText</div></div>
+        <div class="kpi-sub">&nbsp;</div></div>
       <div class="kpi-card"><div class="kpi-accent" style="background:$($P.Green)"></div>
         <div class="kpi-label">Completed</div><div class="kpi-value" style="color:$($P.Green)">$completed</div>
         <div class="kpi-sub">Successfully patched</div></div>
