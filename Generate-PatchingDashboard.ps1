@@ -406,21 +406,123 @@ function Get-DonutSvg {
 }
 
 # ======================================================================
+#  AGGREGATION HELPERS (shared by day blocks and summaries)
+# ======================================================================
+function Get-StatusLabel {
+    param([int]$InScope, [int]$Failed, [int]$Unknown, [double]$Comp, [double]$Threshold)
+    if     ($InScope -eq 0)                    { return @('No In-Scope VMs', 'warn') }
+    elseif ($Failed -gt 0 -or $Unknown -gt 0)  { return @('Attention Required', 'bad') }
+    elseif ($Comp -ge 100)                     { return @('Fully Compliant', 'good') }
+    elseif ($Comp -ge $Threshold)              { return @('On Track - Minor Exceptions', 'warn') }
+    else                                       { return @('Attention Required', 'bad') }
+}
+
+function Get-Aggregate {
+    # Roll a record set up into a summary hashtable.
+    param($Recs, [double]$Threshold)
+    $t  = @($Recs).Count
+    $c  = @($Recs | Where-Object { $_.Bucket -eq 'Completed' }).Count
+    $f  = @($Recs | Where-Object { $_.Bucket -eq 'Failed'    }).Count
+    $p  = @($Recs | Where-Object { $_.Bucket -eq 'Pending'   }).Count
+    $u  = @($Recs | Where-Object { $_.Bucket -eq 'Unknown'   }).Count
+    $x  = @($Recs | Where-Object { $_.Bucket -eq 'Excluded'  }).Count
+    $is = $t - $x
+    $cp = if ($is -gt 0) { [math]::Round(100.0 * $c / $is, 1) } else { 0 }
+    $lab = Get-StatusLabel $is $f $u $cp $Threshold
+    return @{ Total = $t; Completed = $c; Failed = $f; Pending = $p; Unknown = $u
+        Excluded = $x; InScope = $is; Compliance = $cp; StatusText = $lab[0]; StatusClass = $lab[1] }
+}
+
+function Get-ScopeDay {
+    <#
+        Funnel numbers for one OS scope (a set of IN-SCOPE VM records) at the end
+        of one patching day.
+          Total     = VMs still open at the START of the day (Day 1 = all in-scope)
+          Completed = VMs completed ON this day
+          Failed    = VMs whose final status is Failed (open every day) - constant
+          Pending   = still open at END of the day, minus Failed
+        $DayDate = [datetime] of the day, or $null for a single fallback day.
+    #>
+    param($ScopeRecs, [int]$ExcludedCount, $DayDate, [bool]$First, [double]$Threshold)
+
+    $recsArr = @($ScopeRecs)
+    $inN     = $recsArr.Count
+    $isDate  = ($DayDate -is [datetime])
+
+    if (-not $isDate) {
+        $doneByEnd = @($recsArr | Where-Object { $_.Bucket -eq 'Completed' })
+        $doneOnDay = $doneByEnd
+    } else {
+        $doneByEnd = @($recsArr | Where-Object {
+                $_.Bucket -eq 'Completed' -and (
+                    ($First -and -not ($_.Date -is [datetime])) -or
+                    (($_.Date -is [datetime]) -and ($_.Date.Date -le $DayDate))
+                )
+            })
+        $doneOnDay = @($doneByEnd | Where-Object {
+                (-not ($_.Date -is [datetime])) -or ($_.Date.Date -eq $DayDate)
+            })
+    }
+
+    $doneSet = @{}
+    foreach ($x in $doneByEnd) { $doneSet[$x.RowNo] = $true }
+
+    $failedList = @($recsArr | Where-Object { $_.Bucket -eq 'Failed' } | Sort-Object HostName)
+    $failedCnt  = $failedList.Count
+
+    $doneBefore  = $doneByEnd.Count - $doneOnDay.Count
+    $openStart   = $inN - $doneBefore
+    $openEnd     = $inN - $doneByEnd.Count
+    $completedDay = $doneOnDay.Count
+    $pendingDay  = $openEnd - $failedCnt
+    if ($pendingDay -lt 0) { $pendingDay = 0 }
+    $comp = if ($openStart -gt 0) { [math]::Round(100.0 * $completedDay / $openStart, 1) } else { 0 }
+    $lab  = Get-StatusLabel $openStart $failedCnt 0 $comp $Threshold
+
+    $pendingList = @($recsArr | Where-Object {
+            $_.Bucket -ne 'Failed' -and -not $doneSet.ContainsKey($_.RowNo)
+        } | Sort-Object HostName)
+
+    return @{
+        Total = $openStart; Completed = $completedDay; Failed = $failedCnt; Pending = $pendingDay
+        Unknown = 0; Excluded = $ExcludedCount; InScope = $openStart
+        Compliance = $comp; StatusText = $lab[0]; StatusClass = $lab[1]
+        CompletedList = @($doneOnDay | Sort-Object HostName)
+        PendingList   = $pendingList
+        FailedList    = $failedList
+        DoneByEnd     = $doneByEnd.Count
+    }
+}
+
+# ======================================================================
 #  HTML BUILDER
 # ======================================================================
-function Build-DashboardHtml {
-    param([hashtable]$Ctx)
+function Format-Summary {
+    param([hashtable]$S, [string]$Heading, [string]$Note, [string]$Extra = '')
+    $P = $Palette
+    $noteHtml = if ($Note) { "`n    <p class=""sum-note"">$Note</p>" } else { '' }
+    return @"
+  <div class="panel summary$Extra">
+    <h2>$Heading</h2>
+    <div class="sum-row">
+      <div class="sum"><span>Total VMs</span><b>$($S.Total)</b></div>
+      <div class="sum"><span>Completed</span><b style="color:$($P.Green)">$($S.Completed)</b></div>
+      <div class="sum"><span>Failed</span><b style="color:$($P.Red)">$($S.Failed)</b></div>
+      <div class="sum"><span>Pending</span><b style="color:$($P.Amber)">$($S.Pending)</b></div>
+      <div class="sum"><span>Excluded</span><b style="color:$($P.Grey)">$($S.Excluded)</b></div>
+      <div class="sum"><span>Overall Status</span><b class="$($S.StatusClass)">$([string](ConvertTo-HtmlSafe $S.StatusText))</b></div>
+    </div>$noteHtml
+  </div>
+
+"@
+}
+
+function Format-OsBlock {
+    param([object]$b, [string]$DayText)
 
     $P = $Palette
-    $safeTitle = ConvertTo-HtmlSafe $Ctx.Title
-    $safeEng   = ConvertTo-HtmlSafe $Ctx.EngineerDisplay
-    $safeMon   = ConvertTo-HtmlSafe $Ctx.MonthDisplay
-
-    # ================================================================
-    #  One self-contained block per OS family (Windows, then Linux ...)
-    # ================================================================
     $blocksHtml = ''
-    foreach ($b in $Ctx.Blocks) {
+    if ($true) {
         $total = [int]$b.Total; $completed = [int]$b.Completed; $failed = [int]$b.Failed
         $pending = [int]$b.Pending; $unknown = [int]$b.Unknown; $excluded = [int]$b.Excluded
         $sCls = $b.StatusClass
@@ -510,12 +612,12 @@ $exRows        </tbody></table>
         $blocksHtml += @"
   <section class="os-block">
     <div class="os-band">OS &ndash; $famU</div>
-    <div class="os-sub">$total of $($Ctx.GrandTotal) VMs in this workbook are $famU</div>
+    <div class="os-sub">$total $famU VM(s) in play on $DayText (open at the start of the day)</div>
 
     <div class="kpi">
       <div class="kpi-card"><div class="kpi-accent" style="background:$($P.SlateHi)"></div>
         <div class="kpi-label">Total $famU VMs</div><div class="kpi-value">$total</div>
-        <div class="kpi-sub">of $($Ctx.GrandTotal) VMs in this report</div></div>
+        <div class="kpi-sub">open at start of $DayText</div></div>
       <div class="kpi-card"><div class="kpi-accent" style="background:$($P.Green)"></div>
         <div class="kpi-label">Completed</div><div class="kpi-value" style="color:$($P.Green)">$completed</div>
         <div class="kpi-sub">Successfully patched</div></div>
@@ -566,25 +668,41 @@ $exSection
 
 "@
     }
+    return $blocksHtml
+}
 
-    # ---- brief combined summary (all OS families) ----------------
-    $o = $Ctx.Overall
-    $oCol = switch ($o.StatusClass) { 'good' { $P.Green } 'warn' { $P.Amber } default { $P.Red } }
-    $summaryHtml = @"
-  <div class="panel summary">
-    <h2>Overall Summary &mdash; All Operating Systems</h2>
-    <div class="sum-row">
-      <div class="sum"><span>Total VMs</span><b>$($o.Total)</b></div>
-      <div class="sum"><span>Completed</span><b style="color:$($P.Green)">$($o.Completed)</b></div>
-      <div class="sum"><span>Failed</span><b style="color:$($P.Red)">$($o.Failed)</b></div>
-      <div class="sum"><span>Pending</span><b style="color:$($P.Amber)">$($o.Pending)</b></div>
-      <div class="sum"><span>Excluded</span><b style="color:$($P.Grey)">$($o.Excluded)</b></div>
-      <div class="sum"><span>Overall Status</span><b class="$($o.StatusClass)">$([string](ConvertTo-HtmlSafe $o.StatusText))</b></div>
-    </div>
-    <p class="sum-note">$($o.Families) &nbsp;|&nbsp; status is measured on $($o.InScope) in-scope VMs (Total &minus; Excluded).</p>
+# ======================================================================
+#  MAIN HTML BUILDER  --  header + per-day blocks + cumulative summaries
+# ======================================================================
+function Build-DashboardHtml {
+    param([hashtable]$Ctx)
+
+    $P = $Palette
+    $safeTitle = ConvertTo-HtmlSafe $Ctx.Title
+    $safeEng   = ConvertTo-HtmlSafe $Ctx.EngineerDisplay
+    $safeMon   = ConvertTo-HtmlSafe $Ctx.MonthDisplay
+
+    $body = ''
+    $dayNum = 0
+    foreach ($day in $Ctx.Days) {
+        $dayNum++
+        $dn = ConvertTo-HtmlSafe $day.DayName
+        $dt = ConvertTo-HtmlSafe $day.DateText
+        $nameBit = if ($dn) { " &middot; $dn" } else { '' }
+        $body += @"
+  <div class="day-banner">
+    <div class="day-name">Day $dayNum$nameBit</div>
+    <div class="day-date">$dt</div>
   </div>
 
 "@
+        foreach ($b in $day.Blocks) { $body += (Format-OsBlock -b $b -DayText $day.DateText) }
+        $body += (Format-Summary $day.DaySummary ("Day $dayNum Summary &mdash; $dt  (Windows + Linux)") $day.DayNote)
+        if ($day.CumSummary) {
+            $body += (Format-Summary $day.CumSummary ("Cumulative Summary &mdash; Day 1 to Day $dayNum (through $dt)") $day.CumNote ' cumulative')
+        }
+    }
+    $body += (Format-Summary $Ctx.MonthSummary 'Overall Summary &mdash; Full Month (Windows + Linux, all days)' $Ctx.MonthNote ' monthend')
 
     # ---- data-quality notes -------------------------------------
     $dq = ''
@@ -611,10 +729,16 @@ $css = @'
   .engineer{font-size:20px;font-weight:600;margin:12px 0 0;color:#DCE7F2;}
   .engineer b{color:#fff;}
   .report-month{font-size:20px;font-weight:700;margin:6px 0 0;color:#fff;}
-  .os-band{font-size:30px;font-weight:800;letter-spacing:2px;text-transform:uppercase;color:#0F2A43;
-       margin:40px 0 4px;padding-bottom:8px;border-bottom:3px solid #1D4E79;}
-  .os-block:first-of-type .os-band{margin-top:14px;}
+  .day-banner{background:linear-gradient(135deg,#0F2A43 0%,#1D4E79 100%);color:#fff;border-radius:12px;
+       padding:18px 30px;margin:44px 0 6px;box-shadow:0 8px 22px rgba(15,42,67,.20);}
+  .day-banner:first-of-type{margin-top:22px;}
+  .day-name{font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:3px;color:#AFC6DD;}
+  .day-date{font-size:32px;font-weight:800;margin-top:2px;letter-spacing:.5px;}
+  .os-band{font-size:26px;font-weight:800;letter-spacing:2px;text-transform:uppercase;color:#0F2A43;
+       margin:26px 0 4px;padding-bottom:8px;border-bottom:3px solid #1D4E79;}
   .os-sub{font-size:12px;color:var(--muted);margin:0 0 6px;font-weight:600;}
+  .summary.cumulative{border:2px solid #1D4E79;}
+  .summary.monthend{border:2px solid #0F2A43;background:#FBFCFE;}
   .kpi{display:grid;grid-template-columns:repeat(6,1fr);gap:14px;margin:14px 0 10px;}
   .kpi-card{position:relative;background:#fff;border:1px solid var(--line);border-radius:12px;
        padding:18px 16px 16px;overflow:hidden;box-shadow:0 2px 6px rgba(31,41,51,.04);}
@@ -676,7 +800,8 @@ $css = @'
      header.hero,.kpi-card,.panel{box-shadow:none;}
      header.hero{-webkit-print-color-adjust:exact;print-color-adjust:exact;}
      .panel,.kpi-card,.ex-table tr,.lst tr{page-break-inside:avoid;}
-     .os-block + .os-block{page-break-before:always;}
+     .day-banner:not(:first-of-type){page-break-before:always;}
+     .day-banner{-webkit-print-color-adjust:exact;print-color-adjust:exact;}
      .scroll-wrap{max-height:none;overflow:visible;}
      *{-webkit-print-color-adjust:exact;print-color-adjust:exact;}
   }
@@ -702,8 +827,7 @@ $css
     <p class="report-month">$safeMon</p>
   </header>
 
-$blocksHtml
-$summaryHtml
+$body
   <footer>
 $dqSection
     <p style="margin-top:14px;">
@@ -979,83 +1103,131 @@ try {
             }
         }
 
-        # ---- overall KPIs (all OS) for the run summary + log ----
-        $total     = $recs.Count
-        $completed = @($recs | Where-Object { $_.Bucket -eq 'Completed' }).Count
-        $failed    = @($recs | Where-Object { $_.Bucket -eq 'Failed'    }).Count
-        $pending   = @($recs | Where-Object { $_.Bucket -eq 'Pending'   }).Count
-        $unknown   = @($recs | Where-Object { $_.Bucket -eq 'Unknown'   }).Count
-        $excluded  = @($recs | Where-Object { $_.Bucket -eq 'Excluded'  }).Count
-        $inScope   = $total - $excluded
-        $compliance = if ($inScope -gt 0) { [math]::Round(100.0 * $completed / $inScope, 1) } else { 0 }
+        # ================================================================
+        #  Funnel model: the in-scope VM set is fixed. Each patching day
+        #  works whatever was NOT completed the day before. Excluded VMs
+        #  are decided up front and stay constant in every calculation.
+        # ================================================================
+        $grandTotal    = $recs.Count
+        $excludedRecs  = @($recs | Where-Object { $_.Bucket -eq 'Excluded' })
+        $inScopeRecs   = @($recs | Where-Object { $_.Bucket -ne 'Excluded' })
+        $excludedCount = $excludedRecs.Count
+        $inScopeCount  = $inScopeRecs.Count
 
-        if     ($inScope -eq 0)                        { $sTxt = 'No In-Scope VMs';             $sCls = 'warn' }
-        elseif ($failed -gt 0 -or $unknown -gt 0)      { $sTxt = 'Attention Required';          $sCls = 'bad' }
-        elseif ($compliance -ge 100)                   { $sTxt = 'Fully Compliant';             $sCls = 'good' }
-        elseif ($compliance -ge $ComplianceThreshold)  { $sTxt = 'On Track - Minor Exceptions'; $sCls = 'warn' }
-        else                                           { $sTxt = 'Attention Required';          $sCls = 'bad' }
+        $famOrder  = @('Windows', 'Linux', 'Other')
+        $famCounts = foreach ($fam in $famOrder) {
+            $n = @($recs | Where-Object { (Get-OsFamily $_.OS) -eq $fam }).Count
+            if ($n -gt 0) { '{0} {1}' -f $fam, $n }
+        }
+        $famSummary = ($famCounts) -join '  &middot;  '
+        $famExcl = @{}
+        foreach ($fam in $famOrder) { $famExcl[$fam] = @($excludedRecs | Where-Object { (Get-OsFamily $_.OS) -eq $fam }).Count }
 
-        # ---- one block per OS family : Windows first, then Linux, then Other ----
-        $ord = @{ 'Failed' = 0; 'Pending' = 1; 'Unknown' = 2 }
-        $blocks = New-Object System.Collections.Generic.List[object]
-        foreach ($fam in @('Windows', 'Linux', 'Other')) {
-            $fr = @($recs | Where-Object { (Get-OsFamily $_.OS) -eq $fam })
-            if ($fr.Count -eq 0) { continue }
+        # distinct completion dates among in-scope Completed VMs = the patching days
+        $dayDates = @($inScopeRecs | Where-Object { $_.Bucket -eq 'Completed' -and $_.Date -is [datetime] } |
+                      ForEach-Object { $_.Date.Date } | Sort-Object -Unique)
+        $doneNoDate = @($inScopeRecs | Where-Object { $_.Bucket -eq 'Completed' -and -not ($_.Date -is [datetime]) })
+        if ($doneNoDate.Count -gt 0) { $dq.Add("$($doneNoDate.Count) completed VM(s) have no patching date - counted on Day 1.") }
+        $dayList = @($dayDates)
+        if ($dayList.Count -eq 0) { $dayList = @($null) }   # single fallback day (no dates in sheet)
 
-            $fTotal     = $fr.Count
-            $fCompleted = @($fr | Where-Object { $_.Bucket -eq 'Completed' }).Count
-            $fFailed    = @($fr | Where-Object { $_.Bucket -eq 'Failed'    }).Count
-            $fPending   = @($fr | Where-Object { $_.Bucket -eq 'Pending'   }).Count
-            $fUnknown   = @($fr | Where-Object { $_.Bucket -eq 'Unknown'   }).Count
-            $fExcluded  = @($fr | Where-Object { $_.Bucket -eq 'Excluded'  }).Count
-            $fInScope   = $fTotal - $fExcluded
-            $fComp      = if ($fInScope -gt 0) { [math]::Round(100.0 * $fCompleted / $fInScope, 1) } else { 0 }
+        $days = New-Object System.Collections.Generic.List[object]
+        $dayIdx = 0
+        foreach ($d in $dayList) {
+            $dayIdx++
+            $isFirst = ($dayIdx -eq 1)
+            if ($d -is [datetime]) { $dayName = $d.ToString('dddd'); $dateText = $d.ToString('d MMM yyyy') }
+            else                   { $dayName = ''; $dateText = $monthDisplay }
 
-            if     ($fInScope -eq 0)                       { $fTxt = 'No In-Scope VMs';             $fCls = 'warn' }
-            elseif ($fFailed -gt 0 -or $fUnknown -gt 0)    { $fTxt = 'Attention Required';          $fCls = 'bad' }
-            elseif ($fComp -ge 100)                        { $fTxt = 'Fully Compliant';             $fCls = 'good' }
-            elseif ($fComp -ge $ComplianceThreshold)       { $fTxt = 'On Track - Minor Exceptions'; $fCls = 'warn' }
-            else                                           { $fTxt = 'Attention Required';          $fCls = 'bad' }
-
-            $fOs = $fr | ForEach-Object { if ($_.OS -ne '') { $_.OS } else { '(not specified)' } } |
-                Group-Object | Sort-Object Count -Descending |
-                ForEach-Object { [pscustomobject]@{ Name = $_.Name; Count = $_.Count } }
-            if ($fOs.Count -gt 8) {
-                $fTop  = $fOs | Select-Object -First 7
-                $fRest = ($fOs | Select-Object -Skip 7 | Measure-Object -Property Count -Sum).Sum
-                $fOs   = @($fTop) + [pscustomobject]@{ Name = 'Other'; Count = $fRest }
+            # ---- per-OS blocks for this day ----
+            $blocks = New-Object System.Collections.Generic.List[object]
+            foreach ($fam in $famOrder) {
+                $famIn = @($inScopeRecs | Where-Object { (Get-OsFamily $_.OS) -eq $fam })
+                if ($famIn.Count -eq 0 -and $famExcl[$fam] -eq 0) { continue }
+                $sd = Get-ScopeDay $famIn $famExcl[$fam] $d $isFirst $ComplianceThreshold
+                $fOs = $famIn | ForEach-Object { if ($_.OS -ne '') { $_.OS } else { '(not specified)' } } |
+                    Group-Object | Sort-Object Count -Descending |
+                    ForEach-Object { [pscustomobject]@{ Name = $_.Name; Count = $_.Count } }
+                if ($fOs.Count -gt 8) {
+                    $fTop  = $fOs | Select-Object -First 7
+                    $fRest = ($fOs | Select-Object -Skip 7 | Measure-Object -Property Count -Sum).Sum
+                    $fOs   = @($fTop) + [pscustomobject]@{ Name = 'Other'; Count = $fRest }
+                }
+                $blocks.Add([pscustomobject]@{
+                    Family = $fam
+                    Total = $sd.Total; Completed = $sd.Completed; Failed = $sd.Failed; Pending = $sd.Pending
+                    Unknown = 0; Excluded = $sd.Excluded
+                    Compliance = $sd.Compliance; StatusText = $sd.StatusText; StatusClass = $sd.StatusClass
+                    OsBreakdown  = @($fOs)
+                    CompletedVMs = $sd.CompletedList
+                    PendingVMs   = $sd.PendingList
+                    Exceptions   = $sd.FailedList
+                })
             }
 
-            $blocks.Add([pscustomobject]@{
-                Family       = $fam
-                Total = $fTotal; Completed = $fCompleted; Failed = $fFailed; Pending = $fPending; Unknown = $fUnknown; Excluded = $fExcluded
-                Compliance   = $fComp; StatusText = $fTxt; StatusClass = $fCls
-                OsBreakdown  = @($fOs)
-                CompletedVMs = @($fr | Where-Object { $_.Bucket -eq 'Completed' } | Sort-Object HostName)
-                PendingVMs   = @($fr | Where-Object {
-                        $k = Get-NormalKey $_.StatusText
-                        ($_.Bucket -eq 'Unknown') -or ($k -like '*pending*') -or ($k -like '*notstarted*') -or ($k -like '*notyetstarted*') -or ($k -like '*yettostart*') -or ($k -like '*tobestarted*')
-                    } | Sort-Object HostName)
-                Exceptions   = @($fr | Where-Object { $_.Bucket -eq 'Failed' } | Sort-Object HostName)
-            })
-            Write-Log ("  [{0,-7}] Total={1} Completed={2} Failed={3} Pending={4} Unknown={5} Excluded={6}  in-scope compliance {7}%" -f $fam, $fTotal, $fCompleted, $fFailed, $fPending, $fUnknown, $fExcluded, $fComp)
-        }
-        if ($blocks.Count -eq 0) { $dq.Add('No VMs could be classified by operating system.'); continue }
+            # ---- day summary (Windows + Linux combined) ----
+            $allSd = Get-ScopeDay $inScopeRecs $excludedCount $d $isFirst $ComplianceThreshold
+            $daySum = @{ Total = $allSd.Total; Completed = $allSd.Completed; Failed = $allSd.Failed
+                Pending = $allSd.Pending; Unknown = 0; Excluded = $excludedCount; InScope = $allSd.InScope
+                Compliance = $allSd.Compliance; StatusText = $allSd.StatusText; StatusClass = $allSd.StatusClass }
 
-        $famSummary = ($blocks | ForEach-Object { '{0} {1}' -f $_.Family, $_.Total }) -join '  &middot;  '
+            # ---- cumulative state at end of this day (whole campaign) ----
+            $cumCompleted = $allSd.DoneByEnd
+            $cumFailed    = @($inScopeRecs | Where-Object { $_.Bucket -eq 'Failed' }).Count
+            $cumInScope   = $grandTotal - $excludedCount
+            $cumPending   = $grandTotal - $cumCompleted - $cumFailed - $excludedCount
+            if ($cumPending -lt 0) { $cumPending = 0 }
+            $cumComp = if ($cumInScope -gt 0) { [math]::Round(100.0 * $cumCompleted / $cumInScope, 1) } else { 0 }
+            $cl = Get-StatusLabel $cumInScope $cumFailed 0 $cumComp $ComplianceThreshold
+            $cumSum = $null
+            if ($dayIdx -ge 2) {
+                $cumSum = @{ Total = $grandTotal; Completed = $cumCompleted; Failed = $cumFailed
+                    Pending = $cumPending; Unknown = 0; Excluded = $excludedCount; InScope = $cumInScope
+                    Compliance = $cumComp; StatusText = $cl[0]; StatusClass = $cl[1] }
+            }
+
+            $days.Add([pscustomobject]@{
+                DayName = $dayName; DateText = $dateText
+                Blocks  = $blocks.ToArray()
+                DaySummary = $daySum
+                DayNote = ("{0} in-scope VM(s) still open at the start of this day; {1} completed today, {2} still pending, {3} failed.  {4} VM(s) excluded as per management (fixed every day)." -f `
+                            $daySum.Total, $daySum.Completed, $daySum.Pending, $daySum.Failed, $excludedCount)
+                CumSummary = $cumSum
+                CumNote = ("End of Day {0}: {1} of {2} in-scope VMs completed, {3} still pending, {4} failed, {5} excluded (fixed).  Completed rises and Pending falls each day." -f `
+                            $dayIdx, $cumCompleted, $cumInScope, $cumPending, $cumFailed, $excludedCount)
+            })
+
+            Write-Log ("  Day {0} [{1}]  open={2} completedToday={3} pending={4} failed={5} excluded={6}  |  cum completed={7} cum pending={8}" -f `
+                        $dayIdx, $dateText, $daySum.Total, $daySum.Completed, $daySum.Pending, $daySum.Failed, $excludedCount, $cumCompleted, $cumPending)
+        }
+        if ($days.Count -eq 0) { $dq.Add('No VMs to report.'); continue }
+
+        # ---- month-end = final state of the campaign ----
+        $meCompleted = @($inScopeRecs | Where-Object { $_.Bucket -eq 'Completed' }).Count
+        $meFailed    = @($inScopeRecs | Where-Object { $_.Bucket -eq 'Failed'    }).Count
+        $meInScope   = $grandTotal - $excludedCount
+        $mePending   = $grandTotal - $meCompleted - $meFailed - $excludedCount
+        if ($mePending -lt 0) { $mePending = 0 }
+        $meComp = if ($meInScope -gt 0) { [math]::Round(100.0 * $meCompleted / $meInScope, 1) } else { 0 }
+        $ml = Get-StatusLabel $meInScope $meFailed 0 $meComp $ComplianceThreshold
+        $monthSummary = @{ Total = $grandTotal; Completed = $meCompleted; Failed = $meFailed
+            Pending = $mePending; Unknown = 0; Excluded = $excludedCount; InScope = $meInScope
+            Compliance = $meComp; StatusText = $ml[0]; StatusClass = $ml[1] }
+
+        # keep these for the run-summary log line + returned object
+        $total = $grandTotal; $completed = $meCompleted; $failed = $meFailed
+        $pending = $mePending; $unknown = 0; $excluded = $excludedCount
+        $compliance = $meComp; $sTxt = $ml[0]; $sCls = $ml[1]
 
         $ctx = @{
             Title           = 'Monthly Infrastructure Patching Executive Report'
             EngineerDisplay = $(if ($EngineerName) { $EngineerName } else { $ImplementedBy })
             MonthDisplay    = $monthDisplay
-            GrandTotal      = $total
+            GrandTotal      = $grandTotal
             Threshold       = $ComplianceThreshold
-            Overall         = @{
-                Total = $total; Completed = $completed; Failed = $failed; Pending = $pending
-                Excluded = $excluded; InScope = $inScope
-                StatusText = $sTxt; StatusClass = $sCls; Families = $famSummary
-            }
-            Blocks          = $blocks.ToArray()
+            Days            = $days.ToArray()
+            MonthSummary    = $monthSummary
+            MonthNote       = ("$famSummary &nbsp;|&nbsp; {0} patching day(s) &nbsp;|&nbsp; {1} in-scope VMs, {2} excluded as per management (fixed in every calculation)." -f $days.Count, $meInScope, $excludedCount)
             DataQuality     = @($dq | Select-Object -Unique)
             Generated       = (Get-Date).ToString('yyyy-MM-dd HH:mm')
             SourceFile      = [System.IO.Path]::GetFileName($InputExcel)
