@@ -1,0 +1,341 @@
+====================================================================
+ QUALYS COMPLIANCE EVIDENCE - READ-ONLY COLLECTION COMMANDS
+ Method : VMware PowerCLI  Invoke-VMScript  (guest operations)
+ Run from: an admin host whose PowerCLI session is ALREADY
+           connected to vCenter (do NOT Connect/Disconnect here)
+ Targets : vCenter VM inventory names, one per line, in
+           C:\temp\vmlist.txt   (blank lines and #-lines ignored)
+ Safety  : every command below is read-only. No registry writes,
+           no service/policy changes, no reboots. The only disk
+           activity in the guest is a GUID-named temp file from
+           "secedit /export" (an export, not an apply) that the
+           same script deletes.
+====================================================================
+
+
+--------------------------------------------------------------------
+ STEP 1 - SESSION SETUP  (run once per PowerCLI session)
+ Handles: nothing by itself - prepares $VMs, $OutDir, $GuestCred
+          and the reusable read-only runner Invoke-EvidenceCheck
+          used by every per-control block further down.
+--------------------------------------------------------------------
+
+# Confirm the existing vCenter connection (do NOT reconnect):
+$global:DefaultVIServers
+
+# Guest local-admin credential (in-memory only). Example user: .\Administrator
+$GuestCred = Get-Credential
+
+# Target list = vCenter VM inventory names, one per line:
+$VMs = Get-Content C:\temp\vmlist.txt |
+       ForEach-Object { $_.Trim() } |
+       Where-Object { $_ -and $_ -notmatch "^#" }
+
+# Evidence output folder on THIS machine (timestamped, keep as the record):
+$OutDir = "C:\temp\qualys_evidence\$(Get-Date -Format yyyyMMdd_HHmmss)"
+New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
+
+# Reusable read-only runner: one control, all VMs, one file per VM.
+function Invoke-EvidenceCheck {
+    param(
+        [Parameter(Mandatory)] [string] $ControlId,
+        [Parameter(Mandatory)] [string] $GuestScript
+    )
+    foreach ($name in $VMs) {
+        $vm   = Get-VM -Name $name -ErrorAction SilentlyContinue
+        $file = Join-Path $OutDir ("{0}_{1}.txt" -f $name, $ControlId)
+        "===== VM(vCenter): $name | Control: $ControlId | $(Get-Date -Format s) =====" | Set-Content $file
+        if (-not $vm)                       { "SKIPPED: not in vCenter inventory"          | Add-Content $file; continue }
+        if ($vm.PowerState -ne "PoweredOn") { "SKIPPED: power state = $($vm.PowerState)"    | Add-Content $file; continue }
+        if ($vm.Guest.State -ne "Running")  { "SKIPPED: VMware Tools = $($vm.Guest.State)"  | Add-Content $file; continue }
+        try {
+            $p = @{
+                VM              = $vm
+                GuestCredential = $GuestCred
+                ScriptType      = "Powershell"
+                ScriptText      = $GuestScript
+                ErrorAction     = "Stop"
+            }
+            (Invoke-VMScript @p).ScriptOutput.TrimEnd() | Add-Content $file
+        } catch {
+            "ERROR: $($_.Exception.Message)" | Add-Content $file
+        }
+        Write-Host ("  {0} : {1}" -f $name, $file)
+    }
+}
+Write-Host "Setup complete. Evidence folder: $OutDir"
+
+
+--------------------------------------------------------------------
+ STEP 2 - CONSOLIDATED COLLECTOR  (RECOMMENDED for the bulk pass)
+ Handles: ALL seven controls in a single Invoke-VMScript call per
+          VM. Output file per VM: <VM>_qualys_evidence.txt
+            25349 - Kernel-mode Hardware-enforced Stack Protection
+            4501  - Audit Policy Change
+            26502 - Allow Administrator Account Lockout
+            2200  - Deny log on through Remote Desktop Services
+            2196  - Deny access to this computer from the network
+            10473 - Credential Guard (LsaCfgFlags)
+            10474 - HVCI (HypervisorEnforcedCodeIntegrity)
+--------------------------------------------------------------------
+
+$GuestScript_All = @'
+$ErrorActionPreference = "Continue"
+"HOST         : $(hostname)"
+"COMPUTERNAME : $env:COMPUTERNAME"
+$os = Get-CimInstance Win32_OperatingSystem
+"OS           : $($os.Caption) | Build $($os.BuildNumber) | $($os.Version)"
+$dg = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceGuard"
+
+""
+"===== 25349  Kernel-mode Hardware-enforced Stack Protection ====="
+"ConfigureKernelShadowStacksLaunch = " + (Get-ItemProperty $dg -Name ConfigureKernelShadowStacksLaunch -EA SilentlyContinue).ConfigureKernelShadowStacksLaunch
+Get-CimInstance -Namespace root\Microsoft\Windows\DeviceGuard -ClassName Win32_DeviceGuard |
+    Format-List AvailableSecurityProperties, SecurityServicesConfigured, SecurityServicesRunning, VirtualizationBasedSecurityStatus, CodeIntegrityPolicyEnforcementStatus
+
+""
+"===== 4501  Audit Policy Change ====="
+auditpol /get /subcategory:"Audit Policy Change"
+
+""
+"===== 26502  Allow Administrator Account Lockout ====="
+net accounts
+$t2 = Join-Path $env:TEMP ("q_secpol_{0}.cfg" -f [guid]::NewGuid())
+secedit /export /cfg $t2 /areas SECURITYPOLICY | Out-Null
+Get-Content $t2 | Select-String "AllowAdministratorLockout|LockoutBadCount|LockoutDuration|ResetLockoutCount" | ForEach-Object { $_.Line.Trim() }
+Remove-Item $t2 -Force -EA SilentlyContinue
+
+""
+"===== 2200 / 2196  Deny RDP logon / Deny network logon ====="
+$t1 = Join-Path $env:TEMP ("q_secpol_{0}.cfg" -f [guid]::NewGuid())
+secedit /export /cfg $t1 /areas USER_RIGHTS | Out-Null
+Get-Content $t1 | Select-String "SeDenyRemoteInteractiveLogonRight|SeDenyNetworkLogonRight" | ForEach-Object { $_.Line.Trim() }
+Remove-Item $t1 -Force -EA SilentlyContinue
+
+""
+"===== 10473  Credential Guard (LsaCfgFlags) ====="
+"LsaCfgFlags = " + (Get-ItemProperty $dg -Name LsaCfgFlags -EA SilentlyContinue).LsaCfgFlags
+
+""
+"===== 10474  HVCI (HypervisorEnforcedCodeIntegrity) ====="
+"HypervisorEnforcedCodeIntegrity = " + (Get-ItemProperty $dg -Name HypervisorEnforcedCodeIntegrity -EA SilentlyContinue).HypervisorEnforcedCodeIntegrity
+'@
+
+foreach ($name in $VMs) {
+    $vm   = Get-VM -Name $name -ErrorAction SilentlyContinue
+    $file = Join-Path $OutDir ("{0}_qualys_evidence.txt" -f $name)
+    "===== VM(vCenter): $name | $(Get-Date -Format s) =====" | Set-Content $file
+    if (-not $vm)                       { "SKIPPED: not in vCenter inventory"         | Add-Content $file; continue }
+    if ($vm.PowerState -ne "PoweredOn") { "SKIPPED: power state = $($vm.PowerState)"   | Add-Content $file; continue }
+    if ($vm.Guest.State -ne "Running")  { "SKIPPED: VMware Tools = $($vm.Guest.State)" | Add-Content $file; continue }
+    try {
+        $p = @{ VM = $vm; GuestCredential = $GuestCred; ScriptType = "Powershell"; ScriptText = $GuestScript_All; ErrorAction = "Stop" }
+        (Invoke-VMScript @p).ScriptOutput.TrimEnd() | Add-Content $file
+    } catch {
+        "ERROR: $($_.Exception.Message)" | Add-Content $file
+    }
+    Write-Host "collected: $name"
+}
+Write-Host "Done. Files in $OutDir"
+
+
+--------------------------------------------------------------------
+ STEP 2 (OPTIONAL) - THROTTLED PARALLEL VARIANT (5 VMs at a time)
+ Handles: same ALL seven controls as the consolidated collector.
+          Use only for large VM lists after reviewing vCenter
+          guest-ops load. The sequential version above is the
+          safer default.
+--------------------------------------------------------------------
+
+$throttle = 5
+$queue    = [System.Collections.Queue]::new(@($VMs))
+$running  = @{}
+while ($queue.Count -or $running.Count) {
+    while ($running.Count -lt $throttle -and $queue.Count) {
+        $name = $queue.Dequeue()
+        $vm   = Get-VM -Name $name -ErrorAction SilentlyContinue
+        $file = Join-Path $OutDir ("{0}_qualys_evidence.txt" -f $name)
+        if (-not $vm -or $vm.PowerState -ne "PoweredOn" -or $vm.Guest.State -ne "Running") {
+            "SKIPPED: $name (not found / off / no Tools)" | Set-Content $file; continue
+        }
+        $p = @{ VM = $vm; GuestCredential = $GuestCred; ScriptType = "Powershell"; ScriptText = $GuestScript_All; RunAsync = $true }
+        $running[$name] = Invoke-VMScript @p
+    }
+    Start-Sleep -Seconds 5
+    foreach ($name in @($running.Keys)) {
+        $task = Get-Task -Id $running[$name].Id
+        if ($task.State -eq "Success" -or $task.State -eq "Error") {
+            $file = Join-Path $OutDir ("{0}_qualys_evidence.txt" -f $name)
+            "===== VM(vCenter): $name | $(Get-Date -Format s) =====" | Set-Content $file
+            try { (Wait-Task $running[$name]).ScriptOutput.TrimEnd() | Add-Content $file }
+            catch { "ERROR: $($_.Exception.Message)" | Add-Content $file }
+            $running.Remove($name)
+        }
+    }
+}
+
+
+====================================================================
+ PER-CONTROL TARGETED CHECKS
+ Run STEP 1 (Setup block) first. Each block below writes
+ <VM>_<ControlID>.txt into $OutDir for just that one control.
+====================================================================
+
+
+--------------------------------------------------------------------
+ CONTROL 25349 - Kernel-mode Hardware-enforced Stack Protection
+                 (Critical)
+ Checks : registry ConfigureKernelShadowStacksLaunch  (expected 1
+          = Enforcement; 2 = Audit; 0/absent = off) plus the
+          Win32_DeviceGuard runtime arrays and OS build.
+ Note   : msinfo32 runtime state is GUI-only and cannot be
+          captured via Invoke-VMScript - take one interactive
+          msinfo32 "System Summary" screenshot on a representative
+          VM to prove the enforced/running state.
+--------------------------------------------------------------------
+
+Invoke-EvidenceCheck -ControlId 25349 -GuestScript @'
+"HOST: $(hostname)"
+$os = Get-CimInstance Win32_OperatingSystem
+"OS  : $($os.Caption) | Build $($os.BuildNumber)"
+$dg = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceGuard"
+"ConfigureKernelShadowStacksLaunch = " + (Get-ItemProperty $dg -Name ConfigureKernelShadowStacksLaunch -EA SilentlyContinue).ConfigureKernelShadowStacksLaunch
+Get-CimInstance -Namespace root\Microsoft\Windows\DeviceGuard -ClassName Win32_DeviceGuard |
+    Format-List AvailableSecurityProperties, SecurityServicesConfigured, SecurityServicesRunning, VirtualizationBasedSecurityStatus
+'@
+
+
+--------------------------------------------------------------------
+ CONTROL 2200 - Deny log on through Remote Desktop Services
+                (Critical)
+ Checks : SeDenyRemoteInteractiveLogonRight members from an
+          effective-policy secedit export. Expected to include
+          *S-1-5-113 (Local account) alongside Guests.
+--------------------------------------------------------------------
+
+Invoke-EvidenceCheck -ControlId 2200 -GuestScript @'
+"HOST: $(hostname)"
+$t = Join-Path $env:TEMP ("q_secpol_{0}.cfg" -f [guid]::NewGuid())
+secedit /export /cfg $t /areas USER_RIGHTS | Out-Null
+Get-Content $t | Select-String "SeDenyRemoteInteractiveLogonRight" | ForEach-Object { $_.Line.Trim() }
+Remove-Item $t -Force -EA SilentlyContinue
+'@
+
+
+--------------------------------------------------------------------
+ CONTROL 4501 - Audit Policy Change (Advanced Audit Setting)
+                (Critical)
+ Checks : effective auditpol setting for the "Audit Policy Change"
+          subcategory. Expected: "Success and Failure".
+--------------------------------------------------------------------
+
+Invoke-EvidenceCheck -ControlId 4501 -GuestScript @'
+"HOST: $(hostname)"
+auditpol /get /subcategory:"Audit Policy Change"
+'@
+
+
+--------------------------------------------------------------------
+ CONTROL 2196 - Deny access to this computer from the network
+                (Critical / potential exception)
+ Checks : SeDenyNetworkLogonRight members from an effective-policy
+          secedit export. Expected to include *S-1-5-113 (Local
+          account) and *S-1-5-114 (Local account + Administrators)
+          alongside Guests.
+ WARNING: adding S-1-5-114 blocks the local Administrator account
+          Qualys uses to authenticate its scans. Coordinate a
+          scan-account strategy with the security team BEFORE any
+          remediation. (Collection here is unaffected - Invoke-
+          VMScript uses VMware Tools, not network logon.)
+--------------------------------------------------------------------
+
+Invoke-EvidenceCheck -ControlId 2196 -GuestScript @'
+"HOST: $(hostname)"
+$t = Join-Path $env:TEMP ("q_secpol_{0}.cfg" -f [guid]::NewGuid())
+secedit /export /cfg $t /areas USER_RIGHTS | Out-Null
+Get-Content $t | Select-String "SeDenyNetworkLogonRight" | ForEach-Object { $_.Line.Trim() }
+Remove-Item $t -Force -EA SilentlyContinue
+'@
+
+
+--------------------------------------------------------------------
+ CONTROL 26502 - Allow Administrator Account Lockout (Urgent)
+ Checks : "net accounts" lockout threshold/duration/window, plus
+          AllowAdministratorLockout / Lockout* values from a
+          SECURITYPOLICY secedit export. Expected:
+          AllowAdministratorLockout = 1.
+ Note   : Qualys reported "Not Applicable" for this control - this
+          check confirms whether that was a scanner data-collection
+          gap rather than a real misconfiguration.
+--------------------------------------------------------------------
+
+Invoke-EvidenceCheck -ControlId 26502 -GuestScript @'
+"HOST: $(hostname)"
+net accounts
+$t = Join-Path $env:TEMP ("q_secpol_{0}.cfg" -f [guid]::NewGuid())
+secedit /export /cfg $t /areas SECURITYPOLICY | Out-Null
+Get-Content $t | Select-String "AllowAdministratorLockout|LockoutBadCount|LockoutDuration|ResetLockoutCount" | ForEach-Object { $_.Line.Trim() }
+Remove-Item $t -Force -EA SilentlyContinue
+'@
+
+
+--------------------------------------------------------------------
+ CONTROL 10473 - Turn On VBS: Credential Guard Configuration
+                 (Urgent)
+ Checks : registry LsaCfgFlags (expected 1 = Enabled with UEFI
+          lock) plus Win32_DeviceGuard SecurityServicesConfigured /
+          SecurityServicesRunning (value 1 = Credential Guard) for
+          the runtime state.
+--------------------------------------------------------------------
+
+Invoke-EvidenceCheck -ControlId 10473 -GuestScript @'
+"HOST: $(hostname)"
+$dg = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceGuard"
+"LsaCfgFlags = " + (Get-ItemProperty $dg -Name LsaCfgFlags -EA SilentlyContinue).LsaCfgFlags
+Get-CimInstance -Namespace root\Microsoft\Windows\DeviceGuard -ClassName Win32_DeviceGuard |
+    Format-List SecurityServicesConfigured, SecurityServicesRunning, VirtualizationBasedSecurityStatus
+'@
+
+
+--------------------------------------------------------------------
+ CONTROL 10474 - Turn On VBS: HVCI (Hypervisor-Enforced Code
+                 Integrity) (Urgent)
+ Checks : registry HypervisorEnforcedCodeIntegrity (expected 1 =
+          Enabled with UEFI lock; 2 = enabled without lock) plus
+          Win32_DeviceGuard SecurityServicesConfigured /
+          SecurityServicesRunning (value 2 = HVCI) and
+          CodeIntegrityPolicyEnforcementStatus.
+--------------------------------------------------------------------
+
+Invoke-EvidenceCheck -ControlId 10474 -GuestScript @'
+"HOST: $(hostname)"
+$dg = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceGuard"
+"HypervisorEnforcedCodeIntegrity = " + (Get-ItemProperty $dg -Name HypervisorEnforcedCodeIntegrity -EA SilentlyContinue).HypervisorEnforcedCodeIntegrity
+Get-CimInstance -Namespace root\Microsoft\Windows\DeviceGuard -ClassName Win32_DeviceGuard |
+    Format-List SecurityServicesConfigured, SecurityServicesRunning, VirtualizationBasedSecurityStatus, CodeIntegrityPolicyEnforcementStatus
+'@
+
+
+====================================================================
+ MANUAL / INTERACTIVE STEP (cannot be scripted through VMware Tools)
+====================================================================
+
+ CONTROL 25349 runtime proof:
+   On one representative VM, open  msinfo32  -> System Summary and
+   screenshot the line:
+     "Kernel-mode Hardware-enforced Stack Protection"
+   It must read running / enforced (not "audit mode" / "off").
+
+
+====================================================================
+ REMINDERS
+====================================================================
+ - These commands are for EVIDENCE ONLY. Do not run remediation
+   through Invoke-VMScript; all config changes go through change
+   management.
+ - Findings 2196 and 26502 must be routed to the security team for
+   a decision before any change is made.
+ - Keep the timestamped $OutDir as the immutable evidence set
+   (hash it if your process requires).
+ - vmlist.txt entries must be vCenter INVENTORY names (what
+   Get-VM -Name resolves), which are not always the guest hostname.
