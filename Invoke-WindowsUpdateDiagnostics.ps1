@@ -564,6 +564,73 @@ function Get-FriendlyVixError {
     }
 }
 
+# Runs a (potentially large) PowerShell payload in the guest WITHOUT ever asking VMware
+# Tools to locate a PowerShell interpreter for -ScriptType Powershell. Some VMs (older/
+# stale VMware Tools builds) fail that lookup with a misleading "Could not locate
+# 'Powershell' script interpreter... Probably you do not have enough permissions" error
+# even though the credential is perfectly valid - Get-FriendlyVixError above explains it,
+# but the real fix is to stop depending on that lookup at all. Instead: stage the payload
+# as a .ps1 file in the guest (Copy-VMGuestFile - a plain VIX file transfer, no script
+# interpreter involved at all) and execute it via "-ScriptType Bat" invoking
+# "powershell.exe -File" directly - cmd.exe is always locatable, so this works on every
+# VM regardless of Tools' PowerShell-path registration. Falls back to chunked staging
+# (also Bat/certutil-only, no PowerShell dependency) if Copy-VMGuestFile is unavailable.
+function Invoke-GuestPowerShellFile {
+    param(
+        $VM, $Server, [pscredential]$Credential,
+        [string]$PayloadText, [int]$ToolsWaitSecs,
+        [int]$ChunkSize = 1500
+    )
+    $tag  = [guid]::NewGuid().ToString('N').Substring(0, 12)
+    $gB64 = "C:\Windows\Temp\wu$tag.b64"
+    $gPs1 = "C:\Windows\Temp\wu$tag.ps1"
+    $staged = $false
+
+    try {
+        if (Get-Command Copy-VMGuestFile -ErrorAction SilentlyContinue) {
+            $local = Join-Path $env:TEMP "wu$tag.ps1"
+            try {
+                [System.IO.File]::WriteAllText($local, $PayloadText, (New-Object System.Text.UTF8Encoding($false)))
+                Copy-VMGuestFile -Source $local -Destination $gPs1 -VM $VM -Server $Server `
+                                 -GuestCredential $Credential -LocalToGuest -Force -ErrorAction Stop | Out-Null
+                $staged = $true
+            } catch {
+                Write-Log "  Copy-VMGuestFile not usable ($(($_.Exception.Message -split "`n")[0].Trim())); using chunked Bat staging." 'INFO'
+            } finally {
+                Remove-Item -LiteralPath $local -Force -ErrorAction SilentlyContinue
+            }
+        }
+
+        if (-not $staged) {
+            $b64   = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($PayloadText))
+            $total = [Math]::Ceiling($b64.Length / $ChunkSize)
+            for ($i = 0; $i -lt $total; $i++) {
+                $part     = $b64.Substring($i * $ChunkSize, [Math]::Min($ChunkSize, $b64.Length - ($i * $ChunkSize)))
+                $redirect = if ($i -eq 0) { '>' } else { '>>' }
+                $st = "cmd /c echo $part $redirect `"$gB64`""
+                Invoke-VMScript -VM $VM -Server $Server -GuestCredential $Credential -ScriptText $st `
+                                -ScriptType Bat -ToolsWaitSecs $ToolsWaitSecs -Confirm:$false -ErrorAction Stop | Out-Null
+            }
+            # certutil is a stock Windows binary (no PowerShell involved) that decodes base64.
+            $decode = "certutil -decode `"$gB64`" `"$gPs1`""
+            Invoke-VMScript -VM $VM -Server $Server -GuestCredential $Credential -ScriptText $decode `
+                            -ScriptType Bat -ToolsWaitSecs $ToolsWaitSecs -Confirm:$false -ErrorAction Stop | Out-Null
+        }
+
+        $runner = "powershell.exe -NonInteractive -NoProfile -ExecutionPolicy Bypass -File `"$gPs1`""
+        $res = Invoke-VMScript -VM $VM -Server $Server -GuestCredential $Credential -ScriptText $runner `
+                               -ScriptType Bat -ToolsWaitSecs $ToolsWaitSecs -Confirm:$false -ErrorAction Stop
+        return [string]$res.ScriptOutput
+    }
+    finally {
+        $cleanup = "del `"$gB64`" `"$gPs1`" 2>nul"
+        try {
+            Invoke-VMScript -VM $VM -Server $Server -GuestCredential $Credential -ScriptText $cleanup `
+                            -ScriptType Bat -ToolsWaitSecs $ToolsWaitSecs -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+        } catch { }
+    }
+}
+
 function Get-VMInventory {
     param([object[]]$Servers)
     $inv = New-Object System.Collections.Generic.List[object]
@@ -675,12 +742,12 @@ foreach ($vmName in $vmNames) {
         $vm = $val.VM; $srv = $val.Server
 
         Write-Log "'$vmName': invoking guest diagnostics (ToolsWaitSecs=$ToolsWaitSecs)..."
-        $result = Invoke-VMScript -VM $vm -Server $srv -ScriptText $Payload -ScriptType Powershell -GuestCredential $GuestCredential -ToolsWaitSecs $ToolsWaitSecs -Confirm:$false -ErrorAction Stop
+        $scriptOutput = Invoke-GuestPowerShellFile -VM $vm -Server $srv -Credential $GuestCredential -PayloadText $Payload -ToolsWaitSecs $ToolsWaitSecs
 
-        $envelope = Read-EnvelopeFromScriptOutput -Output $result.ScriptOutput -StartMarker '<<<WU-DIAG-ENVELOPE-B64>>>' -EndMarker '<<<END-WU-DIAG-ENVELOPE>>>'
+        $envelope = Read-EnvelopeFromScriptOutput -Output $scriptOutput -StartMarker '<<<WU-DIAG-ENVELOPE-B64>>>' -EndMarker '<<<END-WU-DIAG-ENVELOPE>>>'
         if (-not $envelope) {
             $summary.SkippedFailed++
-            $snippet = if ($result.ScriptOutput) { ($result.ScriptOutput -replace '\s+', ' ').Trim() } else { '(no output)' }
+            $snippet = if ($scriptOutput) { ($scriptOutput -replace '\s+', ' ').Trim() } else { '(no output)' }
             if ($snippet.Length -gt 600) { $snippet = $snippet.Substring(0, 600) + '...' }
             $centralRows.Add((New-CentralRow -vCenter $srv.Name -VMName $vmName -GuestHostname $vm.Guest.HostName `
                 -Section 'Collection' -Check 'Guest payload result' -Status 'Unable to Check' -Value '' -Detail "No parseable result envelope. Output start: $snippet" -NextStep 'Re-run for this VM; if it repeats, check VMware Tools guest-ops health.'))
