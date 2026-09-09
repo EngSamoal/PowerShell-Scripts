@@ -377,6 +377,27 @@ function Read-EnvelopeFromScriptOutput {
     } catch { return $null }
 }
 
+# Classifies the common VIX/guest-ops Invoke-VMScript failures into an actionable
+# explanation instead of surfacing the raw (often misleading) VMware error text.
+function Get-FriendlyVixError {
+    param([string]$Message)
+    switch -Regex ($Message) {
+        'Could not locate .?Powershell.? script interpreter' {
+            return "VMware Tools authenticated the guest credential but could not confirm it has a full administrator token in-guest. Almost always one of: (1) the credential is a LOCAL (non-domain, non-built-in-Administrator) account and Windows' UAC remote token filtering silently downgrades it for network-style logons - fix on the guest with: reg add `"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System`" /v LocalAccountTokenFilterPolicy /t REG_DWORD /d 1 /f  (no reboot needed, then re-run); or (2) VMware Tools on this VM is out of date and isn't correctly registering the PowerShell interpreter path - upgrade VMware Tools on this VM. Isolate which one with: Invoke-VMScript -VM <vm> -ScriptText 'echo hi' -ScriptType Bat -GuestCredential `$cred - if that also fails, it's the credential/UAC issue; if that works, it's Tools."
+        }
+        'InvalidGuestLogin|[Ff]ailed to authenticate|authentication fail|incorrect user name or password|InvalidLogin|guest permissions|permission to perform this operation' {
+            return "Guest authentication failed - VMware Tools rejected the supplied credential. Verify the username/password in the credential file/prompt and that the account exists and isn't locked out on this VM."
+        }
+        'Tools are not running|GuestOperationsUnavailable|VMware Tools is not|not installed|VIX' {
+            return "VMware Tools guest operations are unavailable on this VM (Tools not running/installed, or too old to support guest operations). Check Tools status in vCenter."
+        }
+        'timed out|timeout' {
+            return "Timed out waiting for VMware Tools / guest response. The guest may be under load, booting, or Tools may be unresponsive - retry, or increase -ToolsWaitSecs."
+        }
+        default { return $null }
+    }
+}
+
 function Get-VMInventory {
     param([object[]]$Servers)
     $inv = New-Object System.Collections.Generic.List[object]
@@ -513,8 +534,11 @@ foreach ($vmName in $vmNames) {
     }
     catch {
         $summary.SkippedFailed++
+        $friendly = Get-FriendlyVixError -Message $_.Exception.Message
         Write-Log "'$vmName': unhandled error - $($_.Exception.Message)" 'ERROR'
-        $centralRows.Add((New-CentralRow -vCenter '' -VMName $vmName -Mode 'Read-Only' -Action 'Processing' -Result 'Failed' -Detail $_.Exception.Message))
+        if ($friendly) { Write-Log "'$vmName': diagnosis - $friendly" 'WARN' }
+        $detail = if ($friendly) { "$($_.Exception.Message) | DIAGNOSIS: $friendly" } else { $_.Exception.Message }
+        $centralRows.Add((New-CentralRow -vCenter '' -VMName $vmName -Mode 'Read-Only' -Action 'Processing' -Result 'Failed' -Detail $detail))
         continue
     }
 }
