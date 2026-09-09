@@ -263,7 +263,7 @@ if ($null -eq $scmEvents) {
 # SECTION: Windows Update Event Log Evidence
 # =======================================================================================
 try {
-    $wu20 = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 20; StartTime = $Since } -ErrorAction Stop)
+    $wu20 = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-WindowsUpdateClient'; Id = 20; StartTime = $Since } -ErrorAction Stop)
     if ($wu20.Count -gt 0) {
         $sample = $wu20 | Sort-Object TimeCreated -Descending | Select-Object -First 10 | ForEach-Object { "$($_.TimeCreated): $($_.Message -replace '\s+',' ')" }
         Add-Row 'WU Event Logs' 'System log Event ID 20 (WU install failure)' 'Problem' "$($wu20.Count) event(s)" ($sample -join ' || ') 'These are Windows Update Agent install-failure records with the HResult in the message text - match the timestamp of the most recent one to the update history entries below.'
