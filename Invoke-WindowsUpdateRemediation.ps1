@@ -1,16 +1,22 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Staged, least-to-most-disruptive Windows Update remediation for a single guest VM,
-    executed through VMware Tools Guest Operations (Invoke-VMScript). Companion to
+    Staged, least-to-most-disruptive Windows Update remediation across a list of guest
+    VMs, executed through VMware Tools Guest Operations (Invoke-VMScript). Companion to
     Invoke-WindowsUpdateDiagnostics.ps1 - run diagnostics FIRST and read every 'Problem'
     row's NEXT step before touching this script.
 
 .DESCRIPTION
+    Runs against every VM listed in -VMListPath (one name per line, '#' comments
+    ignored). Each VM is fully isolated and confirmed individually (via ShouldProcess) -
+    a VM that can't be found/validated, or throws mid-run, is recorded as skipped/failed
+    and the batch continues with the next VM; declining the prompt for one VM does not
+    stop the rest.
+
     Four independent stages, each requested explicitly with -Stage. Nothing changes on
-    the guest unless -Apply is also passed - by default every stage only PRINTS what it
-    would do ("Planned"), so you can review the plan before committing to it. Each action
-    is individually labelled Read-Only or Change in its output.
+    any guest unless -Apply is also passed - by default every stage only PRINTS what it
+    would do ("Planned"), so you can review the plan across the whole VM list before
+    committing to it. Each action is individually labelled Read-Only or Change.
 
     Stage 1 (lowest risk - service configuration only, no restart of anything healthy):
         - Reports current StartType for wuauserv/BITS/CryptSvc/UsoSvc/WaaSMedicSvc/DoSvc.
@@ -37,62 +43,64 @@
           C:\Windows\System32\catroot2 to '<name>.old.<timestamp>', so nothing is
           destroyed and the originals can be restored by renaming back if needed.
         - CHANGE: restarts the services and triggers a fresh detection scan.
-        - Refuses to run (even with -Apply) if a pending-reboot flag is currently set on
-          the guest, unless -Force is also passed - resetting Windows Update state ahead
-          of a required reboot usually just reproduces the same failure.
+        - Refuses to run (even with -Apply) on a VM with a pending-reboot flag currently
+          set, unless -Force is also passed - resetting Windows Update state ahead of a
+          required reboot usually just reproduces the same failure.
 
     Stage 4 (most disruptive - can download a large corrective payload and take a long
-    time; requires -Apply -Force):
+    time; requires -Apply -Force per VM if a reboot is pending):
         - CHANGE: DISM /Online /Cleanup-Image /RestoreHealth. Only sensible to run after
-          Stage 2's ScanHealth reported repairable corruption. Does not reboot the server -
+          Stage 2's ScanHealth reported repairable corruption. Does not reboot the guest -
           schedule a reboot yourself afterward.
 
     This script never deletes SoftwareDistribution/Catroot2, never runs a raw
-    'rm/Remove-Item' against Windows Update state, and never reboots the guest.
+    'rm/Remove-Item' against Windows Update state, and never reboots any guest.
 
-.PARAMETER VMName          vCenter inventory name of the target VM.
-.PARAMETER Stage           Which remediation stage to run (1-4). Stages are independent,
-                            not cumulative - run and evaluate one at a time.
-.PARAMETER Apply           Without this switch, the stage only reports what it WOULD do.
-                            Pass -Apply to actually make the changes.
-.PARAMETER Force           Required in addition to -Apply for Stage 3/4 when a pending
-                            reboot is currently detected on the guest.
-.PARAMETER CredentialPath  Export-Clixml PSCredential for the guest admin. If omitted or
-                            not found, you are prompted with Get-Credential instead.
-.PARAMETER OutputPath      Folder on the admin machine for the JSON result + log.
-.PARAMETER ToolsWaitSecs   Invoke-VMScript VMware Tools wait, seconds (default 300 - DISM
-                            operations in Stage 2/4 can run long).
+.PARAMETER VMListPath     Text file of VM names, one per line (default C:\temp\vmlist.txt).
+                           '#' lines and blanks are ignored; names are de-duplicated.
+.PARAMETER Stage          Which remediation stage to run (1-4) - applied uniformly to
+                           every VM in the list. Stages are independent, not cumulative -
+                           run and evaluate one at a time.
+.PARAMETER Apply          Without this switch, every VM's stage run only reports what it
+                           WOULD do. Pass -Apply to actually make the changes.
+.PARAMETER Force          Required in addition to -Apply for Stage 3/4 on any VM where a
+                           pending reboot is currently detected.
+.PARAMETER CredentialPath Export-Clixml PSCredential for the guest admin (used for every
+                           VM). If omitted or not found, you are prompted with
+                           Get-Credential instead.
+.PARAMETER OutputPath     Folder on the admin machine for the consolidated CSV/log.
+.PARAMETER ToolsWaitSecs  Invoke-VMScript VMware Tools wait, seconds (default 300 - DISM
+                           operations in Stage 2/4 can run long).
 
 .EXAMPLE
-    # Review what Stage 1 would change, without changing anything:
+    # Review what Stage 1 would change across the whole list, without changing anything:
     Connect-VIServer vcenter01
-    .\Invoke-WindowsUpdateRemediation.ps1 -VMName TB-KRTN-APP02 -Stage 1
+    .\Invoke-WindowsUpdateRemediation.ps1 -Stage 1
 
 .EXAMPLE
-    # Actually apply Stage 1:
-    .\Invoke-WindowsUpdateRemediation.ps1 -VMName TB-KRTN-APP02 -Stage 1 -Apply
+    # Actually apply Stage 1 across the list (still prompts per VM, ShouldProcess):
+    .\Invoke-WindowsUpdateRemediation.ps1 -Stage 1 -Apply
 
 .EXAMPLE
-    # Stage 3 reset, overriding the pending-reboot guard because the reboot is scheduled
-    # for right after this run:
-    .\Invoke-WindowsUpdateRemediation.ps1 -VMName TB-KRTN-APP02 -Stage 3 -Apply -Force
+    # Stage 3 reset on a specific subset, overriding the pending-reboot guard because a
+    # reboot is scheduled for right after this run:
+    .\Invoke-WindowsUpdateRemediation.ps1 -VMListPath C:\temp\wsus_servers.txt -Stage 3 -Apply -Force
 
 .NOTES
     Requires PowerCLI, an existing Connect-VIServer session, and vCenter "Guest Operation
-    Program Execution/Query" privileges. Run Invoke-WindowsUpdateDiagnostics.ps1 first and
-    do not run this against a VM that Azure Update Manager may currently be patching -
-    check the diagnostics script's "Azure Arc / AUM" section first.
+    Program Execution/Query" privileges on every target VM. Run
+    Invoke-WindowsUpdateDiagnostics.ps1 first and do not run this against a VM that Azure
+    Update Manager may currently be patching - check that script's "Azure Arc / AUM"
+    section first.
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
 param(
     [Parameter(Mandatory)]
-    [string] $VMName,
-
-    [Parameter(Mandatory)]
     [ValidateSet(1, 2, 3, 4)]
     [int] $Stage,
 
+    [string] $VMListPath     = 'C:\temp\vmlist.txt',
     [switch] $Apply,
     [switch] $Force,
 
@@ -106,12 +114,12 @@ param(
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'
 
-Write-Host "Invoke-WindowsUpdateRemediation.ps1 - staged Windows Update remediation  [build 2026-09-09a]" -ForegroundColor Magenta
+Write-Host "Invoke-WindowsUpdateRemediation.ps1 - staged Windows Update remediation across a VM list  [build 2026-09-09b]" -ForegroundColor Magenta
 Write-Host ("Running from: {0}" -f $PSCommandPath) -ForegroundColor DarkGray
 if (-not $Apply) {
-    Write-Host "DRY RUN (no -Apply): this run will only report what Stage $Stage WOULD change. Nothing on '$VMName' will be modified." -ForegroundColor Cyan
+    Write-Host "DRY RUN (no -Apply): this run will only report what Stage $Stage WOULD change on each VM. Nothing will be modified." -ForegroundColor Cyan
 } else {
-    Write-Host "APPLY MODE: Stage $Stage changes WILL be made on '$VMName'." -ForegroundColor Red
+    Write-Host "APPLY MODE: Stage $Stage changes WILL be made on each confirmed VM." -ForegroundColor Red
 }
 
 # =====================================================================================
@@ -125,8 +133,13 @@ $connectedServers = @($global:DefaultVIServers | Where-Object { $_.IsConnected }
 if ($connectedServers.Count -eq 0) { throw "No connected vCenter session. Run Connect-VIServer <vcenter> first." }
 Write-Host ("Connected vCenter(s): {0}" -f (($connectedServers | ForEach-Object { $_.Name }) -join ', ')) -ForegroundColor Gray
 
-$vm = Get-VM -Name $VMName -ErrorAction SilentlyContinue
-if (-not $vm) { throw "VM '$VMName' was not found on any connected vCenter." }
+if (-not (Test-Path -LiteralPath $VMListPath)) { throw "VM list not found: $VMListPath" }
+$vmNames = @(Get-Content -LiteralPath $VMListPath |
+             ForEach-Object { $_.Trim() } |
+             Where-Object { $_ -and -not $_.StartsWith('#') } |
+             Select-Object -Unique)
+if ($vmNames.Count -eq 0) { throw "VM list '$VMListPath' contained no usable VM names." }
+Write-Host ("VMs to process: {0}" -f $vmNames.Count) -ForegroundColor Gray
 
 if (Test-Path -LiteralPath $CredentialPath) {
     try {
@@ -136,21 +149,21 @@ if (Test-Path -LiteralPath $CredentialPath) {
         throw "Failed to import guest credential from '$CredentialPath': $($_.Exception.Message)"
     }
 } else {
-    $GuestCredential = Get-Credential -Message "Guest administrator credential for $VMName"
+    $GuestCredential = Get-Credential -Message "Guest administrator credential (used for every VM in the list)"
 }
 
 if (-not (Test-Path -LiteralPath $OutputPath)) { New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null }
 $RunStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$JsonPath = Join-Path $OutputPath "WU_Remediation_Stage${Stage}_${VMName}_$RunStamp.json"
-$LogPath  = Join-Path $OutputPath "WU_Remediation_Stage${Stage}_${VMName}_$RunStamp.log"
+$CsvPath  = Join-Path $OutputPath "WU_Remediation_Stage${Stage}_$RunStamp.csv"
+$LogPath  = Join-Path $OutputPath "WU_Remediation_Stage${Stage}_$RunStamp.log"
 
 function Write-Log {
-    param([string]$Message)
-    $line = "[{0}] {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message
+    param([string]$Message, [string]$Level = 'INFO')
+    $line = "[{0}] [{1}] {2}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message
     Write-Host $line
     Add-Content -LiteralPath $LogPath -Value $line
 }
-Write-Log "Remediation run started for VM '$VMName'. Stage=$Stage Apply=$($Apply.IsPresent) Force=$($Force.IsPresent)."
+Write-Log "Remediation run started. VMs=$($vmNames.Count). Stage=$Stage Apply=$($Apply.IsPresent) Force=$($Force.IsPresent)."
 
 # =====================================================================================
 # 2. In-guest payload
@@ -364,32 +377,63 @@ function Read-EnvelopeFromScriptOutput {
     } catch { return $null }
 }
 
-$actionDescription = if ($Apply) { "APPLY Windows Update remediation Stage $Stage" } else { "Report the Stage $Stage remediation PLAN (no changes)" }
-if (-not $PSCmdlet.ShouldProcess($VMName, $actionDescription)) {
-    Write-Log "Cancelled by user (ShouldProcess declined)."
-    return
+function Get-VMInventory {
+    param([object[]]$Servers)
+    $inv = New-Object System.Collections.Generic.List[object]
+    foreach ($s in $Servers) {
+        try { $vms = @(Get-VM -Server $s -ErrorAction Stop) }
+        catch { Write-Log "Get-VM failed on vCenter '$($s.Name)': $($_.Exception.Message)" 'WARN'; $vms = @() }
+        $inv.Add([pscustomobject]@{ Server = $s; VMs = $vms }) | Out-Null
+    }
+    return $inv
 }
 
-Write-Log "Invoking guest script on '$VMName' (Stage=$Stage Apply=$($Apply.IsPresent) ToolsWaitSecs=$ToolsWaitSecs)..."
-try {
-    $result = Invoke-VMScript -VM $vm -ScriptText $Payload -ScriptType Powershell -GuestCredential $GuestCredential -ToolsWaitSecs $ToolsWaitSecs -ErrorAction Stop
-} catch {
-    throw "Invoke-VMScript failed against '$VMName': $($_.Exception.Message)"
+function Resolve-AndValidateVM {
+    param([string]$Name, [object[]]$Inventory)
+    $hits = New-Object System.Collections.Generic.List[object]
+    foreach ($entry in $Inventory) {
+        foreach ($v in $entry.VMs) {
+            if ($v.Name -eq $Name) { $hits.Add([pscustomobject]@{ Server = $entry.Server; VM = $v }) | Out-Null }
+        }
+    }
+    $serverList = ($Inventory | ForEach-Object { $_.Server.Name }) -join ', '
+    if ($hits.Count -eq 0) {
+        return [pscustomobject]@{ Ok = $false; Stage = 'VM lookup'; ServerName = ''
+            Reason = "VM '$Name' was not found in any connected vCenter ($serverList)."; VM = $null; Server = $null }
+    }
+    if ($hits.Count -gt 1) {
+        $where = ($hits | ForEach-Object { "$($_.Server.Name):$($_.VM.Id)" }) -join '; '
+        return [pscustomobject]@{ Ok = $false; Stage = 'VM lookup'; ServerName = $hits[0].Server.Name
+            Reason = "VM name '$Name' is ambiguous - $($hits.Count) matching VMs ($where). Skipped for safety."; VM = $null; Server = $null }
+    }
+    $vm = $hits[0].VM; $srv = $hits[0].Server
+    if ($vm.PowerState -ne 'PoweredOn') {
+        return [pscustomobject]@{ Ok = $false; Stage = 'Power state'; ServerName = $srv.Name
+            Reason = "VM is not powered on (PowerState=$($vm.PowerState))."; VM = $null; Server = $null }
+    }
+    $g = $vm.ExtensionData.Guest
+    $toolsOk = ($g.ToolsRunningStatus -eq 'guestToolsRunning') -or ($g.ToolsStatus -in 'toolsOk', 'toolsOld')
+    if (-not $toolsOk) {
+        return [pscustomobject]@{ Ok = $false; Stage = 'VMware Tools'; ServerName = $srv.Name
+            Reason = "VMware Tools not installed/running (ToolsStatus=$($g.ToolsStatus), ToolsRunningStatus=$($g.ToolsRunningStatus))."; VM = $null; Server = $null }
+    }
+    $isWin = ($g.GuestFamily -eq 'windowsGuest') -or ($g.GuestId -match 'windows') -or ($vm.Guest.OSFullName -match 'Windows')
+    if (-not $isWin) {
+        return [pscustomobject]@{ Ok = $false; Stage = 'Guest OS'; ServerName = $srv.Name
+            Reason = "Guest OS is not Windows (GuestFamily=$($g.GuestFamily), OS=$($vm.Guest.OSFullName))."; VM = $null; Server = $null }
+    }
+    return [pscustomobject]@{ Ok = $true; Stage = 'OK'; ServerName = $srv.Name; Reason = ''; VM = $vm; Server = $srv }
 }
 
-$envelope = Read-EnvelopeFromScriptOutput -Output $result.ScriptOutput -StartMarker '<<<WU-REMEDIATION-ENVELOPE-B64>>>' -EndMarker '<<<END-WU-REMEDIATION-ENVELOPE>>>'
-if (-not $envelope) {
-    Write-Log "Could not parse the remediation envelope from guest output. Raw ScriptOutput follows:"
-    Write-Host $result.ScriptOutput
-    throw "Remediation Stage $Stage run failed - no parsable envelope returned from '$VMName'."
+function New-CentralRow {
+    param($vCenter, $VMName, $Mode, $Action, $Result, $Detail)
+    [PSCustomObject]([ordered]@{
+        vCenter = $vCenter; VMName = $VMName; Stage = $Stage; Mode = $Mode
+        Action = $Action; Result = $Result; Detail = $Detail
+        Timestamp = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+    })
 }
 
-$envelope | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $JsonPath -Encoding UTF8
-Write-Log "Result saved to: $JsonPath"
-
-# =====================================================================================
-# 4. Render
-# =====================================================================================
 function Get-ResultColor {
     param([string]$Result)
     switch ($Result) {
@@ -405,23 +449,96 @@ function Get-ResultColor {
     }
 }
 
+# =====================================================================================
+# 4. Per-VM processing
+# =====================================================================================
+$centralRows = New-Object System.Collections.Generic.List[object]
+$summary = [ordered]@{ Total = 0; Applied = 0; PlannedOnly = 0; BlockedPendingReboot = 0; SkippedFailed = 0; DeclinedByUser = 0 }
+$inventory = Get-VMInventory -Servers $connectedServers
+$actionDescription = if ($Apply) { "APPLY Windows Update remediation Stage $Stage" } else { "Report the Stage $Stage remediation PLAN (no changes)" }
+
+foreach ($vmName in $vmNames) {
+    $summary.Total++
+    Write-Log "=== Stage $Stage remediation for VM '$vmName' ==="
+    try {
+        $val = Resolve-AndValidateVM -Name $vmName -Inventory $inventory
+        if (-not $val.Ok) {
+            $summary.SkippedFailed++
+            $centralRows.Add((New-CentralRow -vCenter $val.ServerName -VMName $vmName -Mode 'Read-Only' -Action 'VM validation' -Result 'Skipped' -Detail $val.Reason))
+            Write-Log "SKIP '$vmName' [$($val.Stage)]: $($val.Reason)" 'WARN'
+            continue
+        }
+        $vm = $val.VM; $srv = $val.Server
+
+        if (-not $PSCmdlet.ShouldProcess("$vmName ($($srv.Name))", $actionDescription)) {
+            $summary.DeclinedByUser++
+            $centralRows.Add((New-CentralRow -vCenter $srv.Name -VMName $vmName -Mode 'Read-Only' -Action 'ShouldProcess' -Result 'Declined' -Detail 'User declined confirmation for this VM.'))
+            Write-Log "'$vmName': declined by user (ShouldProcess)." 'WARN'
+            continue
+        }
+
+        Write-Log "'$vmName': invoking guest remediation (Stage=$Stage Apply=$($Apply.IsPresent) ToolsWaitSecs=$ToolsWaitSecs)..."
+        $result = Invoke-VMScript -VM $vm -Server $srv -ScriptText $Payload -ScriptType Powershell -GuestCredential $GuestCredential -ToolsWaitSecs $ToolsWaitSecs -Confirm:$false -ErrorAction Stop
+
+        $envelope = Read-EnvelopeFromScriptOutput -Output $result.ScriptOutput -StartMarker '<<<WU-REMEDIATION-ENVELOPE-B64>>>' -EndMarker '<<<END-WU-REMEDIATION-ENVELOPE>>>'
+        if (-not $envelope) {
+            $summary.SkippedFailed++
+            $snippet = if ($result.ScriptOutput) { ($result.ScriptOutput -replace '\s+', ' ').Trim() } else { '(no output)' }
+            if ($snippet.Length -gt 600) { $snippet = $snippet.Substring(0, 600) + '...' }
+            $centralRows.Add((New-CentralRow -vCenter $srv.Name -VMName $vmName -Mode 'Read-Only' -Action 'Guest payload result' -Result 'Unable to Check' -Detail "No parseable result envelope. Output start: $snippet"))
+            Write-Log "'$vmName': no parseable envelope returned." 'ERROR'
+            continue
+        }
+
+        foreach ($r in @($envelope.Rows)) {
+            $centralRows.Add((New-CentralRow -vCenter $srv.Name -VMName $vmName -Mode $r.Mode -Action $r.Action -Result $r.Result -Detail $r.Detail))
+        }
+        if ($envelope.Meta.PendingReboot -and (@($envelope.Rows) | Where-Object { $_.Result -in 'Blocked','Would Block' })) {
+            $summary.BlockedPendingReboot++
+        } elseif ($Apply) {
+            $summary.Applied++
+        } else {
+            $summary.PlannedOnly++
+        }
+
+        Write-Host ""
+        Write-Host "=== $vmName @ $($srv.Name)  (Stage $Stage, Applied=$($envelope.Meta.Applied)) ===" -ForegroundColor Cyan
+        if ($envelope.Meta.PendingReboot) { Write-Host " PENDING REBOOT DETECTED: $($envelope.Meta.RebootFlags)" -ForegroundColor Yellow }
+        foreach ($row in $envelope.Rows) {
+            $color = Get-ResultColor $row.Result
+            Write-Host ("  [{0,-6}] [{1,-9}] {2}" -f $row.Mode, $row.Result, $row.Action) -ForegroundColor $color
+            if ($row.Detail) { Write-Host "             $($row.Detail)" -ForegroundColor DarkGray }
+        }
+        Write-Log "'$vmName': Stage $Stage complete."
+    }
+    catch {
+        $summary.SkippedFailed++
+        Write-Log "'$vmName': unhandled error - $($_.Exception.Message)" 'ERROR'
+        $centralRows.Add((New-CentralRow -vCenter '' -VMName $vmName -Mode 'Read-Only' -Action 'Processing' -Result 'Failed' -Detail $_.Exception.Message))
+        continue
+    }
+}
+
+# =====================================================================================
+# 5. Consolidated report + console summary
+# =====================================================================================
+$centralRows | Export-Csv -LiteralPath $CsvPath -NoTypeInformation -Encoding UTF8
+Write-Log "CSV written: $CsvPath ($($centralRows.Count) rows across $($vmNames.Count) VM(s))."
+
 Write-Host ""
 Write-Host "================================================================================" -ForegroundColor DarkCyan
-Write-Host " Windows Update Remediation - $($envelope.Meta.Hostname)   Stage $($envelope.Meta.Stage)   Applied=$($envelope.Meta.Applied)" -ForegroundColor Cyan
-if ($envelope.Meta.PendingReboot) {
-    Write-Host " PENDING REBOOT DETECTED: $($envelope.Meta.RebootFlags)" -ForegroundColor Yellow
-}
-Write-Host "================================================================================" -ForegroundColor DarkCyan
-foreach ($row in $envelope.Rows) {
-    $color = Get-ResultColor $row.Result
-    Write-Host ("  [{0,-6}] [{1,-9}] {2}" -f $row.Mode, $row.Result, $row.Action) -ForegroundColor $color
-    if ($row.Detail) { Write-Host "             $($row.Detail)" -ForegroundColor DarkGray }
-}
+Write-Host " WINDOWS UPDATE REMEDIATION SUMMARY - Stage $Stage  Apply=$($Apply.IsPresent)" -ForegroundColor Green
+Write-Host ("  Total VMs in list              : {0}" -f $summary.Total)
+Write-Host ("  Applied                        : {0}" -f $summary.Applied) -ForegroundColor $(if ($summary.Applied) { 'Red' } else { 'Gray' })
+Write-Host ("  Planned only (dry run)         : {0}" -f $summary.PlannedOnly) -ForegroundColor Cyan
+Write-Host ("  Blocked - pending reboot       : {0}" -f $summary.BlockedPendingReboot) -ForegroundColor $(if ($summary.BlockedPendingReboot) { 'Yellow' } else { 'Gray' })
+Write-Host ("  Declined by user (ShouldProcess): {0}" -f $summary.DeclinedByUser) -ForegroundColor Gray
+Write-Host ("  Skipped / failed to process    : {0}" -f $summary.SkippedFailed) -ForegroundColor $(if ($summary.SkippedFailed) { 'Red' } else { 'Gray' })
 Write-Host "================================================================================" -ForegroundColor DarkCyan
 if (-not $Apply) {
     Write-Host " This was a DRY RUN. Re-run with -Apply once you've reviewed the plan above." -ForegroundColor Cyan
 }
-Write-Host " JSON result: $JsonPath" -ForegroundColor Gray
-Write-Host "================================================================================" -ForegroundColor DarkCyan
+Write-Host "CSV: $CsvPath"
+Write-Host "Log: $LogPath"
 
 Write-Log "Remediation Stage $Stage run complete."

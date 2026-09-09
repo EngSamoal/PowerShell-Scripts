@@ -1,17 +1,23 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Read-only Windows Update / servicing diagnostics for a single guest VM, collected
-    entirely through VMware Tools Guest Operations (Invoke-VMScript). No WinRM / PsExec /
-    SMB / RDP guest network path required - only vCenter + Guest Operations privileges,
-    from a machine that already has an active Connect-VIServer session.
+    Read-only Windows Update / servicing diagnostics across a list of guest VMs,
+    collected entirely through VMware Tools Guest Operations (Invoke-VMScript). No
+    WinRM / PsExec / SMB / RDP guest network path required - only vCenter + Guest
+    Operations privileges, from a machine that already has an active Connect-VIServer
+    session.
 
 .DESCRIPTION
     Companion diagnostic script for troubleshooting:
         "Windows Update - Error encountered - We could not complete the install because
          an update service was shutting down."
 
-    Collects, WITHOUT CHANGING ANYTHING on the guest:
+    Runs against every VM listed in -VMListPath (one name per line, '#' comments
+    ignored). Each VM is fully isolated - a VM that can't be found, is powered off,
+    has no VMware Tools, or throws mid-collection is recorded as "Unable to Check" /
+    "Skipped" and the batch continues with the next VM.
+
+    Collects, WITHOUT CHANGING ANYTHING on any guest:
       - Time sync: current time, time zone, w32time service/status/source/config, and
         whether VMware Tools host time sync and Windows Time (w32time) are both active -
         a combination Microsoft/VMware guidance flags for domain-joined VMs.
@@ -35,43 +41,43 @@
         Microsoft.Update.Session), with a plain-English meaning for well-documented
         HResults only - unrecognised codes are reported as such, never guessed.
       - Installed VMware Tools version/status (informational - VMware Tools does not own
-        or manage any Windows Update service; included only to close that question out).
+        or manage any Windows Update service).
 
     Anything this script cannot determine reliably from inside the guest (for example,
     the Azure-side AUM patch-orchestration mode, which is an Azure/Arc resource property,
     not a guest artifact) is reported as "Manual/External Required" with an explanation -
     never guessed or left blank.
 
-.PARAMETER VMName          vCenter inventory name of the target VM.
-.PARAMETER CredentialPath  Export-Clixml PSCredential for the guest admin. If omitted or
-                            not found, you are prompted with Get-Credential instead.
-.PARAMETER OutputPath      Folder on the admin machine for the JSON evidence + log.
-.PARAMETER EventDays       How many days back to pull WU/service-control events (default 30).
-.PARAMETER HistoryCount    How many Windows Update history records to pull (default 40).
-.PARAMETER ToolsWaitSecs   Invoke-VMScript VMware Tools wait, seconds (default 180).
+.PARAMETER VMListPath     Text file of VM names, one per line (default C:\temp\vmlist.txt).
+                           '#' lines and blanks are ignored; names are de-duplicated.
+.PARAMETER CredentialPath Export-Clixml PSCredential for the guest admin. If omitted or
+                           not found, you are prompted with Get-Credential instead.
+.PARAMETER OutputPath     Folder on the admin machine for the consolidated CSV/JSON/log.
+.PARAMETER EventDays      How many days back to pull WU/service-control events (default 30).
+.PARAMETER HistoryCount   How many Windows Update history records to pull (default 40).
+.PARAMETER ToolsWaitSecs  Invoke-VMScript VMware Tools wait, seconds (default 180).
 
 .EXAMPLE
     Connect-VIServer vcenter01
-    .\Invoke-WindowsUpdateDiagnostics.ps1 -VMName TB-KRTN-APP02
+    "TB-KRTN-APP02`nTB-KRTN-APP03" | Set-Content C:\temp\vmlist.txt
+    .\Invoke-WindowsUpdateDiagnostics.ps1
 
 .EXAMPLE
     Connect-VIServer vcenter01
     Get-Credential | Export-Clixml C:\temp\wincred.xml
-    .\Invoke-WindowsUpdateDiagnostics.ps1 -VMName TB-KRTN-APP02 -CredentialPath C:\temp\wincred.xml -EventDays 45
+    .\Invoke-WindowsUpdateDiagnostics.ps1 -VMListPath C:\temp\wsus_servers.txt -EventDays 45
 
 .NOTES
     100% read-only. Requires PowerCLI, an existing Connect-VIServer session, and vCenter
-    "Guest Operation Program Execution/Query" privileges on the target VM.
+    "Guest Operation Program Execution/Query" privileges on every target VM.
 
     Run the companion Invoke-WindowsUpdateRemediation.ps1 SEPARATELY, never in the same
-    pass, so a diagnostic run can never accidentally change the server.
+    pass, so a diagnostic run can never accidentally change any server.
 #>
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)]
-    [string] $VMName,
-
+    [string] $VMListPath     = 'C:\temp\vmlist.txt',
     [string] $CredentialPath = 'C:\temp\wincred.xml',
     [string] $OutputPath     = (Join-Path $PSScriptRoot 'WindowsUpdate_Diagnostics'),
 
@@ -88,7 +94,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'
 
-Write-Host "Invoke-WindowsUpdateDiagnostics.ps1 - read-only Windows Update / servicing evidence  [build 2026-09-09a]" -ForegroundColor Magenta
+Write-Host "Invoke-WindowsUpdateDiagnostics.ps1 - read-only Windows Update / servicing evidence across a VM list  [build 2026-09-09b]" -ForegroundColor Magenta
 Write-Host ("Running from: {0}" -f $PSCommandPath) -ForegroundColor DarkGray
 
 # =====================================================================================
@@ -102,13 +108,13 @@ $connectedServers = @($global:DefaultVIServers | Where-Object { $_.IsConnected }
 if ($connectedServers.Count -eq 0) { throw "No connected vCenter session. Run Connect-VIServer <vcenter> first." }
 Write-Host ("Connected vCenter(s): {0}" -f (($connectedServers | ForEach-Object { $_.Name }) -join ', ')) -ForegroundColor Gray
 
-$vm = Get-VM -Name $VMName -ErrorAction SilentlyContinue
-if (-not $vm) { throw "VM '$VMName' was not found on any connected vCenter." }
-
-$toolsStatus = $vm.ExtensionData.Guest.ToolsRunningStatus
-if ($toolsStatus -ne 'guestToolsRunning') {
-    Write-Host "WARNING: VMware Tools on '$VMName' reports '$toolsStatus', not 'guestToolsRunning'. Invoke-VMScript may fail or hang." -ForegroundColor Yellow
-}
+if (-not (Test-Path -LiteralPath $VMListPath)) { throw "VM list not found: $VMListPath" }
+$vmNames = @(Get-Content -LiteralPath $VMListPath |
+             ForEach-Object { $_.Trim() } |
+             Where-Object { $_ -and -not $_.StartsWith('#') } |
+             Select-Object -Unique)
+if ($vmNames.Count -eq 0) { throw "VM list '$VMListPath' contained no usable VM names." }
+Write-Host ("VMs to process: {0}" -f $vmNames.Count) -ForegroundColor Gray
 
 if (Test-Path -LiteralPath $CredentialPath) {
     try {
@@ -118,24 +124,26 @@ if (Test-Path -LiteralPath $CredentialPath) {
         throw "Failed to import guest credential from '$CredentialPath': $($_.Exception.Message)"
     }
 } else {
-    $GuestCredential = Get-Credential -Message "Guest administrator credential for $VMName"
+    $GuestCredential = Get-Credential -Message "Guest administrator credential (used for every VM in the list)"
 }
 
 if (-not (Test-Path -LiteralPath $OutputPath)) { New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null }
 $RunStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$JsonPath = Join-Path $OutputPath "WU_Diagnostics_${VMName}_$RunStamp.json"
-$LogPath  = Join-Path $OutputPath "WU_Diagnostics_${VMName}_$RunStamp.log"
+$CsvPath  = Join-Path $OutputPath "WU_Diagnostics_$RunStamp.csv"
+$JsonPath = Join-Path $OutputPath "WU_Diagnostics_$RunStamp.json"
+$LogPath  = Join-Path $OutputPath "WU_Diagnostics_$RunStamp.log"
 
 function Write-Log {
-    param([string]$Message)
-    $line = "[{0}] {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message
+    param([string]$Message, [string]$Level = 'INFO')
+    $line = "[{0}] [{1}] {2}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message
     Write-Host $line
     Add-Content -LiteralPath $LogPath -Value $line
 }
-Write-Log "Diagnostics run started for VM '$VMName'. EventDays=$EventDays HistoryCount=$HistoryCount."
+Write-Log "Diagnostics run started. VMs=$($vmNames.Count). EventDays=$EventDays HistoryCount=$HistoryCount."
 
 # =====================================================================================
-# 2. In-guest READ-ONLY payload
+# 2. In-guest READ-ONLY payload (unchanged per-VM logic; identical to the single-VM
+#    version, just invoked once per VM in the loop below)
 #    {{EVENTDAYS}} / {{HISTORYCOUNT}} are replaced with integer literals before each run.
 # =====================================================================================
 $PayloadTemplate = @'
@@ -202,7 +210,7 @@ try {
 } catch { }
 
 if ($IsDomain -and $w32svc -and $w32svc.Status -eq 'Running') {
-    Add-Row 'Time Sync' 'VMware host sync vs W32Time conflict check' 'Warning' 'Domain-joined + W32Time running' "This is a domain-joined machine with Windows Time active (normal - it should follow the domain hierarchy). If VMware Tools 'Synchronize guest time with host' (SyncTimeWithHost) is ALSO enabled at the VM/VMX level, Microsoft and VMware both document this dual-source combination as not recommended for domain members: the two correction sources can fight, producing log noise and occasional larger jumps. It is a real hygiene finding but is NOT expected to produce a 'service is shutting down' Windows Update error by itself - track it separately from the WU failure." 'Confirm the current VMX SyncTimeWithHost setting from vCenter (already known to be True per this investigation). If this VM is domain-joined, the general guidance is to disable VMware Tools periodic time sync and let w32time follow the PDC emulator hierarchy instead. Do this as a follow-up, not as the fix for the WU error.'
+    Add-Row 'Time Sync' 'VMware host sync vs W32Time conflict check' 'Warning' 'Domain-joined + W32Time running' "This is a domain-joined machine with Windows Time active (normal - it should follow the domain hierarchy). If VMware Tools 'Synchronize guest time with host' (SyncTimeWithHost) is ALSO enabled at the VM/VMX level, Microsoft and VMware both document this dual-source combination as not recommended for domain members: the two correction sources can fight, producing log noise and occasional larger jumps. It is a real hygiene finding but is NOT expected to produce a 'service is shutting down' Windows Update error by itself - track it separately from the WU failure." 'Confirm the current VMX SyncTimeWithHost setting from vCenter for this VM. If domain-joined, the general guidance is to disable VMware Tools periodic time sync and let w32time follow the PDC emulator hierarchy instead. Do this as a follow-up, not as the fix for the WU error.'
 } elseif (-not $IsDomain) {
     Add-Row 'Time Sync' 'VMware host sync vs W32Time conflict check' 'Healthy' 'Workgroup machine' 'Not domain-joined, so VMware host time sync is the expected/recommended time source here. No conflict.' ''
 }
@@ -235,7 +243,7 @@ foreach ($svcName in $serviceNames) {
         }
         # Recent unexpected-stop / crash events referencing this service.
         $svcEvts = @()
-        if ($scmEvents) { $svcEvts = @($scmEvents | Where-Object { $_.Message -match [regex]::Escape($svcName) -or $_.Message -match [regex]::Escape($svc.DisplayName) }) }
+        if ($scmEvents) { $svcEvts = @($scmEvents | Where-Object { $_.Message -match [regex]::Escape($svcName) -or ($svc.DisplayName -and $_.Message -match [regex]::Escape($svc.DisplayName)) }) }
         if ($svcEvts.Count -gt 0) {
             $latest = ($svcEvts | Sort-Object TimeCreated -Descending | Select-Object -First 1)
             $status = if ($status -eq 'Healthy') { 'Warning' } else { $status }
@@ -535,26 +543,63 @@ function Read-EnvelopeFromScriptOutput {
     } catch { return $null }
 }
 
-Write-Log "Invoking guest script on '$VMName' (ToolsWaitSecs=$ToolsWaitSecs)..."
-try {
-    $result = Invoke-VMScript -VM $vm -ScriptText $Payload -ScriptType Powershell -GuestCredential $GuestCredential -ToolsWaitSecs $ToolsWaitSecs -ErrorAction Stop
-} catch {
-    throw "Invoke-VMScript failed against '$VMName': $($_.Exception.Message)"
+function Get-VMInventory {
+    param([object[]]$Servers)
+    $inv = New-Object System.Collections.Generic.List[object]
+    foreach ($s in $Servers) {
+        try { $vms = @(Get-VM -Server $s -ErrorAction Stop) }
+        catch { Write-Log "Get-VM failed on vCenter '$($s.Name)': $($_.Exception.Message)" 'WARN'; $vms = @() }
+        $inv.Add([pscustomobject]@{ Server = $s; VMs = $vms }) | Out-Null
+    }
+    return $inv
 }
 
-$envelope = Read-EnvelopeFromScriptOutput -Output $result.ScriptOutput -StartMarker '<<<WU-DIAG-ENVELOPE-B64>>>' -EndMarker '<<<END-WU-DIAG-ENVELOPE>>>'
-if (-not $envelope) {
-    Write-Log "Could not parse the diagnostics envelope from guest output. Raw ScriptOutput follows:"
-    Write-Host $result.ScriptOutput
-    throw "Diagnostics collection failed - no parsable envelope returned from '$VMName'."
+function Resolve-AndValidateVM {
+    param([string]$Name, [object[]]$Inventory)
+    $hits = New-Object System.Collections.Generic.List[object]
+    foreach ($entry in $Inventory) {
+        foreach ($v in $entry.VMs) {
+            if ($v.Name -eq $Name) { $hits.Add([pscustomobject]@{ Server = $entry.Server; VM = $v }) | Out-Null }
+        }
+    }
+    $serverList = ($Inventory | ForEach-Object { $_.Server.Name }) -join ', '
+    if ($hits.Count -eq 0) {
+        return [pscustomobject]@{ Ok = $false; Stage = 'VM lookup'; ServerName = ''
+            Reason = "VM '$Name' was not found in any connected vCenter ($serverList)."; VM = $null; Server = $null }
+    }
+    if ($hits.Count -gt 1) {
+        $where = ($hits | ForEach-Object { "$($_.Server.Name):$($_.VM.Id)" }) -join '; '
+        return [pscustomobject]@{ Ok = $false; Stage = 'VM lookup'; ServerName = $hits[0].Server.Name
+            Reason = "VM name '$Name' is ambiguous - $($hits.Count) matching VMs ($where). Skipped for safety."; VM = $null; Server = $null }
+    }
+    $vm = $hits[0].VM; $srv = $hits[0].Server
+    if ($vm.PowerState -ne 'PoweredOn') {
+        return [pscustomobject]@{ Ok = $false; Stage = 'Power state'; ServerName = $srv.Name
+            Reason = "VM is not powered on (PowerState=$($vm.PowerState))."; VM = $null; Server = $null }
+    }
+    $g = $vm.ExtensionData.Guest
+    $toolsOk = ($g.ToolsRunningStatus -eq 'guestToolsRunning') -or ($g.ToolsStatus -in 'toolsOk', 'toolsOld')
+    if (-not $toolsOk) {
+        return [pscustomobject]@{ Ok = $false; Stage = 'VMware Tools'; ServerName = $srv.Name
+            Reason = "VMware Tools not installed/running (ToolsStatus=$($g.ToolsStatus), ToolsRunningStatus=$($g.ToolsRunningStatus))."; VM = $null; Server = $null }
+    }
+    $isWin = ($g.GuestFamily -eq 'windowsGuest') -or ($g.GuestId -match 'windows') -or ($vm.Guest.OSFullName -match 'Windows')
+    if (-not $isWin) {
+        return [pscustomobject]@{ Ok = $false; Stage = 'Guest OS'; ServerName = $srv.Name
+            Reason = "Guest OS is not Windows (GuestFamily=$($g.GuestFamily), OS=$($vm.Guest.OSFullName))."; VM = $null; Server = $null }
+    }
+    return [pscustomobject]@{ Ok = $true; Stage = 'OK'; ServerName = $srv.Name; Reason = ''; VM = $vm; Server = $srv }
 }
 
-$envelope | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $JsonPath -Encoding UTF8
-Write-Log "Raw evidence saved to: $JsonPath"
+function New-CentralRow {
+    param($vCenter, $VMName, $GuestHostname, $Section, $Check, $Status, $Value, $Detail, $NextStep)
+    [PSCustomObject]([ordered]@{
+        vCenter = $vCenter; VMName = $VMName; GuestHostname = $GuestHostname
+        Section = $Section; Check = $Check; Status = $Status; Value = $Value
+        Detail = $Detail; NextStep = $NextStep; Timestamp = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+    })
+}
 
-# =====================================================================================
-# 4. Render report
-# =====================================================================================
 function Get-StatusColor {
     param([string]$Status)
     switch ($Status) {
@@ -569,35 +614,110 @@ function Get-StatusColor {
     }
 }
 
-Write-Host ""
-Write-Host "================================================================================" -ForegroundColor DarkCyan
-Write-Host " Windows Update Diagnostics - $($envelope.Meta.Hostname)  ($($envelope.Meta.OS), build $($envelope.Meta.Build))" -ForegroundColor Cyan
-Write-Host " Domain-joined: $($envelope.Meta.IsDomain)   Last boot: $($envelope.Meta.LastBoot)   Collected (UTC): $($envelope.Meta.CollectedAtUtc)" -ForegroundColor Gray
-Write-Host "================================================================================" -ForegroundColor DarkCyan
-Write-Host " LEGEND  Healthy=no action  Warning=review, likely contributing  Problem=fix this first" -ForegroundColor DarkGray
-Write-Host "         Unable to Check=inconclusive, don't assume pass or fail  Manual/External Required=verify outside this VM" -ForegroundColor DarkGray
-Write-Host "================================================================================" -ForegroundColor DarkCyan
-
-$bySection = $envelope.Rows | Group-Object Section
-foreach ($grp in $bySection) {
+function Write-VmDetail {
+    param([string]$Header, $Rows)
     Write-Host ""
-    Write-Host "-- $($grp.Name) " -ForegroundColor White -NoNewline
-    Write-Host ("-" * (76 - $grp.Name.Length)) -ForegroundColor DarkGray
-    foreach ($row in $grp.Group) {
-        $color = Get-StatusColor $row.Status
-        Write-Host ("  [{0,-9}] {1}: {2}" -f $row.Status, $row.Check, $row.Value) -ForegroundColor $color
-        if ($row.Detail)   { Write-Host "             $($row.Detail)"   -ForegroundColor DarkGray }
-        if ($row.NextStep) { Write-Host "             NEXT: $($row.NextStep)" -ForegroundColor DarkCyan }
+    Write-Host ("=== $Header ===") -ForegroundColor Cyan
+    $bySection = $Rows | Group-Object Section
+    foreach ($grp in $bySection) {
+        Write-Host "-- $($grp.Name) --" -ForegroundColor White
+        foreach ($row in $grp.Group) {
+            $color = Get-StatusColor $row.Status
+            Write-Host ("  [{0,-9}] {1}: {2}" -f $row.Status, $row.Check, $row.Value) -ForegroundColor $color
+            if ($row.Detail)   { Write-Host "             $($row.Detail)"   -ForegroundColor DarkGray }
+            if ($row.NextStep) { Write-Host "             NEXT: $($row.NextStep)" -ForegroundColor DarkCyan }
+        }
     }
 }
 
-$problemCount = @($envelope.Rows | Where-Object { $_.Status -eq 'Problem' }).Count
-$warningCount = @($envelope.Rows | Where-Object { $_.Status -eq 'Warning' }).Count
+# =====================================================================================
+# 4. Per-VM processing
+# =====================================================================================
+$centralRows = New-Object System.Collections.Generic.List[object]
+$envelopes   = New-Object System.Collections.Generic.List[object]
+$summary = [ordered]@{ Total = 0; Checked = 0; WithProblems = 0; WithWarningsOnly = 0; Clean = 0; SkippedFailed = 0 }
+$inventory = Get-VMInventory -Servers $connectedServers
+
+foreach ($vmName in $vmNames) {
+    $summary.Total++
+    Write-Log "=== Windows Update diagnostics for VM '$vmName' ==="
+    try {
+        $val = Resolve-AndValidateVM -Name $vmName -Inventory $inventory
+        if (-not $val.Ok) {
+            $summary.SkippedFailed++
+            $centralRows.Add((New-CentralRow -vCenter $val.ServerName -VMName $vmName -GuestHostname '' `
+                -Section $val.Stage -Check 'VM validation' -Status 'Unable to Check' -Value '' -Detail $val.Reason -NextStep 'Fix the VM/credential/tools issue and re-run for this VM.'))
+            Write-Log "SKIP '$vmName' [$($val.Stage)]: $($val.Reason)" 'WARN'
+            Write-VmDetail -Header "$vmName  [SKIPPED - not processed]" -Rows @($centralRows[$centralRows.Count - 1])
+            continue
+        }
+        $vm = $val.VM; $srv = $val.Server
+
+        Write-Log "'$vmName': invoking guest diagnostics (ToolsWaitSecs=$ToolsWaitSecs)..."
+        $result = Invoke-VMScript -VM $vm -Server $srv -ScriptText $Payload -ScriptType Powershell -GuestCredential $GuestCredential -ToolsWaitSecs $ToolsWaitSecs -Confirm:$false -ErrorAction Stop
+
+        $envelope = Read-EnvelopeFromScriptOutput -Output $result.ScriptOutput -StartMarker '<<<WU-DIAG-ENVELOPE-B64>>>' -EndMarker '<<<END-WU-DIAG-ENVELOPE>>>'
+        if (-not $envelope) {
+            $summary.SkippedFailed++
+            $snippet = if ($result.ScriptOutput) { ($result.ScriptOutput -replace '\s+', ' ').Trim() } else { '(no output)' }
+            if ($snippet.Length -gt 600) { $snippet = $snippet.Substring(0, 600) + '...' }
+            $centralRows.Add((New-CentralRow -vCenter $srv.Name -VMName $vmName -GuestHostname $vm.Guest.HostName `
+                -Section 'Collection' -Check 'Guest payload result' -Status 'Unable to Check' -Value '' -Detail "No parseable result envelope. Output start: $snippet" -NextStep 'Re-run for this VM; if it repeats, check VMware Tools guest-ops health.'))
+            Write-Log "'$vmName': no parseable envelope returned." 'ERROR'
+            Write-VmDetail -Header "$vmName  [SKIPPED - not processed]" -Rows @($centralRows[$centralRows.Count - 1])
+            continue
+        }
+
+        $envelopes.Add([pscustomobject]@{ VMName = $vmName; vCenter = $srv.Name; Envelope = $envelope }) | Out-Null
+        $summary.Checked++
+        $vmRowStart = $centralRows.Count
+        foreach ($r in @($envelope.Rows)) {
+            $centralRows.Add((New-CentralRow -vCenter $srv.Name -VMName $vmName -GuestHostname $envelope.Meta.Hostname `
+                -Section $r.Section -Check $r.Check -Status $r.Status -Value $r.Value -Detail $r.Detail -NextStep $r.NextStep))
+        }
+        $vmRows = $centralRows.GetRange($vmRowStart, $centralRows.Count - $vmRowStart)
+        $problemCount = @($vmRows | Where-Object { $_.Status -eq 'Problem' }).Count
+        $warningCount = @($vmRows | Where-Object { $_.Status -eq 'Warning' }).Count
+        if ($problemCount -gt 0) { $summary.WithProblems++ }
+        elseif ($warningCount -gt 0) { $summary.WithWarningsOnly++ }
+        else { $summary.Clean++ }
+
+        Write-VmDetail -Header "$vmName @ $($srv.Name)  ($($envelope.Meta.OS), build $($envelope.Meta.Build))  -  $problemCount Problem, $warningCount Warning" -Rows $vmRows
+        Write-Log "'$vmName': collection complete. Problems=$problemCount Warnings=$warningCount."
+    }
+    catch {
+        $summary.SkippedFailed++
+        Write-Log "'$vmName': unhandled error - $($_.Exception.Message)" 'ERROR'
+        try {
+            $centralRows.Add((New-CentralRow -vCenter '' -VMName $vmName -GuestHostname '' `
+                -Section 'Collection' -Check 'Processing' -Status 'Unable to Check' -Value '' -Detail $_.Exception.Message -NextStep 'Re-run for this VM after resolving the error.'))
+            Write-VmDetail -Header "$vmName  [SKIPPED - error]" -Rows @($centralRows[$centralRows.Count - 1])
+        } catch { }
+        continue
+    }
+}
+
+# =====================================================================================
+# 5. Consolidated report + console summary
+# =====================================================================================
+$centralRows | Export-Csv -LiteralPath $CsvPath -NoTypeInformation -Encoding UTF8
+Write-Log "CSV written: $CsvPath ($($centralRows.Count) rows across $($vmNames.Count) VM(s))."
+$envelopes | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $JsonPath -Encoding UTF8
+Write-Log "JSON written: $JsonPath"
+
 Write-Host ""
 Write-Host "================================================================================" -ForegroundColor DarkCyan
-Write-Host " Summary: $problemCount Problem, $warningCount Warning finding(s)." -ForegroundColor $(if ($problemCount -gt 0) { 'Red' } elseif ($warningCount -gt 0) { 'Yellow' } else { 'Green' })
-Write-Host " Review every 'Problem' row's NEXT step before touching Invoke-WindowsUpdateRemediation.ps1." -ForegroundColor Gray
-Write-Host " JSON evidence: $JsonPath" -ForegroundColor Gray
+Write-Host " WINDOWS UPDATE DIAGNOSTICS SUMMARY" -ForegroundColor Green
+Write-Host ("  Total VMs in list          : {0}" -f $summary.Total)
+Write-Host ("  Successfully checked       : {0}" -f $summary.Checked)
+Write-Host ("  VMs with >=1 Problem       : {0}" -f $summary.WithProblems) -ForegroundColor $(if ($summary.WithProblems) { 'Red' } else { 'Gray' })
+Write-Host ("  VMs with Warning only      : {0}" -f $summary.WithWarningsOnly) -ForegroundColor $(if ($summary.WithWarningsOnly) { 'Yellow' } else { 'Gray' })
+Write-Host ("  Clean (Healthy/Info only)  : {0}" -f $summary.Clean) -ForegroundColor Green
+Write-Host ("  Skipped / failed to process: {0}" -f $summary.SkippedFailed) -ForegroundColor $(if ($summary.SkippedFailed) { 'Red' } else { 'Gray' })
 Write-Host "================================================================================" -ForegroundColor DarkCyan
+Write-Host "CSV : $CsvPath"
+Write-Host "JSON: $JsonPath"
+Write-Host "Log : $LogPath"
+Write-Host "Review every 'Problem' row's NEXT step per VM before touching Invoke-WindowsUpdateRemediation.ps1." -ForegroundColor Gray
 
-Write-Log "Diagnostics run complete. Problems=$problemCount Warnings=$warningCount."
+Write-Log "Diagnostics run complete."
