@@ -1277,10 +1277,549 @@ if ($fleetData.Count -ge 2) {
 }
 
 # =====================================================================================
-# 6. Central report + console summary
+# 6. HTML dashboard template
+# =====================================================================================
+# Single-quoted here-string (no PS variable expansion) - {{TOKENS}} are swapped for real
+# JSON further down. This is the exact page design already reviewed, re-pointed from the
+# hardcoded sample data at hardcoded checklist order/VMs to the real $centralRows: category
+# and item order is reconstructed from first-seen order in ROWS (which is already emitted
+# in checklist order per VM), so no separate canonical-order list needs to be kept in sync.
+$DashboardTemplate = @'
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>OS Acceptance Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@600;700;800&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#F3F6F5; --surface:#FFFFFF; --surface-2:#EBF1EF; --border:#D7E0DD;
+    --ink:#16211F; --ink-dim:#57655F; --ink-faint:#8A968F;
+    --accent:#147D77; --accent-soft:rgba(20,125,119,.12);
+    --good:#1F8A4C; --good-soft:rgba(31,138,76,.11);
+    --bad:#C23B34; --bad-soft:rgba(194,59,52,.10);
+    --warn:#A6720C; --warn-soft:rgba(166,114,12,.12);
+    --mute:#68757E; --mute-soft:rgba(104,117,126,.12);
+    --shadow:0 1px 2px rgba(20,33,31,.06), 0 10px 28px -16px rgba(20,33,31,.16);
+    --radius:10px;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --bg:#0A0F0E; --surface:#111917; --surface-2:#16201D; --border:#223029;
+      --ink:#E7EEEB; --ink-dim:#9CACA5; --ink-faint:#647570;
+      --accent:#5BC7BF; --accent-soft:rgba(91,199,191,.16);
+      --good:#4CC786; --good-soft:rgba(76,199,134,.14);
+      --bad:#F0685F; --bad-soft:rgba(240,104,95,.15);
+      --warn:#E5B84B; --warn-soft:rgba(229,184,75,.15);
+      --mute:#8FA09A; --mute-soft:rgba(143,160,154,.14);
+      --shadow:0 1px 2px rgba(0,0,0,.4), 0 14px 34px -18px rgba(0,0,0,.6);
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg:#0A0F0E; --surface:#111917; --surface-2:#16201D; --border:#223029;
+    --ink:#E7EEEB; --ink-dim:#9CACA5; --ink-faint:#647570;
+    --accent:#5BC7BF; --accent-soft:rgba(91,199,191,.16);
+    --good:#4CC786; --good-soft:rgba(76,199,134,.14);
+    --bad:#F0685F; --bad-soft:rgba(240,104,95,.15);
+    --warn:#E5B84B; --warn-soft:rgba(229,184,75,.15);
+    --mute:#8FA09A; --mute-soft:rgba(143,160,154,.14);
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 14px 34px -18px rgba(0,0,0,.6);
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0; padding:0;}
+  body{
+    background:var(--bg); color:var(--ink);
+    font-family:'IBM Plex Sans', -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    font-size:14px; line-height:1.5;
+  }
+  ::selection{background:var(--accent-soft);}
+  .wrap{max-width:1280px; margin:0 auto; padding:22px 24px 90px;}
+  code, .mono{font-family:'IBM Plex Mono', Consolas, Menlo, monospace;}
+  header{
+    display:flex; justify-content:space-between; align-items:flex-end; gap:20px;
+    padding-bottom:18px; margin-bottom:20px; border-bottom:1px solid var(--border); flex-wrap:wrap;
+  }
+  .h-eyebrow{font-family:'IBM Plex Mono'; font-size:11px; color:var(--accent); text-transform:uppercase; letter-spacing:.12em; margin-bottom:6px; font-weight:500;}
+  h1{font-family:'Archivo'; font-weight:800; font-size:28px; margin:0; letter-spacing:-.01em; text-wrap:balance;}
+  .h-meta{display:flex; gap:18px; flex-wrap:wrap; font-size:12.5px; color:var(--ink-dim); margin-top:4px;}
+  .h-meta b{color:var(--ink); font-weight:600;}
+  .h-right{text-align:right; font-size:12px; color:var(--ink-faint); font-family:'IBM Plex Mono';}
+  .kpis{display:grid; grid-template-columns:repeat(5,1fr); gap:12px; margin-bottom:18px;}
+  .kpi{background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:14px 16px; box-shadow:var(--shadow); position:relative; overflow:hidden;}
+  .kpi::before{content:''; position:absolute; left:0; top:0; bottom:0; width:3px;}
+  .kpi.total::before{background:var(--accent);} .kpi.good::before{background:var(--good);}
+  .kpi.bad::before{background:var(--bad);} .kpi.warn::before{background:var(--warn);} .kpi.mute::before{background:var(--mute);}
+  .kpi-label{font-size:10.5px; text-transform:uppercase; letter-spacing:.07em; color:var(--ink-faint); font-weight:600;}
+  .kpi-value{font-family:'Archivo'; font-weight:800; font-size:30px; margin-top:5px; font-variant-numeric:tabular-nums;}
+  .kpi.good .kpi-value{color:var(--good);} .kpi.bad .kpi-value{color:var(--bad);}
+  .kpi.warn .kpi-value{color:var(--warn);} .kpi.mute .kpi-value{color:var(--mute);}
+  .kpi-sub{font-size:11px; color:var(--ink-faint); margin-top:3px;}
+  .panel{background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); box-shadow:var(--shadow); padding:16px 18px; margin-bottom:16px;}
+  .panel h2{font-family:'Archivo'; font-size:14.5px; font-weight:700; margin:0 0 4px;}
+  .panel .panel-sub{font-size:11.5px; color:var(--ink-faint); margin-bottom:14px;}
+  .exec-grid{display:grid; grid-template-columns:220px 1fr; gap:30px; align-items:center;}
+  .exec-donut{display:flex; justify-content:center;}
+  .exec-legend{display:grid; grid-template-columns:repeat(2,1fr); gap:10px 22px;}
+  .leg-row{display:flex; align-items:center; justify-content:space-between; padding:8px 0; border-bottom:1px solid var(--border);}
+  .leg-row .lbl{display:flex; align-items:center; gap:8px; font-size:12.5px; font-weight:600; color:var(--ink-dim);}
+  .leg-row .val{font-family:'Archivo'; font-size:19px; font-weight:800; font-variant-numeric:tabular-nums;}
+  .leg-row.good .val{color:var(--good);} .leg-row.bad .val{color:var(--bad);}
+  .leg-row.warn .val{color:var(--warn);} .leg-row.mute .val{color:var(--mute);}
+  .verdict{grid-column:1/-1; margin-top:4px; padding-top:14px; border-top:1px solid var(--border); display:flex; align-items:baseline; gap:10px; flex-wrap:wrap;}
+  .verdict .vlabel{font-size:10.5px; text-transform:uppercase; letter-spacing:.08em; color:var(--ink-faint); font-weight:700;}
+  .verdict .vtext{font-family:'Archivo'; font-size:22px; font-weight:800;}
+  .verdict .vtext.good{color:var(--good);} .verdict .vtext.bad{color:var(--bad);} .verdict .vtext.warn{color:var(--warn);}
+  .verdict .vnote{font-size:11.5px; color:var(--ink-faint);}
+  .donut-grid{display:grid; grid-template-columns:repeat(auto-fill, minmax(150px,1fr)); gap:6px;}
+  .donut-tile{display:flex; flex-direction:column; align-items:center; text-align:center; padding:12px 8px; border-radius:8px; cursor:pointer; transition:background .12s;}
+  .donut-tile:hover{background:var(--surface-2);}
+  .donut-tile .dname{font-size:11px; font-weight:600; margin-top:6px; line-height:1.3;}
+  .donut-tile .dcounts{font-family:'IBM Plex Mono'; font-size:9.5px; color:var(--ink-faint); margin-top:2px;}
+  @media(max-width:900px){ .exec-grid{grid-template-columns:1fr;} .exec-donut{padding-bottom:6px;} }
+  .roster{display:flex; gap:8px; flex-wrap:wrap; margin-bottom:18px;}
+  .roster-card{
+    background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:8px 12px;
+    display:flex; align-items:center; gap:9px; box-shadow:var(--shadow); min-width:0;
+  }
+  .roster-dot{width:8px; height:8px; border-radius:50%; flex-shrink:0;}
+  .roster-name{font-family:'IBM Plex Mono'; font-size:12px; font-weight:500;}
+  .roster-sub{font-size:10.5px; color:var(--ink-faint);}
+  .roster-card.skip{opacity:.65; border-style:dashed;}
+  .controls{display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:18px;}
+  .chip{font-size:11.5px; font-weight:600; padding:6px 12px; border-radius:100px; border:1px solid var(--border); background:var(--surface); color:var(--ink-dim); cursor:pointer; user-select:none; display:flex; align-items:center; gap:6px; transition:border-color .12s, color .12s;}
+  .chip:hover{border-color:var(--accent);}
+  .chip .n{font-family:'IBM Plex Mono'; opacity:.75;}
+  .chip.active{border-color:var(--accent); color:var(--accent); background:var(--accent-soft);}
+  .swatch{width:7px; height:7px; border-radius:50%;}
+  .swatch.good{background:var(--good);} .swatch.bad{background:var(--bad);} .swatch.warn{background:var(--warn);} .swatch.mute{background:var(--mute);}
+  #search{margin-left:auto; background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:7px 12px; font-size:12.5px; color:var(--ink); width:250px;}
+  #search:focus{outline:2px solid var(--accent-soft); border-color:var(--accent);}
+  #search::placeholder{color:var(--ink-faint);}
+  .not-assessed{background:var(--mute-soft); border:1px solid var(--border); border-radius:var(--radius); padding:10px 16px; margin-bottom:18px; font-size:12px; color:var(--ink-dim);}
+  .not-assessed b{color:var(--ink);}
+  .not-assessed .row{padding:3px 0;}
+  .not-assessed .mono{color:var(--ink-faint);}
+  .layout{display:grid; grid-template-columns:220px 1fr; gap:26px; align-items:start;}
+  .sidenav{position:sticky; top:16px; background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); box-shadow:var(--shadow); padding:10px; max-height:calc(100vh - 32px); overflow-y:auto;}
+  .sidenav a{
+    display:flex; justify-content:space-between; align-items:center; gap:8px; padding:8px 10px; border-radius:7px;
+    font-size:12px; color:var(--ink-dim); text-decoration:none; margin-bottom:2px; font-weight:500;
+  }
+  .sidenav a:hover{background:var(--surface-2); color:var(--ink);}
+  .sidenav .cnt{font-family:'IBM Plex Mono'; font-size:10px; color:var(--ink-faint);}
+  .sidenav .issue{background:var(--bad-soft); color:var(--bad); font-family:'IBM Plex Mono'; font-size:10px; font-weight:700; padding:1px 6px; border-radius:100px;}
+  .cat-section{margin-bottom:8px; scroll-margin-top:16px;}
+  .cat-heading{
+    font-family:'Archivo'; font-weight:800; font-size:17px; margin:26px 0 12px; padding-bottom:8px;
+    border-bottom:2px solid var(--border); display:flex; align-items:center; gap:10px;
+  }
+  .cat-heading:first-child{margin-top:0;}
+  .cat-heading .idx{color:var(--accent); font-family:'IBM Plex Mono'; font-size:14px;}
+  .item-card{background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); box-shadow:var(--shadow); padding:14px 16px; margin-bottom:12px; scroll-margin-top:16px;}
+  .item-top{display:flex; justify-content:space-between; align-items:flex-start; gap:14px; margin-bottom:10px;}
+  .item-title{font-family:'Archivo'; font-weight:700; font-size:14px;}
+  .item-exp{font-size:11px; color:var(--ink-faint); margin-top:3px;}
+  .item-exp .mono{color:var(--ink-dim);}
+  .item-tally{display:flex; gap:5px; flex-shrink:0;}
+  .tally{font-family:'IBM Plex Mono'; font-size:10.5px; font-weight:700; padding:2px 8px; border-radius:100px;}
+  .tally.good{background:var(--good-soft); color:var(--good);} .tally.bad{background:var(--bad-soft); color:var(--bad);}
+  .tally.warn{background:var(--warn-soft); color:var(--warn);} .tally.mute{background:var(--mute-soft); color:var(--mute);}
+  .vm-scroll{max-height:230px; overflow-y:auto; border-top:1px solid var(--border);}
+  .vm-row{display:grid; grid-template-columns:130px 1fr; gap:12px; padding:8px 2px; border-bottom:1px solid var(--border); align-items:start;}
+  .vm-row:last-child{border-bottom:none;}
+  .vm-who{display:flex; align-items:center; gap:7px; padding-top:1px;}
+  .vm-who .name{font-family:'IBM Plex Mono'; font-size:11.5px; font-weight:500;}
+  .vm-detail .det{font-family:'IBM Plex Mono'; font-size:11.5px; color:var(--ink-dim); word-break:break-word;}
+  .vm-detail .status-txt{font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; margin-right:6px;}
+  .vm-detail .status-txt.good{color:var(--good);} .vm-detail .status-txt.bad{color:var(--bad);}
+  .vm-detail .status-txt.warn{color:var(--warn);} .vm-detail .status-txt.mute{color:var(--mute);}
+  .vm-detail .reason{font-size:11px; color:var(--warn); margin-top:3px;}
+  .vm-detail .reason.crit{color:var(--bad);}
+  .empty-state{text-align:center; padding:30px 0; color:var(--ink-faint); font-size:13px;}
+  footer{margin-top:26px; padding-top:16px; border-top:1px solid var(--border); font-size:11.5px; color:var(--ink-faint);}
+  @media(max-width:900px){
+    .kpis{grid-template-columns:repeat(2,1fr);}
+    .layout{grid-template-columns:1fr;}
+    .sidenav{position:static; max-height:none;}
+    #search{width:100%; margin-left:0;}
+    .vm-row{grid-template-columns:1fr;}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <div class="h-eyebrow">Windows OS Acceptance &mdash; Assessment Results</div>
+      <h1>OS Acceptance Results</h1>
+      <div class="h-meta">
+        <span><b id="mTotal">-</b> VMs targeted</span>
+        <span><b id="mAssessed">-</b> assessed &middot; <b id="mSkipped">-</b> not assessed</span>
+        <span>vCenter: <b id="vcenterList">-</b></span>
+      </div>
+    </div>
+    <div class="h-right" id="runMetaRight"></div>
+  </header>
+
+  <div class="panel">
+    <h2>Fleet compliance &mdash; executive summary</h2>
+    <div class="panel-sub">Every checklist item &times; every assessed VM, rolled up into one verdict</div>
+    <div class="exec-grid">
+      <div class="exec-donut" id="execDonut"></div>
+      <div>
+        <div class="exec-legend" id="execLegend"></div>
+        <div class="verdict"><span class="vlabel">Overall assessment</span><span class="vtext" id="verdictText"></span><span class="vnote" id="verdictNote"></span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="kpis" id="kpiStrip"></div>
+
+  <div class="panel">
+    <h2>Compliance by category</h2>
+    <div class="panel-sub">Item-level results aggregated across assessed VMs &mdash; click a donut to jump to that category</div>
+    <div class="donut-grid" id="catChart"></div>
+  </div>
+
+  <div class="roster" id="roster"></div>
+  <div id="notAssessed"></div>
+
+  <div class="controls">
+    <div id="statusChips" style="display:flex; gap:10px; flex-wrap:wrap;"></div>
+    <input id="search" type="text" placeholder="Filter by VM, category, or item...">
+  </div>
+
+  <div class="layout">
+    <nav class="sidenav" id="sidenav"></nav>
+    <main id="main"></main>
+  </div>
+
+  <footer>
+    Read-only assessment &mdash; <code class="mono">Invoke-OSAcceptanceCheck.ps1</code> via VMware Tools guest ops, plus a VMware Tools status read from the VM object in vCenter (the one item checked before any in-guest command is attempted).
+  </footer>
+</div>
+
+<script>
+const ROWS = {{ROWS_JSON}};
+const RUN_META = {{RUN_META_JSON}};
+
+function statusClass(status){
+  if (status === 'Compliant') return 'good';
+  if (status === 'Non-Compliant') return 'bad';
+  if (status === 'Manual Verification Required') return 'warn';
+  return 'mute';
+}
+const STATUS_LABEL = { good:'Compliant', bad:'Non-Compliant', warn:'Manual Review', mute:'Unable to Check' };
+
+const VM_META = {};
+const catOrder = [];
+const itemsByCat = {};
+const dataByKey = {};
+
+ROWS.forEach(row=>{
+  if (!VM_META[row.vm]) VM_META[row.vm] = { os:'', ip:'', vCenter:row.vCenter||'', cats:new Set(), skipReason:'' };
+  const vm = VM_META[row.vm];
+  if (row.os) vm.os = row.os;
+  if (row.ip) vm.ip = row.ip;
+  if (row.vCenter) vm.vCenter = row.vCenter;
+  vm.cats.add(row.cat);
+
+  if (row.cat === 'Validation') { vm.skipReason = row.reason || row.det || 'Not assessed.'; return; }
+
+  if (!catOrder.includes(row.cat)) { catOrder.push(row.cat); itemsByCat[row.cat] = []; }
+  if (!itemsByCat[row.cat].includes(row.item)) itemsByCat[row.cat].push(row.item);
+
+  const key = row.cat + '||' + row.item;
+  if (!dataByKey[key]) dataByKey[key] = { exp: row.exp, vms:{} };
+  dataByKey[key].vms[row.vm] = { s: statusClass(row.status), label: row.status, d: row.det, r: row.reason };
+});
+
+Object.keys(VM_META).forEach(v=>{
+  const cats = VM_META[v].cats;
+  if (cats.size >= 3) VM_META[v].state = 'assessed';
+  else if (cats.size === 1 && cats.has('Validation')) VM_META[v].state = 'notfound';
+  else VM_META[v].state = 'skipped';
+});
+const ASSESSED = Object.keys(VM_META).filter(v => VM_META[v].state === 'assessed');
+
+let activeStatuses = new Set(['good','bad','warn','mute']);
+let searchTerm = '';
+
+function computeFlags(){
+  const flags = {}; ASSESSED.forEach(v => flags[v] = { good:0, bad:0, warn:0, mute:0 });
+  Object.values(dataByKey).forEach(entry=>{
+    ASSESSED.forEach(v=>{ const r = entry.vms[v]; if (r) flags[v][r.s]++; });
+  });
+  return flags;
+}
+const FLAGS = computeFlags();
+
+function donutSvg(counts, total, size){
+  const order = ['good','bad','warn','mute'];
+  const r = 62, cx = 80, cy = 80, sw = 22;
+  const circ = 2 * Math.PI * r;
+  let acc = 0, arcs = '';
+  order.forEach(k=>{
+    const v = counts[k] || 0;
+    if (!v) return;
+    const len = circ * (v / total);
+    arcs += `<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" style="stroke:var(--${k})" stroke-width="${sw}" stroke-dasharray="${len} ${circ-len}" stroke-dashoffset="${-acc}" transform="rotate(-90 ${cx} ${cy})"/>`;
+    acc += len;
+  });
+  if (!total) arcs = `<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" style="stroke:var(--border)" stroke-width="${sw}"/>`;
+  return `<svg viewBox="0 0 160 160" width="${size}" height="${size}" role="img" aria-label="Compliance donut">
+    ${arcs}
+    <text x="80" y="76" text-anchor="middle" font-family="Archivo" font-size="${size>=180?28:16}" font-weight="800" style="fill:var(--ink)">${total}</text>
+    <text x="80" y="${size>=180?96:92}" text-anchor="middle" font-family="IBM Plex Mono" font-size="${size>=180?11:8}" style="fill:var(--ink-faint)">points</text>
+  </svg>`;
+}
+
+function computeItemTotals(){
+  const t = { good:0, bad:0, warn:0, mute:0 };
+  Object.values(dataByKey).forEach(entry=>{
+    ASSESSED.forEach(v=>{ const r = entry.vms[v]; if (r) t[r.s]++; });
+  });
+  t.total = t.good+t.bad+t.warn+t.mute;
+  return t;
+}
+
+function renderExecSummary(){
+  const t = computeItemTotals();
+  document.getElementById('execDonut').innerHTML = donutSvg(t, t.total, 200);
+  document.getElementById('execLegend').innerHTML = `
+    <div class="leg-row good"><span class="lbl"><span class="swatch good"></span>Compliant</span><span class="val">${t.good}</span></div>
+    <div class="leg-row bad"><span class="lbl"><span class="swatch bad"></span>Non-Compliant</span><span class="val">${t.bad}</span></div>
+    <div class="leg-row warn"><span class="lbl"><span class="swatch warn"></span>Manual Review</span><span class="val">${t.warn}</span></div>
+    <div class="leg-row mute"><span class="lbl"><span class="swatch mute"></span>Unable to Check</span><span class="val">${t.mute}</span></div>`;
+
+  const vEl = document.getElementById('verdictText'); const nEl = document.getElementById('verdictNote');
+  if (t.total === 0) {
+    vEl.textContent = 'No Data'; vEl.className = 'vtext warn';
+    nEl.textContent = 'No VM in this run produced any checklist results.';
+  } else if (t.bad > 0) {
+    vEl.textContent = 'Not Ready for Acceptance'; vEl.className = 'vtext bad';
+    nEl.textContent = `${t.bad} non-compliant finding(s) block acceptance until remediated or formally risk-accepted.`;
+  } else if (t.warn > 0 || t.mute > 0) {
+    vEl.textContent = 'Accepted with Conditions'; vEl.className = 'vtext warn';
+    nEl.textContent = `${t.warn + t.mute} item(s) need a human sign-off before this fleet is fully closed out.`;
+  } else {
+    vEl.textContent = 'Accepted'; vEl.className = 'vtext good';
+    nEl.textContent = 'No open findings across any assessed VM.';
+  }
+}
+
+function renderKpis(){
+  const skippedCount = Object.values(VM_META).filter(v => v.state !== 'assessed').length;
+  const compliant = ASSESSED.filter(v => FLAGS[v].bad === 0).length;
+  const nonCompliant = ASSESSED.filter(v => FLAGS[v].bad > 0).length;
+  const manual = ASSESSED.filter(v => FLAGS[v].warn > 0).length;
+  const unable = ASSESSED.filter(v => FLAGS[v].mute > 0).length;
+
+  document.getElementById('mTotal').textContent = Object.keys(VM_META).length;
+  document.getElementById('mAssessed').textContent = ASSESSED.length;
+  document.getElementById('mSkipped').textContent = skippedCount;
+  document.getElementById('vcenterList').textContent = RUN_META.vCenters || '-';
+  document.getElementById('runMetaRight').innerHTML = `Run ${RUN_META.generatedAt}<br>${RUN_META.csvFile}`;
+
+  document.getElementById('kpiStrip').innerHTML = `
+    <div class="kpi total"><div class="kpi-label">VMs Assessed</div><div class="kpi-value">${ASSESSED.length}</div><div class="kpi-sub">of ${Object.keys(VM_META).length} targeted</div></div>
+    <div class="kpi good"><div class="kpi-label">Compliant</div><div class="kpi-value">${compliant}</div><div class="kpi-sub">no gaps found</div></div>
+    <div class="kpi bad"><div class="kpi-label">Non-Compliant</div><div class="kpi-value">${nonCompliant}</div><div class="kpi-sub">gaps found</div></div>
+    <div class="kpi warn"><div class="kpi-label">Manual Review</div><div class="kpi-value">${manual}</div><div class="kpi-sub">need a human check</div></div>
+    <div class="kpi mute"><div class="kpi-label">Not Assessed</div><div class="kpi-value">${skippedCount}</div><div class="kpi-sub">Tools/power/lookup failure</div></div>`;
+}
+
+function renderRoster(){
+  const el = document.getElementById('roster');
+  let html = '';
+  ASSESSED.forEach(v=>{
+    const bad = FLAGS[v].bad > 0;
+    html += `<div class="roster-card"><span class="roster-dot" style="background:var(--${bad?'bad':'good'})"></span>
+      <div><div class="roster-name">${v}</div><div class="roster-sub">${bad ? FLAGS[v].bad+' non-compliant' : 'compliant'} &middot; ${VM_META[v].ip||VM_META[v].os||''}</div></div></div>`;
+  });
+  Object.keys(VM_META).filter(v=>VM_META[v].state!=='assessed').forEach(v=>{
+    html += `<div class="roster-card skip"><span class="roster-dot" style="background:var(--mute)"></span>
+      <div><div class="roster-name">${v}</div><div class="roster-sub">not assessed</div></div></div>`;
+  });
+  el.innerHTML = html;
+}
+
+function renderNotAssessed(){
+  const list = Object.entries(VM_META).filter(([,m]) => m.state !== 'assessed');
+  if (list.length === 0) { document.getElementById('notAssessed').innerHTML = ''; return; }
+  document.getElementById('notAssessed').innerHTML = `<div class="not-assessed">
+    <b>${list.length} VM(s) not fully assessed:</b>
+    ${list.map(([name,m])=>`<div class="row">${name} &mdash; <span class="mono">${m.skipReason}</span>${m.state==='skipped' ? ' (VMware Tools status recorded below, if reachable)' : ''}</div>`).join('')}
+  </div>`;
+}
+
+function renderCatChart(){
+  const el = document.getElementById('catChart');
+  el.innerHTML = catOrder.map(cat=>{
+    const c = { good:0, bad:0, warn:0, mute:0 }; let total = 0;
+    itemsByCat[cat].forEach(item=>{
+      const entry = dataByKey[cat+'||'+item];
+      ASSESSED.forEach(v=>{ const r = entry.vms[v]; if (r) { c[r.s]++; total++; } });
+    });
+    const slug = cat.replace(/[^A-Za-z0-9]+/g,'-');
+    return `
+    <div class="donut-tile" onclick="document.getElementById('cat-${slug}').scrollIntoView({behavior:'smooth', block:'start'})">
+      ${donutSvg(c, total, 108)}
+      <div class="dname">${cat.replace(/^\d+\.\s*/,'')}</div>
+      <div class="dcounts">${c.good}&#10003; ${c.bad}&#10005; ${c.warn}? ${c.mute}&#8213;</div>
+    </div>`;
+  }).join('');
+}
+
+function renderStatusChips(){
+  const totals = { good:0, bad:0, warn:0, mute:0 };
+  Object.values(dataByKey).forEach(entry=>{
+    ASSESSED.forEach(v=>{ const r = entry.vms[v]; if (r) totals[r.s]++; });
+  });
+  const order = ['good','bad','warn','mute'];
+  document.getElementById('statusChips').innerHTML = order.map(k => `
+    <div class="chip ${activeStatuses.has(k)?'active':''}" onclick="toggleStatus('${k}')">
+      <span class="swatch ${k}"></span>${STATUS_LABEL[k]} <span class="n">${totals[k]}</span>
+    </div>`).join('');
+}
+function toggleStatus(k){
+  if (activeStatuses.has(k)) { if (activeStatuses.size>1) activeStatuses.delete(k); } else activeStatuses.add(k);
+  renderStatusChips(); renderMain();
+}
+
+function matchesSearch(hayParts){
+  if (!searchTerm) return true;
+  return hayParts.join(' ').toLowerCase().includes(searchTerm);
+}
+
+function renderSidenav(visibleCounts, issueCounts){
+  document.getElementById('sidenav').innerHTML = catOrder.map(cat=>{
+    const slug = cat.replace(/[^A-Za-z0-9]+/g,'-');
+    return `<a href="#cat-${slug}">
+      <span>${cat}</span>
+      <span style="display:flex; gap:6px; align-items:center;">
+        ${issueCounts[cat] ? `<span class="issue">${issueCounts[cat]}</span>` : ''}
+        <span class="cnt">${visibleCounts[cat]||0}</span>
+      </span>
+    </a>`;
+  }).join('');
+}
+
+function renderMain(){
+  const visibleCounts = {}; const issueCounts = {};
+  let bodyHtml = '';
+
+  catOrder.forEach((cat, ci)=>{
+    const slug = cat.replace(/[^A-Za-z0-9]+/g,'-');
+    let sectionHtml = '';
+    let sectionVisibleCount = 0;
+    let sectionIssues = 0;
+
+    itemsByCat[cat].forEach(item=>{
+      const entry = dataByKey[cat+'||'+item];
+      const rowsForItem = Object.entries(entry.vms).filter(([vm, r]) =>
+        activeStatuses.has(r.s) && matchesSearch([cat, item, vm, r.d, r.r||'']));
+      if (rowsForItem.length === 0) return;
+      sectionVisibleCount++;
+
+      const tally = { good:0, bad:0, warn:0, mute:0 };
+      Object.values(entry.vms).forEach(r=>tally[r.s]++);
+      if (tally.bad > 0) sectionIssues += tally.bad;
+
+      const rowsHtml = rowsForItem.map(([vm, r])=>`
+        <div class="vm-row">
+          <div class="vm-who"><span class="status-dot" style="width:7px;height:7px;border-radius:50%;background:var(--${r.s})"></span><span class="name">${vm}</span></div>
+          <div class="vm-detail">
+            <span class="status-txt ${r.s}">${r.label}</span><span class="det">${r.d}</span>
+            ${r.r ? `<div class="reason ${r.s==='bad'?'crit':''}">${r.r}</div>` : ''}
+          </div>
+        </div>`).join('');
+
+      sectionHtml += `
+      <div class="item-card">
+        <div class="item-top">
+          <div><div class="item-title">${item}</div>
+            <div class="item-exp">Expected: <span class="mono">${entry.exp}</span></div></div>
+          <div class="item-tally">
+            ${tally.good?`<span class="tally good">${tally.good}</span>`:''}
+            ${tally.bad?`<span class="tally bad">${tally.bad}</span>`:''}
+            ${tally.warn?`<span class="tally warn">${tally.warn}</span>`:''}
+            ${tally.mute?`<span class="tally mute">${tally.mute}</span>`:''}
+          </div>
+        </div>
+        <div class="vm-scroll">${rowsHtml}</div>
+      </div>`;
+    });
+
+    visibleCounts[cat] = sectionVisibleCount;
+    issueCounts[cat] = sectionIssues;
+    if (sectionVisibleCount === 0) return;
+
+    bodyHtml += `
+    <section class="cat-section" id="cat-${slug}">
+      <div class="cat-heading"><span class="idx">${String(ci+1).padStart(2,'0')}</span>${cat}</div>
+      ${sectionHtml}
+    </section>`;
+  });
+
+  document.getElementById('main').innerHTML = bodyHtml || '<div class="empty-state">No items match the current filter, or no checklist rows were produced by this run.</div>';
+  renderSidenav(visibleCounts, issueCounts);
+}
+
+document.getElementById('search').addEventListener('input', e=>{
+  searchTerm = e.target.value.trim().toLowerCase();
+  renderMain();
+});
+
+renderExecSummary();
+renderKpis();
+renderRoster();
+renderNotAssessed();
+renderCatChart();
+renderStatusChips();
+renderMain();
+</script>
+</body>
+</html>
+'@
+
+# =====================================================================================
+# 7. Central report + console summary
 # =====================================================================================
 $centralRows | Export-Csv -LiteralPath $CsvPath -NoTypeInformation -Encoding UTF8
 Write-Log "CSV written: $CsvPath ($($centralRows.Count) rows)."
+
+$HtmlPath = Join-Path $OutputPath "OSAcceptance_$RunStamp.html"
+$rowsForJson = @($centralRows | ForEach-Object {
+    [ordered]@{
+        vm = $_.VMName; vCenter = $_.vCenter; os = $_.OS; ip = $_.IPAddress
+        cat = $_.Category; item = $_.Item; status = $_.Status
+        det = $_.DetectedValue; exp = $_.ExpectedValue; reason = $_.'Error/Reason'
+    }
+})
+if ($rowsForJson.Count -eq 0) {
+    $rowsJson = '[]'
+} elseif ($rowsForJson.Count -eq 1) {
+    # ConvertTo-Json on a single-item array collapses to a bare object on PS 5.1 (no -AsArray there) - wrap by hand.
+    $rowsJson = '[' + ($rowsForJson | ConvertTo-Json -Depth 6 -Compress) + ']'
+} else {
+    $rowsJson = $rowsForJson | ConvertTo-Json -Depth 6 -Compress
+}
+$rowsJson = $rowsJson.Replace('</script', '<\/script')
+
+$runMetaObj = [ordered]@{
+    generatedAt   = (Get-Date -Format 'yyyy-MM-dd HH:mm')
+    csvFile       = (Split-Path -Leaf $CsvPath)
+    vCenters      = (($connectedServers | ForEach-Object { $_.Name }) -join ', ')
+    totalTargeted = $vmNames.Count
+}
+$runMetaJson = ($runMetaObj | ConvertTo-Json -Compress).Replace('</script', '<\/script')
+
+$htmlOut = $DashboardTemplate.Replace('{{ROWS_JSON}}', $rowsJson).Replace('{{RUN_META_JSON}}', $runMetaJson)
+Set-Content -LiteralPath $HtmlPath -Value $htmlOut -Encoding UTF8
+Write-Log "HTML dashboard written: $HtmlPath"
 
 Write-Host ""
 Write-Host "============= OS ACCEPTANCE SUMMARY =============" -ForegroundColor Green
@@ -1293,6 +1832,7 @@ Write-Host ("  Unable to Check (some items)  : {0}" -f $summary.Unable) -Foregro
 Write-Host ("  Skipped / Failed to process   : {0}" -f $summary.SkippedFailed) -ForegroundColor $(if ($summary.SkippedFailed) { 'Red' } else { 'Gray' })
 Write-Host "===================================================" -ForegroundColor Green
 Write-Host ""
-Write-Host "Report : $CsvPath"
-Write-Host "Log    : $LogPath"
+Write-Host "CSV       : $CsvPath"
+Write-Host "Dashboard : $HtmlPath"
+Write-Host "Log       : $LogPath"
 Write-Log "OS Acceptance run complete."
