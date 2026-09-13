@@ -1234,7 +1234,7 @@ function Get-Mode {
     return ($nonEmpty | Group-Object | Sort-Object Count -Descending | Select-Object -First 1).Name
 }
 
-if (@($fleetData).Count -ge 2) {
+if ($fleetData.Count -ge 2) {
     $Cat7 = '7. Configuration Consistency'
     $modeDns    = Get-Mode -Values @($fleetData | ForEach-Object { $_.DnsServers })
     $modeTime   = Get-Mode -Values @($fleetData | ForEach-Object { $_.TimeSource })
