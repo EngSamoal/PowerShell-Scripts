@@ -1839,4 +1839,200 @@ $ColorGood = New-ExcelColor 198 239 206   # Excel's built-in "Good" green
 $ColorBad  = New-ExcelColor 255 199 206   # Excel's built-in "Bad" red
 $ColorWarn = New-ExcelColor 255 235 156   # Excel's built-in "Neutral" amber
 $ColorMute = New-ExcelColor 217 217 217   # grey - Unable to Check / Not Applicable
-$ColorHead = New-ExcelColor 232 236 236  
+$ColorHead = New-ExcelColor 232 236 236   # header fill
+
+$xlsxOk   = $false
+$XlsxPath = Join-Path $OutputPath "OSAcceptance_$RunStamp.xlsx"
+try {
+    $catOrder   = New-Object System.Collections.Generic.List[string]         # categories, in first-seen order
+    $itemsByCat = @{}                                                        # category -> List[string] of items, in first-seen order within that category
+    $cellData   = @{}                                                        # "VM||Category||Item" -> @{ Status; Detected; Expected; Reason }
+    $vmOrder    = New-Object System.Collections.Generic.List[string]
+    $vmMetaRow  = @{}
+
+    foreach ($r in $centralRows) {
+        if (-not $vmOrder.Contains($r.VMName)) {
+            $vmOrder.Add($r.VMName) | Out-Null
+            $vmMetaRow[$r.VMName] = @{ vCenter = $r.vCenter; Host = $r.GuestHostname; IP = $r.IPAddress; OS = $r.OS }
+        } else {
+            if (-not $vmMetaRow[$r.VMName].Host -and $r.GuestHostname) { $vmMetaRow[$r.VMName].Host = $r.GuestHostname }
+            if (-not $vmMetaRow[$r.VMName].IP   -and $r.IPAddress)     { $vmMetaRow[$r.VMName].IP   = $r.IPAddress }
+            if (-not $vmMetaRow[$r.VMName].OS   -and $r.OS)            { $vmMetaRow[$r.VMName].OS   = $r.OS }
+        }
+        if ($r.Category -eq 'Validation') { continue }
+        # Two-level ordering (category first, then item within it) - not a single flat first-seen pass -
+        # so a category's columns stay contiguous even when a later VM is the first to hit an item in a
+        # category that an earlier VM had already partially populated (e.g. one VM alone triggers CPU
+        # counters failing, or -SkipRolesInventory differs between runs).
+        if (-not $catOrder.Contains($r.Category)) {
+            $catOrder.Add($r.Category) | Out-Null
+            $itemsByCat[$r.Category] = New-Object System.Collections.Generic.List[string]
+        }
+        if (-not $itemsByCat[$r.Category].Contains($r.Item)) { $itemsByCat[$r.Category].Add($r.Item) | Out-Null }
+        $cellData["$($r.VMName)||$($r.Category)||$($r.Item)"] = @{ Status = $r.Status; Detected = $r.DetectedValue; Expected = $r.ExpectedValue; Reason = $r.'Error/Reason' }
+    }
+
+    $itemColumns     = New-Object System.Collections.Generic.List[string]    # "Category||Item" keys, in final column order
+    $itemColumnLabel = @{}
+    $itemColumnCat   = @{}
+    foreach ($cat in $catOrder) {
+        foreach ($item in $itemsByCat[$cat]) {
+            $key = "$cat||$item"
+            $itemColumns.Add($key) | Out-Null
+            $itemColumnCat[$key]   = $cat
+            $itemColumnLabel[$key] = $item
+        }
+    }
+
+    $IdentityCols = @('VM Name', 'vCenter', 'Guest Hostname', 'IP Address', 'OS')
+    $XlsxPath     = Join-Path $OutputPath "OSAcceptance_$RunStamp.xlsx"
+    $xlsxOk       = $false
+    $excel = $null; $wb = $null; $ws = $null
+    try {
+        $excel = New-Object -ComObject Excel.Application -ErrorAction Stop
+        $excel.Visible = $false
+        $excel.DisplayAlerts = $false
+        $wb = $excel.Workbooks.Add()
+        $ws = $wb.Worksheets.Item(1)
+        $ws.Name = 'OS Acceptance'
+
+        for ($i = 0; $i -lt $IdentityCols.Count; $i++) {
+            $c = $i + 1
+            $ws.Cells.Item(2, $c) = $IdentityCols[$i]
+            $ws.Range($ws.Cells.Item(1, $c), $ws.Cells.Item(2, $c)).Merge() | Out-Null
+        }
+        $firstItemCol = $IdentityCols.Count + 1
+
+        $col = $firstItemCol
+        $prevCat = $null
+        $catStartCol = $col
+        foreach ($key in $itemColumns) {
+            $cat = $itemColumnCat[$key]
+            if ($cat -ne $prevCat) {
+                if ($prevCat -and ($col - 1) -ge $catStartCol) {
+                    $ws.Range($ws.Cells.Item(1, $catStartCol), $ws.Cells.Item(1, $col - 1)).Merge() | Out-Null
+                }
+                $ws.Cells.Item(1, $col) = $cat
+                $catStartCol = $col
+                $prevCat = $cat
+            }
+            $ws.Cells.Item(2, $col) = $itemColumnLabel[$key]
+            $col++
+        }
+        if ($prevCat -and ($col - 1) -ge $catStartCol) {
+            $ws.Range($ws.Cells.Item(1, $catStartCol), $ws.Cells.Item(1, $col - 1)).Merge() | Out-Null
+        }
+        $lastCol = $col - 1
+
+        $headerRange = $ws.Range($ws.Cells.Item(1, 1), $ws.Cells.Item(2, $lastCol))
+        $headerRange.Font.Bold = $true
+        $headerRange.Interior.Color = $ColorHead
+        $headerRange.WrapText = $true
+        $headerRange.VerticalAlignment = -4108   # xlVAlignCenter / xlHAlignCenter share this value
+        $headerRange.HorizontalAlignment = -4108
+        $ws.Rows.Item(1).RowHeight = 20
+        $ws.Rows.Item(2).RowHeight = 46
+
+        $rowIdx = 3
+        foreach ($vm in $vmOrder) {
+            $meta = $vmMetaRow[$vm]
+            $ws.Cells.Item($rowIdx, 1) = $vm
+            $ws.Cells.Item($rowIdx, 2) = $meta.vCenter
+            $ws.Cells.Item($rowIdx, 3) = $meta.Host
+            $ws.Cells.Item($rowIdx, 4) = $meta.IP
+            $ws.Cells.Item($rowIdx, 5) = $meta.OS
+
+            $c = $firstItemCol
+            foreach ($key in $itemColumns) {
+                $cd = $cellData["$vm||$key"]
+                if ($cd) {
+                    $cell = $ws.Cells.Item($rowIdx, $c)
+                    $cell.Value2 = $cd.Status
+                    $cell.Interior.Color = switch ($cd.Status) {
+                        'Compliant' { $ColorGood }
+                        'Non-Compliant' { $ColorBad }
+                        'Manual Verification Required' { $ColorWarn }
+                        default { $ColorMute }
+                    }
+                    $note = "Detected: $($cd.Detected)`nExpected: $($cd.Expected)"
+                    if ($cd.Reason) { $note += "`nReason: $($cd.Reason)" }
+                    [void]$cell.AddComment($note)
+                    $cell.Comment.Shape.TextFrame.AutoSize = $true
+                }
+                $c++
+            }
+            $rowIdx++
+        }
+
+        $ws.Columns.Item(1).ColumnWidth = 22
+        $ws.Columns.Item(2).ColumnWidth = 20
+        $ws.Columns.Item(3).ColumnWidth = 24
+        $ws.Columns.Item(4).ColumnWidth = 16
+        $ws.Columns.Item(5).ColumnWidth = 26
+        for ($c = $firstItemCol; $c -le $lastCol; $c++) { $ws.Columns.Item($c).ColumnWidth = 15 }
+
+        $ws.Activate()
+        $ws.Cells.Item(3, $firstItemCol).Select() | Out-Null
+        $excel.ActiveWindow.FreezePanes = $true
+
+        $wb.SaveAs($XlsxPath, 51)   # 51 = xlOpenXMLWorkbook (.xlsx)
+        $wb.Close($false)
+        $excel.Quit()
+        $xlsxOk = $true
+        Write-Log "Compliance matrix workbook written: $XlsxPath ($($vmOrder.Count) VM rows x $($itemColumns.Count) item columns)."
+    } catch {
+        Write-Log "Excel COM automation failed - falling back to a wide-format CSV instead of .xlsx: $($_.Exception.Message)" 'WARN'
+        try { if ($wb) { $wb.Close($false) } } catch { }
+        try { if ($excel) { $excel.Quit() } } catch { }
+    } finally {
+        foreach ($comObj in @($ws, $wb, $excel)) {
+            if ($comObj) { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($comObj) }
+        }
+        Remove-Variable excel, wb, ws -ErrorAction SilentlyContinue
+        [GC]::Collect()
+        [GC]::WaitForPendingFinalizers()
+    }
+
+    if (-not $xlsxOk) {
+        $XlsxPath = Join-Path $OutputPath "OSAcceptance_Matrix_$RunStamp.csv"
+        $wideRows = foreach ($vm in $vmOrder) {
+            $meta = $vmMetaRow[$vm]
+            $obj = [ordered]@{ 'VM Name' = $vm; vCenter = $meta.vCenter; 'Guest Hostname' = $meta.Host; 'IP Address' = $meta.IP; OS = $meta.OS }
+            foreach ($key in $itemColumns) {
+                $cd = $cellData["$vm||$key"]
+                $obj["$($itemColumnCat[$key]) - $($itemColumnLabel[$key])"] = if ($cd) { $cd.Status } else { '' }
+            }
+            [PSCustomObject]$obj
+        }
+        $wideRows | Export-Csv -LiteralPath $XlsxPath -NoTypeInformation -Encoding UTF8
+        Write-Log "Wide-format compliance matrix CSV written instead: $XlsxPath"
+    }
+} catch {
+    # Guarantees the run still reaches the CSV export below even if compliance-matrix
+    # generation (Excel COM or its CSV fallback) fails for a reason the inner try/catch
+    # did not anticipate - a single bad row should never cost the whole report.
+    Write-Log "Compliance matrix generation failed entirely - neither .xlsx nor a fallback CSV was written: $($_.Exception.Message)" 'ERROR'
+}
+
+# =====================================================================================
+# 8. Central report + console summary
+# =====================================================================================
+$centralRows | Export-Csv -LiteralPath $CsvPath -NoTypeInformation -Encoding UTF8
+Write-Log "CSV written: $CsvPath ($($centralRows.Count) rows)."
+
+Write-Host ""
+Write-Host "============= OS ACCEPTANCE SUMMARY =============" -ForegroundColor Green
+Write-Host ("  Total VMs                     : {0}" -f $summary.Total)
+Write-Host ("  Successfully Checked          : {0}" -f $summary.Checked)
+Write-Host ("  Compliant (no gaps found)     : {0}" -f $summary.Compliant)
+Write-Host ("  Non-Compliant (gaps found)    : {0}" -f $summary.NonCompliant) -ForegroundColor $(if ($summary.NonCompliant) { 'Yellow' } else { 'Gray' })
+Write-Host ("  Manual Verification Required  : {0}" -f $summary.Manual) -ForegroundColor DarkYellow
+Write-Host ("  Unable to Check (some items)  : {0}" -f $summary.Unable) -ForegroundColor $(if ($summary.Unable) { 'Yellow' } else { 'Gray' })
+Write-Host ("  Skipped / Failed to process   : {0}" -f $summary.SkippedFailed) -ForegroundColor $(if ($summary.SkippedFailed) { 'Red' } else { 'Gray' })
+Write-Host "===================================================" -ForegroundColor Green
+Write-Host ""
+Write-Host "CSV       : $CsvPath"
+Write-Host "Dashboard : $HtmlPath"
+Write-Host "$(if ($xlsxOk) { 'Workbook ' } else { 'Matrix   ' }) : $XlsxPath"
+Write-Host "Log       : $LogPath"
+Write-Log "OS Acceptance run complete."
