@@ -1947,14 +1947,20 @@ try {
                 $cd = $cellData["$vm||$key"]
                 if ($cd) {
                     $cell = $ws.Cells.Item($rowIdx, $c)
-                    $cell.Value2 = $cd.Status
+                    # Compliant/Non-Compliant: color + the pass/fail word is enough at a glance.
+                    # Manual Verification Required/Unable to Check: the whole point is that a human
+                    # has to read the actual value to make the call, so put it in the cell itself
+                    # instead of behind a hover comment.
+                    $cell.Value2 = if ($cd.Status -in 'Manual Verification Required', 'Unable to Check') {
+                        if ($cd.Detected) { $cd.Detected } else { $cd.Status }
+                    } else { $cd.Status }
                     $cell.Interior.Color = switch ($cd.Status) {
                         'Compliant' { $ColorGood }
                         'Non-Compliant' { $ColorBad }
                         'Manual Verification Required' { $ColorWarn }
                         default { $ColorMute }
                     }
-                    $note = "Detected: $($cd.Detected)`nExpected: $($cd.Expected)"
+                    $note = "Status: $($cd.Status)`nDetected: $($cd.Detected)`nExpected: $($cd.Expected)"
                     if ($cd.Reason) { $note += "`nReason: $($cd.Reason)" }
                     [void]$cell.AddComment($note)
                     $cell.Comment.Shape.TextFrame.AutoSize = $true
@@ -2000,7 +2006,10 @@ try {
             $obj = [ordered]@{ 'VM Name' = $vm; vCenter = $meta.vCenter; 'Guest Hostname' = $meta.Host; 'IP Address' = $meta.IP; OS = $meta.OS }
             foreach ($key in $itemColumns) {
                 $cd = $cellData["$vm||$key"]
-                $obj["$($itemColumnCat[$key]) - $($itemColumnLabel[$key])"] = if ($cd) { $cd.Status } else { '' }
+                $obj["$($itemColumnCat[$key]) - $($itemColumnLabel[$key])"] =
+                    if (-not $cd) { '' }
+                    elseif ($cd.Status -in 'Manual Verification Required', 'Unable to Check') { if ($cd.Detected) { "$($cd.Status): $($cd.Detected)" } else { $cd.Status } }
+                    else { $cd.Status }
             }
             [PSCustomObject]$obj
         }
