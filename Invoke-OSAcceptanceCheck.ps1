@@ -936,13 +936,21 @@ function Resolve-AndValidateVM {
 # depends on Invoke-VMScript, which itself depends on Tools being installed
 # and running, so this is recorded for every VM that could be uniquely
 # resolved, even when the VM is later skipped for being off or Tools-less.
+function Split-CamelWords {
+    # 'toolsOk' -> 'tools Ok', 'guestToolsNotRunning' -> 'guest Tools Not Running' - readability only,
+    # never applied to the raw enum values used for comparisons.
+    param([string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return $Text }
+    return ($Text -creplace '([a-z])([A-Z])', '$1 $2')
+}
+
 function Get-ToolsStatusFields {
     param($VM)
     $g = $VM.ExtensionData.Guest
     $toolsStatus  = [string]$g.ToolsStatus
     $toolsRunning = [string]$g.ToolsRunningStatus
     $toolsVersion = [string]$VM.Guest.ToolsVersion
-    $detected = "ToolsStatus=$toolsStatus ToolsRunningStatus=$toolsRunning ToolsVersion=$toolsVersion"
+    $detected = "ToolsStatus= $(Split-CamelWords $toolsStatus) ToolsRunningStatus= $(Split-CamelWords $toolsRunning) ToolsVersion= $toolsVersion"
     $status =
         if ($toolsStatus -eq 'toolsOk' -and $toolsRunning -eq 'guestToolsRunning') { 'Compliant' }
         elseif ($toolsStatus -eq 'toolsOld' -and $toolsRunning -eq 'guestToolsRunning') { 'Manual Verification Required' }
@@ -1134,7 +1142,7 @@ foreach ($vmName in $vmNames) {
             $toolsFields = Get-ToolsStatusFields -VM $val.VM
             $centralRows.Add((New-CentralRow -vCenter $val.ServerName -VMName $vmName -GuestHostname $val.VM.Guest.HostName -IPAddress ($val.VM.Guest.IPAddress -join ',') -OS $val.VM.Guest.OSFullName `
                 -Category '1. Windows OS Health' -Item 'VMware Tools status' -DetectedValue $toolsFields.Detected `
-                -ExpectedValue 'ToolsStatus=toolsOk, ToolsRunningStatus=guestToolsRunning' -Status $toolsFields.Status -Reason $toolsFields.Reason))
+                -ExpectedValue 'ToolsStatus= tools Ok, ToolsRunningStatus= guest Tools Running' -Status $toolsFields.Status -Reason $toolsFields.Reason))
         }
 
         if (-not $val.Ok) {
@@ -1277,13 +1285,13 @@ if ($fleetData.Count -ge 2) {
 }
 
 # =====================================================================================
+# =====================================================================================
 # 6. HTML dashboard template
 # =====================================================================================
 # Single-quoted here-string (no PS variable expansion) - {{TOKENS}} are swapped for real
-# JSON further down. This is the exact page design already reviewed, re-pointed from the
-# hardcoded sample data at hardcoded checklist order/VMs to the real $centralRows: category
-# and item order is reconstructed from first-seen order in ROWS (which is already emitted
-# in checklist order per VM), so no separate canonical-order list needs to be kept in sync.
+# JSON further down. Category and item order is reconstructed from first-seen order in
+# ROWS (already emitted in checklist order per VM), so there is no separate canonical
+# order list to keep in sync here either.
 $DashboardTemplate = @'
 <!doctype html>
 <html lang="en">
@@ -1785,12 +1793,6 @@ renderMain();
 </html>
 '@
 
-# =====================================================================================
-# 7. Central report + console summary
-# =====================================================================================
-$centralRows | Export-Csv -LiteralPath $CsvPath -NoTypeInformation -Encoding UTF8
-Write-Log "CSV written: $CsvPath ($($centralRows.Count) rows)."
-
 $HtmlPath = Join-Path $OutputPath "OSAcceptance_$RunStamp.html"
 $rowsForJson = @($centralRows | ForEach-Object {
     [ordered]@{
@@ -1821,18 +1823,20 @@ $htmlOut = $DashboardTemplate.Replace('{{ROWS_JSON}}', $rowsJson).Replace('{{RUN
 Set-Content -LiteralPath $HtmlPath -Value $htmlOut -Encoding UTF8
 Write-Log "HTML dashboard written: $HtmlPath"
 
-Write-Host ""
-Write-Host "============= OS ACCEPTANCE SUMMARY =============" -ForegroundColor Green
-Write-Host ("  Total VMs                     : {0}" -f $summary.Total)
-Write-Host ("  Successfully Checked          : {0}" -f $summary.Checked)
-Write-Host ("  Compliant (no gaps found)     : {0}" -f $summary.Compliant)
-Write-Host ("  Non-Compliant (gaps found)    : {0}" -f $summary.NonCompliant) -ForegroundColor $(if ($summary.NonCompliant) { 'Yellow' } else { 'Gray' })
-Write-Host ("  Manual Verification Required  : {0}" -f $summary.Manual) -ForegroundColor DarkYellow
-Write-Host ("  Unable to Check (some items)  : {0}" -f $summary.Unable) -ForegroundColor $(if ($summary.Unable) { 'Yellow' } else { 'Gray' })
-Write-Host ("  Skipped / Failed to process   : {0}" -f $summary.SkippedFailed) -ForegroundColor $(if ($summary.SkippedFailed) { 'Red' } else { 'Gray' })
-Write-Host "===================================================" -ForegroundColor Green
-Write-Host ""
-Write-Host "CSV       : $CsvPath"
-Write-Host "Dashboard : $HtmlPath"
-Write-Host "Log       : $LogPath"
-Write-Log "OS Acceptance run complete."
+# 7. Compliance matrix workbook (VM rows x checklist-item columns)
+# =====================================================================================
+# One row per VM, one column per Category/Item the fleet actually produced results for -
+# column order is first-seen order in $centralRows (already emitted in checklist order per
+# VM), so there is no separate canonical column list to keep in sync. Cell = Status, color
+# coded; the Detected/Expected/Reason detail that would otherwise need ~3x the columns is
+# attached as a cell comment instead, so the sheet stays scannable at compliance-matrix width.
+function New-ExcelColor {
+    # Excel COM Interior.Color is an OLE_COLOR (0x00BBGGRR) - NOT plain RGB packing.
+    param([int]$R, [int]$G, [int]$B)
+    return ($B * 65536) + ($G * 256) + $R
+}
+$ColorGood = New-ExcelColor 198 239 206   # Excel's built-in "Good" green
+$ColorBad  = New-ExcelColor 255 199 206   # Excel's built-in "Bad" red
+$ColorWarn = New-ExcelColor 255 235 156   # Excel's built-in "Neutral" amber
+$ColorMute = New-ExcelColor 217 217 217   # grey - Unable to Check / Not Applicable
+$ColorHead = New-ExcelColor 232 236 236  
