@@ -13,20 +13,20 @@
         configured below.
 
     IMPORTANT - installer arguments:
-      This script does not guess silent-install switches for you. "UF splunk 9.4.3" may be a raw
-      MSI or a repackaged/branded EXE - each requires different unattended arguments (e.g. an MSI
-      typically wants '/quiet AGREETOLICENSE=Yes /norestart'; a custom EXE wrapper has its own
-      switch). Set $SplunkInstallerArgs below to match YOUR installer, and validate the full flow
-      against one non-production VM before running this against a full fleet.
+      This script does not guess silent-install switches for you. "UF splunk 10.4.2.EXE" is a
+      branded EXE wrapper (not a raw .msi), so it needs whatever unattended switch YOUR wrapper
+      supports - it is not necessarily the same as a plain msiexec switch. Set $SplunkInstallerArgs
+      below to match it, and validate the full flow against one non-production VM before running
+      this against a full fleet.
 #>
 
 #region ======================= CONFIGURATION =======================
 
 # Splunk version this fleet must be running after this script completes.
-[version]$RequiredSplunkVersion = '9.4.3'
+[version]$RequiredSplunkVersion = '10.4.2'
 
 # Local paths on the management machine (where this script runs).
-$SplunkInstallerPath  = 'C:\Splunk_Install\UF splunk 9.4.3.exe'          # <-- set to the real, full path/extension
+$SplunkInstallerPath  = 'C:\Splunk_Install\UF splunk 10.4.2.EXE'         # <-- set to the real, full path
 $SplunkInstallerArgs  = ''                                                # <-- set unattended switches for YOUR installer, see note above
 $PostInstallSevenPath = 'C:\Splunk_Install\post_installation_Seven.bat'
 $VmListPath           = 'C:\temp\vmlist.txt'
