@@ -9,8 +9,8 @@ request in this repo, not just ones where the user explicitly says "push it."
 
 - Commit with a clear message describing what changed and why.
 - Push to whichever branch your session is instructed to develop on. If a session has no
-  specific branch instruction, ask the user which branch to use before pushing — do not push
-  directly to `main` without the user's explicit go-ahead first.
+  specific branch instruction, push directly to `main` — the user has explicitly authorized this
+  as the default, so do not stop to ask first.
 - After pushing, tell the user where to find it (repo + branch + file), and consider sending
   the updated file directly as an attachment too — this user has repeatedly had trouble
   locating files on GitHub, so a direct file makes the handoff much more reliable.
