@@ -156,44 +156,6 @@ if ($connectedServers.Count -eq 0) {
 }
 Write-Host ("Connected vCenter(s): {0}" -f (($connectedServers | ForEach-Object { $_.Name }) -join ', ')) -ForegroundColor Gray
 
-# Invoke-VMScript fetches script output via DownloadFileFromGuest, which goes straight to the
-# ESXi host by its registered name - not through vCenter. If this workstation can't resolve
-# that name, every single VM on that host fails identically with a generic "An error occurred
-# while sending the request." Check that up front instead of discovering it VM-by-VM.
-$unresolvedHosts = New-Object System.Collections.Generic.List[pscustomobject]
-foreach ($srv in $connectedServers) {
-    foreach ($esxHost in (Get-VMHost -Server $srv -ErrorAction SilentlyContinue)) {
-        try { [void][System.Net.Dns]::GetHostAddresses($esxHost.Name) }
-        catch {
-            $mgmtIp = ($esxHost | Get-VMHostNetworkAdapter -VMKernel -ErrorAction SilentlyContinue |
-                       Where-Object ManagementTrafficEnabled | Select-Object -First 1 -ExpandProperty IP)
-            $unresolvedHosts.Add([pscustomobject]@{ Name = $esxHost.Name; IP = $mgmtIp }) | Out-Null
-        }
-    }
-}
-if ($unresolvedHosts.Count -gt 0) {
-    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    $hostsFile = "$env:WINDIR\System32\drivers\etc\hosts"
-    Write-Host ""
-    Write-Host "WARNING: $($unresolvedHosts.Count) ESXi host(s) do not resolve via DNS from this machine - every VM on them will fail at the guest-ops probe stage:" -ForegroundColor Yellow
-    $unresolvedHosts | ForEach-Object { Write-Host ("  {0,-16} {1}" -f $_.IP, $_.Name) -ForegroundColor Yellow }
-    if ($isAdmin) {
-        $existing = Get-Content -LiteralPath $hostsFile -ErrorAction SilentlyContinue
-        $added = 0
-        foreach ($h in $unresolvedHosts) {
-            if ($h.IP -and -not ($existing -match [regex]::Escape($h.Name))) {
-                Add-Content -LiteralPath $hostsFile -Value ("{0}`t{1}" -f $h.IP, $h.Name)
-                $added++
-            }
-        }
-        Write-Host "Added $added entr$(if ($added -eq 1) {'y'} else {'ies'}) to $hostsFile - re-run this script now." -ForegroundColor Green
-        exit 1
-    } else {
-        Write-Host "Re-run this PowerShell session as Administrator so it can add these to $hostsFile automatically, or add them yourself, then re-run." -ForegroundColor Yellow
-        exit 1
-    }
-}
-
 if (-not (Test-Path -LiteralPath $VMListPath)) { throw "VM list not found: $VMListPath" }
 $vmNames = @(Get-Content -LiteralPath $VMListPath |
              ForEach-Object { $_.Trim() } |
@@ -223,6 +185,44 @@ function Write-Log {
     Add-Content -LiteralPath $LogPath -Value $line
 }
 Write-Log "OS Acceptance run started. VMs=$($vmNames.Count)."
+
+# Invoke-VMScript fetches script output via DownloadFileFromGuest, which goes straight to the
+# ESXi host by its registered name - not through vCenter. If this workstation can't resolve
+# that name, every single VM on that host fails identically with a generic "An error occurred
+# while sending the request." Check that up front instead of discovering it VM-by-VM. Only
+# checks hosts Get-VMHost actually returns for the connected vCenter(s) - a host outside that
+# scope (disconnected, filtered by permissions) won't be caught here.
+$unresolvedHosts = New-Object System.Collections.Generic.List[pscustomobject]
+foreach ($srv in $connectedServers) {
+    foreach ($esxHost in (Get-VMHost -Server $srv -ErrorAction SilentlyContinue)) {
+        try { [void][System.Net.Dns]::GetHostAddresses($esxHost.Name) }
+        catch {
+            $mgmtIp = ($esxHost | Get-VMHostNetworkAdapter -VMKernel -ErrorAction SilentlyContinue |
+                       Where-Object ManagementTrafficEnabled | Select-Object -First 1 -ExpandProperty IP)
+            $unresolvedHosts.Add([pscustomobject]@{ Name = $esxHost.Name; IP = $mgmtIp }) | Out-Null
+        }
+    }
+}
+if ($unresolvedHosts.Count -gt 0) {
+    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    $hostsFile = "$env:WINDIR\System32\drivers\etc\hosts"
+    Write-Log "$($unresolvedHosts.Count) ESXi host(s) do not resolve via DNS from this machine - every VM on them would fail at the guest-ops probe stage:" 'WARN'
+    $unresolvedHosts | ForEach-Object { Write-Log ("  {0,-16} {1}" -f $_.IP, $_.Name) 'WARN' }
+    if ($isAdmin) {
+        $existing = Get-Content -LiteralPath $hostsFile -ErrorAction SilentlyContinue
+        $added = 0
+        foreach ($h in $unresolvedHosts) {
+            if ($h.IP -and -not ($existing -match [regex]::Escape($h.Name))) {
+                Add-Content -LiteralPath $hostsFile -Value ("{0}`t{1}`t# Added by Invoke-OSAcceptanceCheck.ps1 - DNS fallback, {2}" -f $h.IP, $h.Name, (Get-Date -Format 'yyyy-MM-dd'))
+                $added++
+            }
+        }
+        Write-Log "Added $added entr$(if ($added -eq 1) {'y'} else {'ies'}) to $hostsFile - re-run this script now." 'WARN'
+        throw "Added missing ESXi host DNS fallback entries to $hostsFile - re-run this script to pick them up."
+    } else {
+        throw "Re-run this PowerShell session as Administrator so it can add the missing entries to $hostsFile automatically, or add them yourself (see the WARN lines above), then re-run."
+    }
+}
 
 function ConvertTo-PSArrayLiteral {
     param([string[]]$Items)
