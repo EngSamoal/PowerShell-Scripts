@@ -24,7 +24,7 @@
 # Bump this on every change and check it against the version quoted in chat before trusting a
 # run's results - prints as the very first line of output so a stale cached copy is always
 # immediately obvious, instead of silently re-running old logic.
-$ScriptBuild = '2026.09.20-12'
+$ScriptBuild = '2026.09.20-13'
 
 # Splunk version this fleet must be running after this script completes.
 [version]$RequiredSplunkVersion = '10.4.2'
@@ -344,6 +344,16 @@ try {
 }
 '@
 
+# Live testing found the real cause of the persistent Copy-VMGuestFile 500s: the destination file
+# from an earlier successful copy was locked by something on the guest (most likely antivirus
+# on-access scanning of a newly-arrived large unknown .EXE), so deleting/overwriting it failed.
+# Checking remote file size first lets the script skip re-copying a file that is already staged
+# correctly, instead of fighting a lock that may not even be a real problem.
+$Template_GetRemoteFileSize = @'
+$path = '__PATH__'
+if (Test-Path -LiteralPath $path) { (Get-Item -LiteralPath $path).Length } else { -1 }
+'@
+
 #endregion ============================================================
 
 
@@ -458,6 +468,46 @@ function Copy-VMGuestFileWithRetry {
     throw $lastError
 }
 
+# Checks whether the destination already has a file of the same size as the source and, if so,
+# skips copying entirely. This avoids ever needing to delete/overwrite a file that a prior
+# successful copy left behind and that something on the guest (antivirus on-access scanning a
+# newly-arrived large unknown .EXE, confirmed via live testing showing an Access Denied trying to
+# delete it) may be holding a lock on. Only attempts cleanup + copy when sizes genuinely differ
+# (missing, partial, or a different file).
+function Ensure-VMGuestFileStaged {
+    param(
+        [Parameter(Mandatory)] [string] $Source,
+        [Parameter(Mandatory)] [string] $Destination,
+        [Parameter(Mandatory)] $VM,
+        [Parameter(Mandatory)] [System.Management.Automation.PSCredential] $GuestCredential
+    )
+
+    $localSize = (Get-Item -LiteralPath $Source).Length
+
+    $sizeScript = $Template_GetRemoteFileSize.Replace('__PATH__', $Destination)
+    $sizeCheck = Invoke-GuestScriptWithTimeout -VM $VM -GuestCredential $GuestCredential -ScriptType Powershell `
+        -ScriptText $sizeScript -TimeoutSeconds $QuickGuestOpTimeoutSec
+
+    $remoteSize = -1
+    if ($sizeCheck.Success -and $sizeCheck.ScriptOutput -match '(-?\d+)') {
+        $remoteSize = [int64]$Matches[1]
+    }
+
+    if ($remoteSize -eq $localSize) {
+        return  # already staged correctly on the guest - nothing to do
+    }
+
+    if ($remoteSize -ge 0) {
+        # A different/partial file exists - try to clear it, but don't treat failure here as
+        # fatal on its own; the copy attempt below is the real test of whether this can proceed.
+        $cleanupScript = $Template_MkdirAndCleanup.Replace('__PATH__', $Destination).Replace('__MODE__', 'remove')
+        Invoke-GuestScriptWithTimeout -VM $VM -GuestCredential $GuestCredential -ScriptType Powershell `
+            -ScriptText $cleanupScript -TimeoutSeconds $QuickGuestOpTimeoutSec | Out-Null
+    }
+
+    Copy-VMGuestFileWithRetry -Source $Source -Destination $Destination -VM $VM -GuestCredential $GuestCredential
+}
+
 # Copies the installer + post_installation_Seven.bat to the guest, runs both as the guest
 # credential (which must be a local admin - checked earlier), waits for each to finish (bounded
 # by timeout), then cleans up the copied files. Does not itself decide compliant/upgrade/install -
@@ -490,20 +540,12 @@ function Invoke-SplunkInstallProcedure {
         return $out
     }
 
-    # 2. Remove any stale destination files left over from a previous failed attempt first - live
-    # testing showed Copy-VMGuestFile consistently 500s when a prior partial file already sits at
-    # the destination, and -Force alone does not reliably clear that state. Non-fatal if this
-    # fails since the files may simply not exist yet on a first-ever run.
-    foreach ($stalePath in @($remoteInstaller, $remotePostBat)) {
-        $cleanupScript = $Template_MkdirAndCleanup.Replace('__PATH__', $stalePath).Replace('__MODE__', 'remove')
-        Invoke-GuestScriptWithTimeout -VM $VM -GuestCredential $GuestCredential -ScriptType Powershell `
-            -ScriptText $cleanupScript -TimeoutSeconds $QuickGuestOpTimeoutSec | Out-Null
-    }
-
-    # 3. Copy installer + post-install bat into the guest (VMware Tools guest-file API only).
+    # 2/3. Stage installer + post-install bat on the guest (VMware Tools guest-file API only) -
+    # skips re-copying a file that's already correctly staged from a prior run (see
+    # Ensure-VMGuestFileStaged for why that matters).
     try {
-        Copy-VMGuestFileWithRetry -Source $SplunkInstallerPath -Destination $remoteInstaller -VM $VM -GuestCredential $GuestCredential
-        Copy-VMGuestFileWithRetry -Source $PostInstallSevenPath -Destination $remotePostBat -VM $VM -GuestCredential $GuestCredential
+        Ensure-VMGuestFileStaged -Source $SplunkInstallerPath -Destination $remoteInstaller -VM $VM -GuestCredential $GuestCredential
+        Ensure-VMGuestFileStaged -Source $PostInstallSevenPath -Destination $remotePostBat -VM $VM -GuestCredential $GuestCredential
     } catch {
         $out.FailureReason = "Failed to copy installation files to guest: $($_.Exception.Message)"
         return $out
