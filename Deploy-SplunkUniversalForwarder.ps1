@@ -13,11 +13,10 @@
         configured below.
 
     IMPORTANT - installer arguments:
-      This script does not guess silent-install switches for you. "UF splunk 10.4.2.EXE" is a
-      branded EXE wrapper (not a raw .msi), so it needs whatever unattended switch YOUR wrapper
-      supports - it is not necessarily the same as a plain msiexec switch. Set $SplunkInstallerArgs
-      below to match it, and validate the full flow against one non-production VM before running
-      this against a full fleet.
+      "UF splunk 10.4.2.EXE" is an IExpress self-extracting package (confirmed via its own /?
+      help text), so it takes IExpress's standard switches - notably /Q for quiet/unattended mode.
+      $SplunkInstallerArgs below is set to '/Q' accordingly. If a future installer build is NOT an
+      IExpress package, re-check its /? output before assuming /Q still applies.
 #>
 
 #region ======================= CONFIGURATION =======================
@@ -27,7 +26,7 @@
 
 # Local paths on the management machine (where this script runs).
 $SplunkInstallerPath  = 'C:\Splunk_Install\UF splunk 10.4.2.EXE'         # <-- set to the real, full path
-$SplunkInstallerArgs  = ''                                                # <-- set unattended switches for YOUR installer, see note above
+$SplunkInstallerArgs  = '/Q'                                              # IExpress quiet/unattended switch (confirmed via installer's /? output)
 $PostInstallSevenPath = 'C:\Splunk_Install\post_installation_Seven.bat'
 $VmListPath           = 'C:\temp\vmlist.txt'
 $GuestCredentialPath  = 'C:\temp\wincred.xml'
