@@ -132,7 +132,26 @@ function Invoke-GuestScriptWithTimeout {
         $task = Invoke-VMScript -VM $VM -GuestCredential $GuestCredential -ScriptType $ScriptType `
             -ScriptText $ScriptText -RunAsync -ErrorAction Stop
 
-        $completed = Wait-Task -Task $task -Timeout $TimeoutSeconds -ErrorAction Stop
+        # Wait-Task has no -Timeout parameter in this PowerCLI version, so bound the wait
+        # ourselves by polling Get-Task and only calling Wait-Task once the task is finished
+        # (at that point Wait-Task returns immediately and just extracts the .Result).
+        $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+        $polled = Get-Task -Id $task.Id -ErrorAction Stop
+        while ($polled.State -eq 'Running' -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 2
+            $polled = Get-Task -Id $task.Id -ErrorAction Stop
+        }
+
+        if ($polled.State -eq 'Running') {
+            try { Stop-Task -Task $polled -Confirm:$false -ErrorAction Stop | Out-Null } catch {}
+            return [PSCustomObject]@{
+                Success      = $false
+                ScriptOutput = $null
+                ErrorMessage = "Guest operation timed out after $TimeoutSeconds seconds"
+            }
+        }
+
+        $completed = Wait-Task -Task $polled -ErrorAction Stop
 
         [PSCustomObject]@{
             Success      = $true
