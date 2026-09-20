@@ -24,7 +24,7 @@
 # Bump this on every change and check it against the version quoted in chat before trusting a
 # run's results - prints as the very first line of output so a stale cached copy is always
 # immediately obvious, instead of silently re-running old logic.
-$ScriptBuild = '2026.09.20-10'
+$ScriptBuild = '2026.09.20-11'
 
 # Splunk version this fleet must be running after this script completes.
 [version]$RequiredSplunkVersion = '10.4.2'
@@ -428,6 +428,36 @@ function Get-VMReadinessAndSplunkStatus {
 
 #region ======================= INSTALL / UPGRADE PROCEDURE =======================
 
+# Live testing showed Copy-VMGuestFile intermittently fails with a transient HTTP 500 from the
+# ESXi/vCenter guest-file-transfer endpoint - confirmed transient by retrying the exact same call
+# immediately afterward and having it succeed. This wraps the copy with a few retries so the
+# script recovers on its own instead of requiring a manual re-run each time it happens.
+function Copy-VMGuestFileWithRetry {
+    param(
+        [Parameter(Mandatory)] [string] $Source,
+        [Parameter(Mandatory)] [string] $Destination,
+        [Parameter(Mandatory)] $VM,
+        [Parameter(Mandatory)] [System.Management.Automation.PSCredential] $GuestCredential,
+        [int] $MaxAttempts = 3,
+        [int] $RetryDelaySeconds = 10
+    )
+
+    $lastError = $null
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            Copy-VMGuestFile -Source $Source -Destination $Destination -LocalToGuest `
+                -VM $VM -GuestCredential $GuestCredential -Force -ErrorAction Stop
+            return
+        } catch {
+            $lastError = $_
+            if ($attempt -lt $MaxAttempts) {
+                Start-Sleep -Seconds $RetryDelaySeconds
+            }
+        }
+    }
+    throw $lastError
+}
+
 # Copies the installer + post_installation_Seven.bat to the guest, runs both as the guest
 # credential (which must be a local admin - checked earlier), waits for each to finish (bounded
 # by timeout), then cleans up the copied files. Does not itself decide compliant/upgrade/install -
@@ -462,10 +492,8 @@ function Invoke-SplunkInstallProcedure {
 
     # 2. Copy installer + post-install bat into the guest (VMware Tools guest-file API only).
     try {
-        Copy-VMGuestFile -Source $SplunkInstallerPath -Destination $remoteInstaller -LocalToGuest `
-            -VM $VM -GuestCredential $GuestCredential -Force -ErrorAction Stop
-        Copy-VMGuestFile -Source $PostInstallSevenPath -Destination $remotePostBat -LocalToGuest `
-            -VM $VM -GuestCredential $GuestCredential -Force -ErrorAction Stop
+        Copy-VMGuestFileWithRetry -Source $SplunkInstallerPath -Destination $remoteInstaller -VM $VM -GuestCredential $GuestCredential
+        Copy-VMGuestFileWithRetry -Source $PostInstallSevenPath -Destination $remotePostBat -VM $VM -GuestCredential $GuestCredential
     } catch {
         $out.FailureReason = "Failed to copy installation files to guest: $($_.Exception.Message)"
         return $out
