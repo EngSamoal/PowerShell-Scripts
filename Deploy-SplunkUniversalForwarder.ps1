@@ -24,7 +24,7 @@
 # Bump this on every change and check it against the version quoted in chat before trusting a
 # run's results - prints as the very first line of output so a stale cached copy is always
 # immediately obvious, instead of silently re-running old logic.
-$ScriptBuild = '2026.09.20-9'
+$ScriptBuild = '2026.09.20-10'
 
 # Splunk version this fleet must be running after this script completes.
 [version]$RequiredSplunkVersion = '10.4.2'
@@ -272,33 +272,43 @@ try {
 '@
 
 # NOTE: Invoke-VMScript's -ScriptType Bat flattens multi-line batch text onto one logical line
-# joined by '&' - confirmed via live testing, which returned the literal cmd.exe error
-# "& was unexpected at this time." A parenthesized "if not exist (...)" block breaks under that
-# flattening (the closing ')' immediately followed by '&' is a known cmd.exe parsing trap).
-# Rewritten below using goto/labels instead of parentheses to avoid it entirely.
+# joined by '&' - confirmed via live testing (literal cmd.exe error "& was unexpected at this
+# time."), and this breaks ANY multi-statement batch structure, not just parenthesized blocks -
+# a goto/label rewrite hit the identical error, since labels can't survive being '&'-joined onto
+# one line either. Abandoning -ScriptType Bat entirely for anything beyond a single command.
+# These are now Powershell scripts that launch the target executable via .NET's Start-Process,
+# which hands back a real exit code without ever touching cmd.exe's batch parser.
 $Template_RunInstaller = @'
-@echo off
-set "INSTALLER=__INSTALLER_PATH__"
-set "IARGS=__INSTALLER_ARGS__"
-if not exist "%INSTALLER%" goto :missing
-"%INSTALLER%" %IARGS%
-echo INSTALLER_EXITCODE=%ERRORLEVEL%
-goto :eof
-:missing
-echo INSTALLER_MISSING
-exit /b 9009
+$installer = '__INSTALLER_PATH__'
+$installerArgs = '__INSTALLER_ARGS__'
+if (-not (Test-Path -LiteralPath $installer)) {
+    'INSTALLER_MISSING'
+} else {
+    try {
+        if ([string]::IsNullOrWhiteSpace($installerArgs)) {
+            $proc = Start-Process -FilePath $installer -Wait -PassThru -ErrorAction Stop
+        } else {
+            $proc = Start-Process -FilePath $installer -ArgumentList $installerArgs -Wait -PassThru -ErrorAction Stop
+        }
+        "INSTALLER_EXITCODE=$($proc.ExitCode)"
+    } catch {
+        "INSTALLER_LAUNCH_ERROR: $($_.Exception.Message)"
+    }
+}
 '@
 
 $Template_RunPostInstall = @'
-@echo off
-set "POSTBAT=__POSTBAT_PATH__"
-if not exist "%POSTBAT%" goto :missing
-"%POSTBAT%"
-echo POSTBAT_EXITCODE=%ERRORLEVEL%
-goto :eof
-:missing
-echo POSTBAT_MISSING
-exit /b 9009
+$postBat = '__POSTBAT_PATH__'
+if (-not (Test-Path -LiteralPath $postBat)) {
+    'POSTBAT_MISSING'
+} else {
+    try {
+        $proc = Start-Process -FilePath $postBat -Wait -PassThru -ErrorAction Stop
+        "POSTBAT_EXITCODE=$($proc.ExitCode)"
+    } catch {
+        "POSTBAT_LAUNCH_ERROR: $($_.Exception.Message)"
+    }
+}
 '@
 
 $Template_EnsureAutoStart = @'
@@ -463,7 +473,7 @@ function Invoke-SplunkInstallProcedure {
 
     # 3. Run the installer (as the guest admin credential) and wait for it to finish.
     $installScript = $Template_RunInstaller.Replace('__INSTALLER_PATH__', $remoteInstaller).Replace('__INSTALLER_ARGS__', $SplunkInstallerArgs)
-    $installResult = Invoke-GuestScriptWithTimeout -VM $VM -GuestCredential $GuestCredential -ScriptType Bat `
+    $installResult = Invoke-GuestScriptWithTimeout -VM $VM -GuestCredential $GuestCredential -ScriptType Powershell `
         -ScriptText $installScript -TimeoutSeconds $InstallerTimeoutSec
 
     if (-not $installResult.Success) {
@@ -472,6 +482,10 @@ function Invoke-SplunkInstallProcedure {
     }
     if ($installResult.ScriptOutput -match 'INSTALLER_MISSING') {
         $out.FailureReason = "Installer file was not found on the guest at $remoteInstaller after copy."
+        return $out
+    }
+    if ($installResult.ScriptOutput -match 'INSTALLER_LAUNCH_ERROR: (.+)') {
+        $out.FailureReason = "Installer failed to launch: $($Matches[1])"
         return $out
     }
     if ($installResult.ScriptOutput -match 'INSTALLER_EXITCODE=(-?\d+)') {
@@ -488,7 +502,7 @@ function Invoke-SplunkInstallProcedure {
 
     # 4. Run post_installation_Seven.bat (SEVEN configuration only) and wait for it to finish.
     $postScript = $Template_RunPostInstall.Replace('__POSTBAT_PATH__', $remotePostBat)
-    $postResult = Invoke-GuestScriptWithTimeout -VM $VM -GuestCredential $GuestCredential -ScriptType Bat `
+    $postResult = Invoke-GuestScriptWithTimeout -VM $VM -GuestCredential $GuestCredential -ScriptType Powershell `
         -ScriptText $postScript -TimeoutSeconds $PostInstallTimeoutSec
 
     if (-not $postResult.Success) {
@@ -497,6 +511,10 @@ function Invoke-SplunkInstallProcedure {
     }
     if ($postResult.ScriptOutput -match 'POSTBAT_MISSING') {
         $out.FailureReason = "post_installation_Seven.bat was not found on the guest at $remotePostBat after copy."
+        return $out
+    }
+    if ($postResult.ScriptOutput -match 'POSTBAT_LAUNCH_ERROR: (.+)') {
+        $out.FailureReason = "post_installation_Seven.bat failed to launch: $($Matches[1])"
         return $out
     }
     if ($postResult.ScriptOutput -match 'POSTBAT_EXITCODE=(-?\d+)') {
