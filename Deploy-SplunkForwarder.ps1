@@ -24,7 +24,7 @@
 # Bump this on every change and check it against the version quoted in chat before trusting a
 # run's results - prints as the very first line of output so a stale cached copy is always
 # immediately obvious, instead of silently re-running old logic.
-$ScriptBuild = '2026.09.20-6'
+$ScriptBuild = '2026.09.20-7'
 
 # Splunk version this fleet must be running after this script completes.
 [version]$RequiredSplunkVersion = '10.4.2'
@@ -207,24 +207,16 @@ try {
         $checks.IsInRoleAdministrator = "ERROR: $($_.Exception.Message)"
     }
 
-    try {
-        $localAdmins = @(Get-LocalGroupMember -Group 'Administrators' -ErrorAction Stop)
-        $shortName = $id.Name -replace '^.*\\', ''
-        $checks.LocalGroupMemberMatch = [bool]($localAdmins | Where-Object {
-            ($_.Name -replace '^.*\\', '') -eq $shortName
-        })
-    } catch {
-        $checks.LocalGroupMemberMatch = "ERROR: $($_.Exception.Message)"
-    }
+    # Get-LocalGroupMember (Microsoft.PowerShell.LocalAccounts module) was tried here and removed -
+    # it is not guaranteed present/fast on every Windows build and is the likely cause of the
+    # previous run coming back completely empty (script probably never reached its final output).
+    # Sticking to the two lightweight, dependency-free .NET checks above.
 
     $result.IsAdminMethod = ($checks.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join '; '
 
-    # Treat as admin if ANY method affirmatively says so (defensive OR, since we do not yet know
-    # which method is reliable in this environment).
     $result.IsAdmin = [bool](
         ($checks.GroupsSidMatch -eq $true) -or
-        ($checks.IsInRoleAdministrator -eq $true) -or
-        ($checks.LocalGroupMemberMatch -eq $true)
+        ($checks.IsInRoleAdministrator -eq $true)
     )
 } catch {
     $result.IsAdminError = $_.Exception.Message
@@ -370,14 +362,27 @@ function Get-VMReadinessAndSplunkStatus {
         -ScriptText $script -TimeoutSeconds $QuickGuestOpTimeoutSec
 
     if (-not $r.Success) {
-        return [PSCustomObject]@{ Success = $false; ErrorMessage = $r.ErrorMessage; Status = $null }
+        return [PSCustomObject]@{ Success = $false; ErrorMessage = $r.ErrorMessage; Status = $null; RawOutput = $r.ScriptOutput }
+    }
+
+    # An empty/blank response means the guest script never reached its final output line (crashed,
+    # got killed, or hung partway through) - ConvertFrom-Json on an empty string returns $null
+    # WITHOUT throwing, which would otherwise silently masquerade as a "successful" empty result.
+    # Treat blank output as an explicit failure instead.
+    if ([string]::IsNullOrWhiteSpace($r.ScriptOutput)) {
+        return [PSCustomObject]@{
+            Success      = $false
+            ErrorMessage = 'Guest script produced no output at all (it may have crashed or hung before finishing - check for a non-terminating step that never returns).'
+            Status       = $null
+            RawOutput    = $r.ScriptOutput
+        }
     }
 
     try {
         $status = $r.ScriptOutput | ConvertFrom-Json -ErrorAction Stop
-        [PSCustomObject]@{ Success = $true; ErrorMessage = $null; Status = $status }
+        [PSCustomObject]@{ Success = $true; ErrorMessage = $null; Status = $status; RawOutput = $r.ScriptOutput }
     } catch {
-        [PSCustomObject]@{ Success = $false; ErrorMessage = "Could not parse guest status output: $($_.Exception.Message)"; Status = $null }
+        [PSCustomObject]@{ Success = $false; ErrorMessage = "Could not parse guest status output: $($_.Exception.Message)"; Status = $null; RawOutput = $r.ScriptOutput }
     }
 }
 
@@ -572,6 +577,7 @@ foreach ($vmName in $vmNames) {
         $detect = Get-VMReadinessAndSplunkStatus -VM $vm -GuestCredential $guestCred
         if (-not $detect.Success) {
             $row.GuestCredentialStatus = 'Invalid'
+            Write-Host "  [diag] Raw guest output: '$($detect.RawOutput)'" -ForegroundColor DarkGray
             throw "Guest credential validation / detection failed: $($detect.ErrorMessage)"
         }
         $status = $detect.Status
