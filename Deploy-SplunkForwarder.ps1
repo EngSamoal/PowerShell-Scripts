@@ -128,34 +128,21 @@ function Invoke-GuestScriptWithTimeout {
         [int] $TimeoutSeconds = 300
     )
 
+    # NOTE: earlier revisions of this function tried to enforce a hard client-side timeout using
+    # Invoke-VMScript -RunAsync plus Get-Task/Wait-Task. That guest-ops task object did not behave
+    # like a normal vCenter task in this environment's PowerCLI version (Get-Task -Id threw "Index
+    # was outside the bounds of the array"), so that approach is abandoned rather than patched a
+    # third time on unverified internals. This now calls Invoke-VMScript synchronously - the same
+    # proven pattern already used elsewhere in this repo (RunRemediationAcrossVMs-PowerCli.ps1).
+    # $TimeoutSeconds is kept for future use but is not currently enforced; a stuck guest process
+    # will block on this call until Invoke-VMScript/vCenter's own internal behavior resolves it.
     try {
-        $task = Invoke-VMScript -VM $VM -GuestCredential $GuestCredential -ScriptType $ScriptType `
-            -ScriptText $ScriptText -RunAsync -ErrorAction Stop
-
-        # Wait-Task has no -Timeout parameter in this PowerCLI version, so bound the wait
-        # ourselves by polling Get-Task and only calling Wait-Task once the task is finished
-        # (at that point Wait-Task returns immediately and just extracts the .Result).
-        $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-        $polled = Get-Task -Id $task.Id -ErrorAction Stop
-        while ($polled.State -eq 'Running' -and (Get-Date) -lt $deadline) {
-            Start-Sleep -Seconds 2
-            $polled = Get-Task -Id $task.Id -ErrorAction Stop
-        }
-
-        if ($polled.State -eq 'Running') {
-            try { Stop-Task -Task $polled -Confirm:$false -ErrorAction Stop | Out-Null } catch {}
-            return [PSCustomObject]@{
-                Success      = $false
-                ScriptOutput = $null
-                ErrorMessage = "Guest operation timed out after $TimeoutSeconds seconds"
-            }
-        }
-
-        $completed = Wait-Task -Task $polled -ErrorAction Stop
+        $result = Invoke-VMScript -VM $VM -GuestCredential $GuestCredential -ScriptType $ScriptType `
+            -ScriptText $ScriptText -ErrorAction Stop
 
         [PSCustomObject]@{
             Success      = $true
-            ScriptOutput = $completed.Result.ScriptOutput
+            ScriptOutput = $result.ScriptOutput
             ErrorMessage = $null
         }
     } catch {
