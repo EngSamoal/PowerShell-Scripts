@@ -1,334 +1,652 @@
-#Requires -Version 5.1
 <#
-.SYNOPSIS
-    Deploys the Splunk Universal Forwarder to a list of Windows VMs via VMware Tools
-    (Invoke-VMScript), without WinRM.
+    Deploy-SplunkUniversalForwarder.ps1
 
-.DESCRIPTION
-    Run from a laptop that already has an active PowerCLI session
-    (Connect-VIServer done beforehand). -InputFile is a plain TXT file with one VM
-    name per line (blank lines and lines starting with # are ignored). For each VM:
+    Installs or upgrades the Splunk Universal Forwarder (SEVEN configuration only) across a list
+    of Windows VMs in vCenter, using PowerCLI Guest Operations (VMware Tools) exclusively.
+    WinRM is never used - all guest-side work goes through Copy-VMGuestFile and Invoke-VMScript.
 
-      1. Validates: VM exists in vCenter, VM is powered on, VMware Tools is
-         running, guest credentials work, and Splunk UF is not already installed.
-      2. Copies the local Splunk UF installer into the guest with Copy-VMGuestFile.
-      3. Runs the installer silently (msiexec /quiet) via Invoke-VMScript.
-      4. Verifies install: SplunkForwarder service exists/running, installed version.
-      5. Does NOT reboot the VM - Splunk UF's MSI does not require a reboot.
+    Prerequisites:
+      - Already connected to the target vCenter via Connect-VIServer before running this script.
+      - VMware Tools running in every target guest, with a local-administrator guest account
+        credential exported to $GuestCredentialPath via Export-Clixml.
+      - The Splunk UF installer and post_installation_Seven.bat present locally at the paths
+        configured below.
 
-    Any validation or step failure skips that VM only; the run always continues to
-    the next VM. Nothing here configures a deployment server, indexer, outputs.conf,
-    or forwarding - that is intentionally left to you (see $InstallArguments below).
-
-    Guest credentials are read from a saved credential XML file (created once with
-    Get-Credential | Export-Clixml), never typed or hard-coded into this script.
-    Because Export-Clixml encrypts the password with Windows DPAPI, that file can
-    only be decrypted by the same Windows user account on the same machine that
-    created it - copying it to another PC or user profile will not work.
-
-.NOTES
-    Author:  (fill in)
-    Requires: VMware PowerCLI module, an already-connected vCenter session,
-              VMware Tools running in every target guest.
-
-.EXAMPLE
-    Connect-VIServer vcenter.corp.local
-    # One-time setup, on this laptop, under your own Windows account:
-    Get-Credential | Export-Clixml -Path .\GuestCredential.xml
-    .\Deploy-SplunkForwarder.ps1 -InputFile .\vmlist.txt -InstallerPath 'C:\Installers\splunkforwarder-9.2.1-x64-release.msi' -GuestCredentialFile .\GuestCredential.xml
+    IMPORTANT - installer arguments:
+      "UF splunk 10.4.2.EXE" is an IExpress self-extracting package (confirmed via its own /?
+      help text), so it takes IExpress's standard switches - notably /Q for quiet/unattended mode.
+      $SplunkInstallerArgs below is set to '/Q' accordingly. If a future installer build is NOT an
+      IExpress package, re-check its /? output before assuming /Q still applies.
 #>
 
-[CmdletBinding()]
-param(
-    # ===== REQUIRED - CHANGE THESE FOR YOUR RUN =====================================
+#region ======================= CONFIGURATION =======================
 
-    # Plain TXT file, one VM name per line (blank lines / lines starting with # ignored).
-    [Parameter(Mandatory)]
-    [string]$InputFile,
+# Splunk version this fleet must be running after this script completes.
+[version]$RequiredSplunkVersion = '10.4.2'
 
-    # Full local path to the Splunk Universal Forwarder installer (.msi) you already downloaded.
-    [Parameter(Mandatory)]
-    [string]$InstallerPath,
+# Local paths on the management machine (where this script runs).
+$SplunkInstallerPath  = 'C:\Splunk_Install\UF splunk 10.4.2.EXE'         # <-- set to the real, full path
+$SplunkInstallerArgs  = '/Q'                                              # IExpress quiet/unattended switch (confirmed via installer's /? output)
+$PostInstallSevenPath = 'C:\Splunk_Install\post_installation_Seven.bat'
+$VmListPath           = 'C:\temp\vmlist.txt'
+$GuestCredentialPath  = 'C:\temp\wincred.xml'
 
-    # Path to a credential XML file created ahead of time with:
-    #   Get-Credential | Export-Clixml -Path .\GuestCredential.xml
-    # Must be a local admin (or equivalent) account on every target guest. This file is
-    # DPAPI-encrypted and only readable by the Windows user/machine that created it.
-    [Parameter(Mandatory)]
-    [string]$GuestCredentialFile,
+# Guest-side paths/names.
+$RemoteTempFolder  = 'C:\Windows\Temp\SplunkUFDeploy'
+$SplunkInstallDir  = 'C:\Program Files\SplunkUniversalForwarder'
+$SplunkServiceName = 'SplunkForwarder'
 
-    # ===== OPTIONAL - defaults are reasonable, review before a large run ============
+# Report output.
+$ReportFolder = 'C:\temp'
+$ReportPath   = Join-Path $ReportFolder ("SplunkDeploymentReport_{0}.csv" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
 
-    # Silent-install arguments passed to msiexec. AGENTPASSWORD/RECEIVING_INDEXER/
-    # DEPLOYMENT_SERVER etc. are deliberately NOT set here - add them yourself as
-    # "PROPERTY=value" entries if your environment requires them.
-    [string]$InstallArguments = 'AGREETOLICENSE=Yes /quiet',
+# Timeouts (seconds). Keep the installer/post-install ceilings generous - real installs can take
+# several minutes - but bounded, so one stuck VM cannot hang the whole run.
+$QuickGuestOpTimeoutSec      = 60     # cheap read-only guest calls (cred test, detection, validation)
+$InstallerTimeoutSec         = 1200   # 20 min ceiling for the Splunk UF installer itself
+$PostInstallTimeoutSec       = 600    # 10 min ceiling for post_installation_Seven.bat
+$PostActionPollTimeoutSec    = 180    # extra time to allow install dir/service to settle after exit
+$PostActionPollIntervalSec   = 10
 
-    # Where the installer is staged inside the guest before running it.
-    [string]$RemoteStagingPath = 'C:\Windows\Temp\SplunkUF\splunkforwarder.msi',
+#endregion ===========================================================
 
-    # Splunk UF's own install folder, used for the post-install version/service check.
-    [string]$SplunkInstallDir = 'C:\Program Files\SplunkUniversalForwarder',
 
-    # Output folder for the CSV report and log file.
-    [string]$OutputPath = (Join-Path $PSScriptRoot "SplunkUF_Deployment_Reports"),
+#region ======================= REPORT ROW TEMPLATE =======================
 
-    # Seconds to wait for the msiexec install to finish inside the guest before giving up.
-    [int]$InstallTimeoutSeconds = 600
-)
+function New-ReportRow {
+    param([string]$VMName)
 
-$ErrorActionPreference = 'Stop'
-$RunStart   = Get-Date
-$RunStamp   = $RunStart.ToString('yyyyMMdd_HHmmss')
-if (-not (Test-Path $OutputPath)) { New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null }
-
-$CsvReportPath = Join-Path $OutputPath "SplunkUF_Deployment_$RunStamp.csv"
-$LogPath       = Join-Path $OutputPath "SplunkUF_Deployment_$RunStamp.log"
-
-# ============================================================================
-# 0. LOGGING / RESULT TRACKING
-# ============================================================================
-$Global:Results = [System.Collections.Generic.List[object]]::new()
-
-function Write-Log {
-    param(
-        [Parameter(Mandatory)][string]$Message,
-        [ValidateSet('INFO','WARN','ERROR')][string]$Level = 'INFO'
-    )
-    $line = "[{0}] [{1}] {2}" -f (Get-Date).ToString('s'), $Level, $Message
-    Add-Content -Path $LogPath -Value $line
-    switch ($Level) {
-        'WARN'  { Write-Warning $Message }
-        'ERROR' { Write-Warning $Message }
-        default { Write-Host $Message }
+    [PSCustomObject][ordered]@{
+        VMName                = $VMName
+        PowerState            = 'Unknown'
+        VMwareToolsStatus     = 'Unknown'
+        GuestCredentialStatus = 'Not Tested'
+        SplunkInstalledBefore = $false
+        PreviousVersion       = 'None'
+        RequiredVersion       = $RequiredSplunkVersion.ToString()
+        Action                = 'Skipped'
+        InstallerExitCode     = ''
+        SevenPostInstallStatus = ''
+        SplunkServiceStatus   = 'Unknown'
+        FinalVersion          = ''
+        RebootRequired        = $false
+        Result                = ''
+        FailureReason         = ''
+        StartTime             = Get-Date
+        EndTime               = $null
+        Duration              = ''
     }
 }
 
-# Records one VM's final outcome. Status is one of:
-# AlreadyInstalled | Success | Failed | Skipped
-function Add-Result {
+#endregion ============================================================
+
+
+#region ======================= LOCAL PREREQUISITE CHECKS =======================
+
+function Test-LocalPrerequisites {
+    $missing = @()
+
+    foreach ($item in @(
+        @{ Path = $SplunkInstallerPath;  Label = 'Splunk UF installer' },
+        @{ Path = $PostInstallSevenPath; Label = 'post_installation_Seven.bat' },
+        @{ Path = $VmListPath;           Label = 'VM list file' },
+        @{ Path = $GuestCredentialPath;  Label = 'Guest credential XML' }
+    )) {
+        if (-not (Test-Path -LiteralPath $item.Path)) {
+            $missing += "$($item.Label) not found: $($item.Path)"
+        }
+    }
+
+    if (-not (Test-Path -LiteralPath $ReportFolder)) {
+        try {
+            New-Item -ItemType Directory -Path $ReportFolder -Force -ErrorAction Stop | Out-Null
+        } catch {
+            $missing += "Report folder '$ReportFolder' does not exist and could not be created: $($_.Exception.Message)"
+        }
+    }
+
+    if ($missing.Count -gt 0) {
+        foreach ($m in $missing) { Write-Host "PREREQUISITE FAILED: $m" -ForegroundColor Red }
+        throw "One or more local prerequisites are missing. Aborting before touching any VM."
+    }
+}
+
+#endregion ============================================================
+
+
+#region ======================= GUEST OPERATION HELPER (WITH TIMEOUT) =======================
+
+# Runs a guest script asynchronously and bounds the wait with Wait-Task, so a stuck/slow VM
+# cannot hang the whole run. Exit codes for Bat scripts must be embedded in the script's own
+# output text (Invoke-VMScript does not surface a separate exit-code property).
+function Invoke-GuestScriptWithTimeout {
     param(
-        [string]$VMName,
-        [string]$IPAddress,
-        [string]$Status,
-        [string]$SplunkVersion = '',
-        [string]$ServiceStatus = '',
-        [string]$Reason = ''
+        [Parameter(Mandatory)] $VM,
+        [Parameter(Mandatory)] [System.Management.Automation.PSCredential] $GuestCredential,
+        [Parameter(Mandatory)] [ValidateSet('Powershell', 'Bat')] [string] $ScriptType,
+        [Parameter(Mandatory)] [string] $ScriptText,
+        [int] $TimeoutSeconds = 300
     )
-    $Global:Results.Add([pscustomobject]@{
-        Timestamp     = (Get-Date).ToString('s')
-        VMName        = $VMName
-        IPAddress     = $IPAddress
-        Status        = $Status
-        SplunkVersion = $SplunkVersion
-        ServiceStatus = $ServiceStatus
-        Reason        = $Reason
-    })
+
+    try {
+        $task = Invoke-VMScript -VM $VM -GuestCredential $GuestCredential -ScriptType $ScriptType `
+            -ScriptText $ScriptText -RunAsync -ErrorAction Stop
+
+        $completed = Wait-Task -Task $task -Timeout $TimeoutSeconds -ErrorAction Stop
+
+        [PSCustomObject]@{
+            Success      = $true
+            ScriptOutput = $completed.Result.ScriptOutput
+            ErrorMessage = $null
+        }
+    } catch {
+        [PSCustomObject]@{
+            Success      = $false
+            ScriptOutput = $null
+            ErrorMessage = $_.Exception.Message
+        }
+    }
 }
 
-# ============================================================================
-# 1. PRE-FLIGHT
-# ============================================================================
-if (-not (Get-Module -ListAvailable -Name VMware.VimAutomation.Core)) {
-    throw "VMware PowerCLI is not installed. Install-Module VMware.PowerCLI first."
-}
-Import-Module VMware.VimAutomation.Core -ErrorAction Stop
+#endregion ============================================================
 
-if (-not $global:DefaultVIServers -or $global:DefaultVIServers.Count -eq 0) {
-    throw "No active vCenter connection found. Run Connect-VIServer before this script."
-}
 
-if (-not (Test-Path $InputFile)) {
-    throw "Input file not found: $InputFile"
-}
-if (-not (Test-Path $InstallerPath)) {
-    throw "Splunk installer not found: $InstallerPath"
-}
-if (-not (Test-Path $GuestCredentialFile)) {
-    throw "Guest credential file not found: $GuestCredentialFile. Create it once with: Get-Credential | Export-Clixml -Path '$GuestCredentialFile'"
+#region ======================= GUEST-SIDE SCRIPT TEMPLATES =======================
+# Single-quoted here-strings so local PowerShell never expands $ inside them; placeholders are
+# substituted explicitly with .Replace(), which also keeps filenames-with-spaces safe (no local
+# string interpolation quoting hazards).
+
+$Template_Readiness = @'
+$result = [ordered]@{
+    UserName         = $null
+    IsAdmin          = $false
+    InstallDirExists = $false
+    ServiceExists    = $false
+    ServiceStatus    = $null
+    ServiceStartType = $null
+    Version          = $null
+    VersionSource    = $null
+    Installed        = $false
+    RebootPending    = $false
 }
 
 try {
-    $GuestCredential = Import-Clixml -Path $GuestCredentialFile
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $result.UserName = $id.Name
+    $wp = New-Object Security.Principal.WindowsPrincipal($id)
+    $result.IsAdmin = $wp.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+} catch {}
+
+$installDir = '__INSTALLDIR__'
+$svcName    = '__SVCNAME__'
+
+$result.InstallDirExists = Test-Path -LiteralPath $installDir
+
+$svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+if ($svc) {
+    $result.ServiceExists = $true
+    $result.ServiceStatus = $svc.Status.ToString()
+    try {
+        $wmiSvc = Get-CimInstance -ClassName Win32_Service -Filter "Name='$svcName'" -ErrorAction Stop
+        $result.ServiceStartType = $wmiSvc.StartMode
+    } catch { $result.ServiceStartType = 'Unknown' }
+}
+
+$versionFile = Join-Path $installDir 'etc\splunk.version'
+if (Test-Path -LiteralPath $versionFile) {
+    try {
+        $content = Get-Content -LiteralPath $versionFile -ErrorAction Stop
+        $verLine = $content | Where-Object { $_ -match '^VERSION\s*=\s*(.+)$' }
+        if ($verLine) {
+            $result.Version = $Matches[1].Trim()
+            $result.VersionSource = 'VersionFile'
+        }
+    } catch {}
+}
+
+if (-not $result.Version) {
+    try {
+        $uninstallKeys = @(
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+        )
+        $app = Get-ItemProperty -Path $uninstallKeys -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -like 'SplunkForwarder*' -or $_.DisplayName -like '*Splunk Universal Forwarder*' } |
+            Select-Object -First 1
+        if ($app -and $app.DisplayVersion) {
+            $result.Version = $app.DisplayVersion
+            $result.VersionSource = 'Registry'
+        }
+    } catch {}
+}
+
+if (-not $result.Version) {
+    $splunkExe = Join-Path $installDir 'bin\splunk.exe'
+    if (Test-Path -LiteralPath $splunkExe) {
+        try {
+            $verOut = & $splunkExe version --accept-license 2>$null
+            if ($verOut -match '([0-9]+\.[0-9]+\.[0-9]+)') {
+                $result.Version = $Matches[1]
+                $result.VersionSource = 'SplunkExe'
+            }
+        } catch {}
+    }
+}
+
+$result.Installed = [bool]($result.ServiceExists -or $result.InstallDirExists -or $result.Version)
+
+try {
+    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { $result.RebootPending = $true }
+    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { $result.RebootPending = $true }
+    $pfro = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name 'PendingFileRenameOperations' -ErrorAction SilentlyContinue
+    if ($pfro) { $result.RebootPending = $true }
+} catch {}
+
+[PSCustomObject]$result | ConvertTo-Json -Compress
+'@
+
+$Template_RunInstaller = @'
+@echo off
+set "INSTALLER=__INSTALLER_PATH__"
+set "IARGS=__INSTALLER_ARGS__"
+if not exist "%INSTALLER%" (
+    echo INSTALLER_MISSING
+    exit /b 9009
+)
+"%INSTALLER%" %IARGS%
+echo INSTALLER_EXITCODE=%ERRORLEVEL%
+'@
+
+$Template_RunPostInstall = @'
+@echo off
+set "POSTBAT=__POSTBAT_PATH__"
+if not exist "%POSTBAT%" (
+    echo POSTBAT_MISSING
+    exit /b 9009
+)
+"%POSTBAT%"
+echo POSTBAT_EXITCODE=%ERRORLEVEL%
+'@
+
+$Template_EnsureAutoStart = @'
+$svcName = '__SVCNAME__'
+try {
+    $wmiSvc = Get-CimInstance -ClassName Win32_Service -Filter "Name='$svcName'" -ErrorAction Stop
+    if ($wmiSvc.StartMode -ne 'Auto') {
+        Set-Service -Name $svcName -StartupType Automatic -ErrorAction Stop
+        'ChangedToAutomatic'
+    } else {
+        'AlreadyAutomatic'
+    }
 } catch {
-    throw "Failed to load guest credential from '$GuestCredentialFile': $($_.Exception.Message). This file can only be read back by the same Windows user account, on the same machine, that created it."
+    "FailedToSetStartupType: $($_.Exception.Message)"
 }
-if ($GuestCredential -isnot [System.Management.Automation.PSCredential]) {
-    throw "'$GuestCredentialFile' does not contain a saved PSCredential object."
+'@
+
+$Template_MkdirAndCleanup = @'
+$path = '__PATH__'
+$mode = '__MODE__'
+try {
+    if ($mode -eq 'create') {
+        New-Item -ItemType Directory -Path $path -Force -ErrorAction Stop | Out-Null
+        'OK'
+    } else {
+        if (Test-Path -LiteralPath $path) {
+            Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop
+        }
+        'OK'
+    }
+} catch {
+    "FAILED: $($_.Exception.Message)"
 }
+'@
 
-$Targets = Get-Content -Path $InputFile |
-    ForEach-Object { $_.Trim() } |
-    Where-Object { $_ -and -not $_.StartsWith('#') } |
-    Select-Object -Unique
+#endregion ============================================================
 
-if (-not $Targets) {
-    throw "Input file '$InputFile' has no VM names (one per line)."
-}
 
-Write-Log "Starting Splunk UF deployment run. Targets: $($Targets.Count). Installer: $InstallerPath"
+#region ======================= VM READINESS / DETECTION =======================
 
-# ============================================================================
-# 2. PER-VM DEPLOYMENT
-# ============================================================================
-foreach ($vmName in $Targets) {
+function Get-VMReadinessAndSplunkStatus {
+    param(
+        [Parameter(Mandatory)] $VM,
+        [Parameter(Mandatory)] [System.Management.Automation.PSCredential] $GuestCredential
+    )
 
-    $vmIP = ''
+    $script = $Template_Readiness.Replace('__INSTALLDIR__', $SplunkInstallDir).Replace('__SVCNAME__', $SplunkServiceName)
+    $r = Invoke-GuestScriptWithTimeout -VM $VM -GuestCredential $GuestCredential -ScriptType Powershell `
+        -ScriptText $script -TimeoutSeconds $QuickGuestOpTimeoutSec
 
-    Write-Log "----- Processing '$vmName' -----"
+    if (-not $r.Success) {
+        return [PSCustomObject]@{ Success = $false; ErrorMessage = $r.ErrorMessage; Status = $null }
+    }
 
     try {
-        # --- 2.1 VM exists in vCenter -------------------------------------------------
-        $vm = Get-VM -Name $vmName -ErrorAction SilentlyContinue
-        if (-not $vm) {
-            Write-Log "VM '$vmName' not found in vCenter." 'WARN'
-            Add-Result -VMName $vmName -IPAddress $vmIP -Status 'Skipped' -Reason 'VM not found in vCenter'
-            continue
-        }
-        if (@($vm).Count -gt 1) {
-            Write-Log "Multiple VMs named '$vmName' found; ambiguous, skipping." 'WARN'
-            Add-Result -VMName $vmName -IPAddress $vmIP -Status 'Skipped' -Reason 'Multiple VMs with this name in vCenter'
-            continue
-        }
-
-        # --- 2.2 Powered on -------------------------------------------------------------
-        if ($vm.PowerState -ne 'PoweredOn') {
-            Write-Log "VM '$vmName' is not powered on (state: $($vm.PowerState))." 'WARN'
-            Add-Result -VMName $vmName -IPAddress $vmIP -Status 'Skipped' -Reason "VM not powered on ($($vm.PowerState))"
-            continue
-        }
-
-        # --- 2.3 VMware Tools installed and running -------------------------------------
-        $vmView = Get-View -VIObject $vm -Property Guest
-        $toolsStatus = $vmView.Guest.ToolsStatus
-        $toolsRunning = $vmView.Guest.ToolsRunningStatus
-
-        $guestIPs = $vmView.Guest.Net | ForEach-Object { $_.IpAddress } | Where-Object { $_ }
-        $vmIP = $guestIPs -join '; '
-
-        if ($toolsRunning -ne 'guestToolsRunning') {
-            Write-Log "VMware Tools not running on '$vmName' (status: $toolsStatus / $toolsRunning)." 'WARN'
-            Add-Result -VMName $vmName -IPAddress $vmIP -Status 'Skipped' -Reason "VMware Tools not running ($toolsStatus)"
-            continue
-        }
-
-        # --- 2.4 Guest credentials valid (also confirms guest OS is responsive) -----------
-        try {
-            $osCheck = Invoke-VMScript -VM $vm -GuestCredential $GuestCredential `
-                -ScriptType Powershell -ScriptText '$env:COMPUTERNAME' -ErrorAction Stop
-        } catch {
-            Write-Log "Guest credential/connectivity check failed for '$vmName': $($_.Exception.Message)" 'WARN'
-            Add-Result -VMName $vmName -IPAddress $vmIP -Status 'Skipped' -Reason "Guest credential/connectivity check failed: $($_.Exception.Message)"
-            continue
-        }
-
-        # --- 2.5 Already installed? --------------------------------------------------------
-        $checkInstalledScript = @"
-if (Test-Path '$SplunkInstallDir\bin\splunk.exe') {
-    `$svc = Get-Service -Name 'SplunkForwarder' -ErrorAction SilentlyContinue
-    `$ver = (Get-Item '$SplunkInstallDir\bin\splunk.exe').VersionInfo.ProductVersion
-    "INSTALLED|`$(`$svc.Status)|`$ver"
-} else {
-    "NOTINSTALLED"
-}
-"@
-        $installedCheck = Invoke-VMScript -VM $vm -GuestCredential $GuestCredential `
-            -ScriptType Powershell -ScriptText $checkInstalledScript -ErrorAction Stop
-        $installedOut = $installedCheck.ScriptOutput.Trim()
-
-        if ($installedOut -like 'INSTALLED|*') {
-            $parts = $installedOut.Split('|')
-            Write-Log "Splunk UF already installed on '$vmName' (version $($parts[2]), service: $($parts[1]))."
-            Add-Result -VMName $vmName -IPAddress $vmIP -Status 'AlreadyInstalled' `
-                -SplunkVersion $parts[2] -ServiceStatus $parts[1] -Reason 'Already installed'
-            continue
-        }
-
-        # --- 2.6 Copy installer to guest ---------------------------------------------------
-        $remoteDir = Split-Path $RemoteStagingPath -Parent
-        $mkdirScript = "New-Item -ItemType Directory -Path '$remoteDir' -Force | Out-Null"
-        Invoke-VMScript -VM $vm -GuestCredential $GuestCredential -ScriptType Powershell -ScriptText $mkdirScript -ErrorAction Stop | Out-Null
-
-        Write-Log "Copying installer to '$vmName':$RemoteStagingPath ..."
-        Copy-VMGuestFile -Source $InstallerPath -Destination $RemoteStagingPath -VM $vm `
-            -LocalToGuest -GuestCredential $GuestCredential -Force -ErrorAction Stop
-
-        # --- 2.7 Silent install --------------------------------------------------------------
-        $installScript = @"
-`$p = Start-Process -FilePath 'msiexec.exe' -ArgumentList '/i `"$RemoteStagingPath`" $InstallArguments /norestart /l*v `"$remoteDir\install.log`"' -Wait -PassThru
-"ExitCode=`$(`$p.ExitCode)"
-"@
-        Write-Log "Installing Splunk UF on '$vmName' (timeout ${InstallTimeoutSeconds}s)..."
-        $installResult = Invoke-VMScript -VM $vm -GuestCredential $GuestCredential `
-            -ScriptType Powershell -ScriptText $installScript -ToolsWaitSecs $InstallTimeoutSeconds -ErrorAction Stop
-        $installOut = $installResult.ScriptOutput.Trim()
-
-        if ($installOut -notmatch 'ExitCode=0') {
-            Write-Log "Install on '$vmName' returned non-zero: $installOut" 'WARN'
-            Add-Result -VMName $vmName -IPAddress $vmIP -Status 'Failed' -Reason "msiexec $installOut"
-            continue
-        }
-
-        # --- 2.8 Post-install verification -----------------------------------------------
-        $verifyScript = @"
-`$svc = Get-Service -Name 'SplunkForwarder' -ErrorAction SilentlyContinue
-if (-not `$svc) { "NOSERVICE"; exit }
-if (`$svc.Status -ne 'Running') { Start-Service -Name 'SplunkForwarder' -ErrorAction SilentlyContinue }
-Start-Sleep -Seconds 5
-`$svc.Refresh()
-`$ver = (Get-Item '$SplunkInstallDir\bin\splunk.exe' -ErrorAction SilentlyContinue).VersionInfo.ProductVersion
-"OK|`$(`$svc.Status)|`$ver"
-"@
-        $verify = Invoke-VMScript -VM $vm -GuestCredential $GuestCredential `
-            -ScriptType Powershell -ScriptText $verifyScript -ErrorAction Stop
-        $verifyOut = $verify.ScriptOutput.Trim()
-
-        if ($verifyOut -eq 'NOSERVICE' -or -not $verifyOut) {
-            Write-Log "Install ran but SplunkForwarder service not found on '$vmName'." 'WARN'
-            Add-Result -VMName $vmName -IPAddress $vmIP -Status 'Failed' -Reason 'Installer completed but SplunkForwarder service missing'
-            continue
-        }
-
-        $vparts = $verifyOut.Split('|')
-        $svcStatus = $vparts[1]
-        $version   = $vparts[2]
-
-        if ($svcStatus -ne 'Running') {
-            Write-Log "SplunkForwarder installed on '$vmName' but service is '$svcStatus', not Running." 'WARN'
-            Add-Result -VMName $vmName -IPAddress $vmIP -Status 'Failed' -SplunkVersion $version -ServiceStatus $svcStatus `
-                -Reason "Service present but not running ($svcStatus)"
-            continue
-        }
-
-        Write-Log "Splunk UF $version successfully installed and running on '$vmName'."
-        Add-Result -VMName $vmName -IPAddress $vmIP -Status 'Success' -SplunkVersion $version -ServiceStatus $svcStatus -Reason ''
-    }
-    catch {
-        Write-Log "Unhandled error processing '$vmName': $($_.Exception.Message)" 'ERROR'
-        Add-Result -VMName $vmName -IPAddress $vmIP -Status 'Failed' -Reason $_.Exception.Message
+        $status = $r.ScriptOutput | ConvertFrom-Json -ErrorAction Stop
+        [PSCustomObject]@{ Success = $true; ErrorMessage = $null; Status = $status }
+    } catch {
+        [PSCustomObject]@{ Success = $false; ErrorMessage = "Could not parse guest status output: $($_.Exception.Message)"; Status = $null }
     }
 }
 
-# ============================================================================
-# 3. REPORT / SUMMARY
-# ============================================================================
-$Global:Results | Export-Csv -Path $CsvReportPath -NoTypeInformation -Encoding UTF8
+#endregion ============================================================
 
-$total    = $Global:Results.Count
-$success  = ($Global:Results | Where-Object Status -eq 'Success').Count
-$already  = ($Global:Results | Where-Object Status -eq 'AlreadyInstalled').Count
-$skipped  = ($Global:Results | Where-Object Status -eq 'Skipped').Count
-$failed   = ($Global:Results | Where-Object Status -eq 'Failed').Count
 
-Write-Host ""
-Write-Host "================ Splunk UF Deployment Summary ================"
-Write-Host "Total VMs processed : $total"
-Write-Host "Successfully Installed : $success"
-Write-Host "Already Installed      : $already"
-Write-Host "Skipped                : $skipped"
-Write-Host "Failed                 : $failed"
-Write-Host "================================================================"
-Write-Host "CSV report: $CsvReportPath"
-Write-Host "Log file  : $LogPath"
+#region ======================= INSTALL / UPGRADE PROCEDURE =======================
 
-Write-Log "Run complete. Total=$total Success=$success AlreadyInstalled=$already Skipped=$skipped Failed=$failed"
+# Copies the installer + post_installation_Seven.bat to the guest, runs both as the guest
+# credential (which must be a local admin - checked earlier), waits for each to finish (bounded
+# by timeout), then cleans up the copied files. Does not itself decide compliant/upgrade/install -
+# the caller has already made that decision; this function just executes the guide's procedure.
+function Invoke-SplunkInstallProcedure {
+    param(
+        [Parameter(Mandatory)] $VM,
+        [Parameter(Mandatory)] [System.Management.Automation.PSCredential] $GuestCredential
+    )
+
+    $out = [PSCustomObject]@{
+        Success             = $false
+        FailureReason       = ''
+        InstallerExitCode   = ''
+        SevenPostInstallStatus = ''
+        RebootRequired      = $false
+    }
+
+    $installerLeaf  = Split-Path -Path $SplunkInstallerPath -Leaf
+    $postBatLeaf    = Split-Path -Path $PostInstallSevenPath -Leaf
+    $remoteInstaller = Join-Path $RemoteTempFolder $installerLeaf
+    $remotePostBat   = Join-Path $RemoteTempFolder $postBatLeaf
+
+    # 1. Create remote temp folder.
+    $mkdirScript = $Template_MkdirAndCleanup.Replace('__PATH__', $RemoteTempFolder).Replace('__MODE__', 'create')
+    $mkdirResult = Invoke-GuestScriptWithTimeout -VM $VM -GuestCredential $GuestCredential -ScriptType Powershell `
+        -ScriptText $mkdirScript -TimeoutSeconds $QuickGuestOpTimeoutSec
+    if (-not $mkdirResult.Success -or ($mkdirResult.ScriptOutput -notmatch 'OK')) {
+        $out.FailureReason = "Failed to create remote temp folder: $($mkdirResult.ErrorMessage)$($mkdirResult.ScriptOutput)"
+        return $out
+    }
+
+    # 2. Copy installer + post-install bat into the guest (VMware Tools guest-file API only).
+    try {
+        Copy-VMGuestFile -Source $SplunkInstallerPath -Destination $remoteInstaller -LocalToGuest `
+            -VM $VM -GuestCredential $GuestCredential -Force -ErrorAction Stop
+        Copy-VMGuestFile -Source $PostInstallSevenPath -Destination $remotePostBat -LocalToGuest `
+            -VM $VM -GuestCredential $GuestCredential -Force -ErrorAction Stop
+    } catch {
+        $out.FailureReason = "Failed to copy installation files to guest: $($_.Exception.Message)"
+        return $out
+    }
+
+    # 3. Run the installer (as the guest admin credential) and wait for it to finish.
+    $installScript = $Template_RunInstaller.Replace('__INSTALLER_PATH__', $remoteInstaller).Replace('__INSTALLER_ARGS__', $SplunkInstallerArgs)
+    $installResult = Invoke-GuestScriptWithTimeout -VM $VM -GuestCredential $GuestCredential -ScriptType Bat `
+        -ScriptText $installScript -TimeoutSeconds $InstallerTimeoutSec
+
+    if (-not $installResult.Success) {
+        $out.FailureReason = "Installer execution failed or timed out: $($installResult.ErrorMessage)"
+        return $out
+    }
+    if ($installResult.ScriptOutput -match 'INSTALLER_MISSING') {
+        $out.FailureReason = "Installer file was not found on the guest at $remoteInstaller after copy."
+        return $out
+    }
+    if ($installResult.ScriptOutput -match 'INSTALLER_EXITCODE=(-?\d+)') {
+        $out.InstallerExitCode = $Matches[1]
+        if ($Matches[1] -eq '3010') { $out.RebootRequired = $true }
+        elseif ($Matches[1] -ne '0') {
+            $out.FailureReason = "Installer returned non-zero exit code $($Matches[1])."
+            return $out
+        }
+    } else {
+        $out.FailureReason = "Could not determine installer exit code from output."
+        return $out
+    }
+
+    # 4. Run post_installation_Seven.bat (SEVEN configuration only) and wait for it to finish.
+    $postScript = $Template_RunPostInstall.Replace('__POSTBAT_PATH__', $remotePostBat)
+    $postResult = Invoke-GuestScriptWithTimeout -VM $VM -GuestCredential $GuestCredential -ScriptType Bat `
+        -ScriptText $postScript -TimeoutSeconds $PostInstallTimeoutSec
+
+    if (-not $postResult.Success) {
+        $out.FailureReason = "post_installation_Seven.bat execution failed or timed out: $($postResult.ErrorMessage)"
+        return $out
+    }
+    if ($postResult.ScriptOutput -match 'POSTBAT_MISSING') {
+        $out.FailureReason = "post_installation_Seven.bat was not found on the guest at $remotePostBat after copy."
+        return $out
+    }
+    if ($postResult.ScriptOutput -match 'POSTBAT_EXITCODE=(-?\d+)') {
+        $code = $Matches[1]
+        if ($code -eq '3010') { $out.RebootRequired = $true; $out.SevenPostInstallStatus = "Completed (ExitCode $code, reboot pending)" }
+        elseif ($code -eq '0') { $out.SevenPostInstallStatus = 'Completed (ExitCode 0)' }
+        else {
+            $out.SevenPostInstallStatus = "Completed with non-zero ExitCode $code"
+            $out.FailureReason = "post_installation_Seven.bat returned non-zero exit code $code."
+            return $out
+        }
+    } else {
+        $out.SevenPostInstallStatus = 'Unknown - exit code not captured'
+        $out.FailureReason = "Could not determine post_installation_Seven.bat exit code from output."
+        return $out
+    }
+
+    # 5. Poll briefly: the installer/bat may finish while Splunk itself is still settling.
+    $deadline = (Get-Date).AddSeconds($PostActionPollTimeoutSec)
+    $finalStatus = $null
+    do {
+        $check = Get-VMReadinessAndSplunkStatus -VM $VM -GuestCredential $GuestCredential
+        if ($check.Success -and $check.Status.ServiceExists -and $check.Status.ServiceStatus -eq 'Running') {
+            $finalStatus = $check.Status
+            break
+        }
+        Start-Sleep -Seconds $PostActionPollIntervalSec
+    } while ((Get-Date) -lt $deadline)
+
+    if (-not $finalStatus) {
+        $lastCheck = Get-VMReadinessAndSplunkStatus -VM $VM -GuestCredential $GuestCredential
+        $out.FailureReason = "Post-install validation failed: SplunkForwarder service was not confirmed Running within $PostActionPollTimeoutSec seconds."
+        if ($lastCheck.Success) {
+            $out.FailureReason += " Last observed ServiceExists=$($lastCheck.Status.ServiceExists), ServiceStatus=$($lastCheck.Status.ServiceStatus)."
+        }
+        return $out
+    }
+
+    # 6. Ensure service is set to start Automatically (required post-install check).
+    if ($finalStatus.ServiceStartType -ne 'Auto') {
+        $autoScript = $Template_EnsureAutoStart.Replace('__SVCNAME__', $SplunkServiceName)
+        Invoke-GuestScriptWithTimeout -VM $VM -GuestCredential $GuestCredential -ScriptType Powershell `
+            -ScriptText $autoScript -TimeoutSeconds $QuickGuestOpTimeoutSec | Out-Null
+    }
+
+    $out.Success = $true
+    return $out
+}
+
+#endregion ============================================================
+
+
+#region ======================= MAIN =======================
+
+Write-Host "`n=== Splunk Universal Forwarder Deployment (SEVEN configuration) ===" -ForegroundColor Cyan
+Write-Host "Required version: $RequiredSplunkVersion`n"
+
+Test-LocalPrerequisites
+
+if (-not $global:DefaultVIServer -or -not $global:DefaultVIServer.IsConnected) {
+    throw "No active vCenter connection found. Connect with Connect-VIServer before running this script."
+}
+
+$guestCred = Import-Clixml -Path $GuestCredentialPath
+$vmNames = Get-Content -Path $VmListPath |
+    ForEach-Object { $_.Trim() } |
+    Where-Object { $_ -ne '' -and -not $_.StartsWith('#') } |
+    Select-Object -Unique
+
+if ($vmNames.Count -eq 0) {
+    throw "VM list at $VmListPath contains no VM names."
+}
+
+$results = New-Object System.Collections.Generic.List[object]
+
+foreach ($vmName in $vmNames) {
+
+    $row = New-ReportRow -VMName $vmName
+    Write-Host "`n--- $vmName ---" -ForegroundColor Cyan
+
+    try {
+        # 1. VM exists.
+        $vmMatches = @(Get-VM -Name $vmName -ErrorAction SilentlyContinue)
+        if ($vmMatches.Count -eq 0) { throw "VM '$vmName' was not found in vCenter." }
+        if ($vmMatches.Count -gt 1) { throw "VM name '$vmName' is ambiguous ($($vmMatches.Count) matches) - skipping for safety." }
+        $vm = $vmMatches[0]
+
+        # Powered on.
+        $row.PowerState = $vm.PowerState.ToString()
+        if ($vm.PowerState -ne 'PoweredOn') { throw "VM is not powered on (state: $($vm.PowerState))." }
+
+        # VMware Tools installed and running.
+        $toolsStatus  = $vm.ExtensionData.Guest.ToolsStatus
+        $toolsRunning = $vm.ExtensionData.Guest.ToolsRunningStatus
+        $row.VMwareToolsStatus = "$toolsStatus / $toolsRunning"
+        if ($toolsRunning -ne 'guestToolsRunning') { throw "VMware Tools is not running (status: $toolsStatus / $toolsRunning)." }
+
+        # Guest OS is Windows.
+        if ($vm.ExtensionData.Guest.GuestFamily -ne 'windowsGuest') {
+            throw "Guest OS is not Windows (family: $($vm.ExtensionData.Guest.GuestFamily))."
+        }
+
+        # Guest credentials valid + readiness/detection (single combined guest call).
+        $detect = Get-VMReadinessAndSplunkStatus -VM $vm -GuestCredential $guestCred
+        if (-not $detect.Success) {
+            $row.GuestCredentialStatus = 'Invalid'
+            throw "Guest credential validation / detection failed: $($detect.ErrorMessage)"
+        }
+        $status = $detect.Status
+        $row.GuestCredentialStatus = if ($status.IsAdmin) { 'Valid (Administrator)' } else { 'Valid (NOT Administrator - install will likely fail)' }
+        $row.RebootRequired = [bool]$status.RebootPending
+
+        $row.SplunkInstalledBefore = [bool]$status.Installed
+        $row.PreviousVersion = if ($status.Version) { $status.Version } else { 'None' }
+
+        $needsProcedure = $false
+
+        if ($status.Installed -and $status.Version) {
+            $installedVersion = $null
+            try { $installedVersion = [version]$status.Version } catch { $installedVersion = $null }
+
+            if (-not $installedVersion) {
+                $row.Action = 'Manual Review'
+                $row.Result = 'Manual Review'
+                $row.FailureReason = "Installed version string '$($status.Version)' could not be parsed - not touching this VM."
+            }
+            elseif ($installedVersion -gt $RequiredSplunkVersion) {
+                $row.Action = 'Manual Review'
+                $row.Result = 'Newer Version Detected - Manual Review'
+                $row.FinalVersion = $status.Version
+            }
+            elseif ($installedVersion -eq $RequiredSplunkVersion) {
+                if ($status.ServiceExists -and $status.ServiceStatus -eq 'Running') {
+                    $row.Action = 'Skipped'
+                    $row.Result = 'Already Compliant'
+                    $row.FinalVersion = $status.Version
+                    $row.SplunkServiceStatus = $status.ServiceStatus
+                } else {
+                    # Correct version but service unhealthy - repair using the same guide procedure.
+                    $row.Action = 'Installed'
+                    $needsProcedure = $true
+                }
+            }
+            else {
+                $row.Action = 'Upgraded'
+                $needsProcedure = $true
+            }
+        } else {
+            $row.Action = 'Installed'
+            $needsProcedure = $true
+        }
+
+        if ($needsProcedure) {
+            if (-not $status.IsAdmin) {
+                throw "Guest credential is not a local Administrator; cannot proceed with install/upgrade."
+            }
+
+            $procResult = Invoke-SplunkInstallProcedure -VM $vm -GuestCredential $guestCred
+            $row.InstallerExitCode = $procResult.InstallerExitCode
+            $row.SevenPostInstallStatus = $procResult.SevenPostInstallStatus
+            if ($procResult.RebootRequired) { $row.RebootRequired = $true }
+
+            if (-not $procResult.Success) {
+                $row.Action = 'Failed'
+                $row.Result = 'Failed'
+                $row.FailureReason = $procResult.FailureReason
+            } else {
+                # Final post-install validation - success is based on this, not on the procedure "starting".
+                $final = Get-VMReadinessAndSplunkStatus -VM $vm -GuestCredential $guestCred
+                if (-not $final.Success) {
+                    $row.Action = 'Failed'
+                    $row.Result = 'Failed'
+                    $row.FailureReason = "Post-install validation could not be performed: $($final.ErrorMessage)"
+                } else {
+                    $fs = $final.Status
+                    $row.SplunkServiceStatus = $fs.ServiceStatus
+                    $row.FinalVersion = $fs.Version
+                    if ($fs.RebootPending) { $row.RebootRequired = $true }
+
+                    $finalVersionOk = $false
+                    try { $finalVersionOk = ([version]$fs.Version -eq $RequiredSplunkVersion) } catch {}
+
+                    if ($fs.ServiceExists -and $fs.ServiceStatus -eq 'Running' -and $fs.InstallDirExists -and $finalVersionOk) {
+                        $row.Result = if ($row.Action -eq 'Upgraded') { 'Upgrade Successful' } else { 'Install Successful' }
+                    } else {
+                        $row.Action = 'Failed'
+                        $row.Result = 'Failed'
+                        $row.FailureReason = "Post-install validation failed: ServiceExists=$($fs.ServiceExists), ServiceStatus=$($fs.ServiceStatus), InstallDirExists=$($fs.InstallDirExists), Version=$($fs.Version)."
+                    }
+                }
+            }
+        }
+
+        if ($row.Result -eq '') { $row.Result = $row.Action }
+
+    } catch {
+        $row.Action = 'Failed'
+        $row.Result = 'Failed'
+        $row.FailureReason = $_.Exception.Message
+    } finally {
+        $row.EndTime = Get-Date
+        $row.Duration = [string]([timespan]($row.EndTime - $row.StartTime))
+        $results.Add($row)
+
+        $color = switch ($row.Action) {
+            'Failed'        { 'Red' }
+            'Manual Review' { 'Yellow' }
+            'Skipped'       { 'DarkGray' }
+            default         { 'Green' }
+        }
+        Write-Host "Result: $($row.Result)  |  Action: $($row.Action)  |  Version: $($row.FinalVersion)$(if(-not $row.FinalVersion){$row.PreviousVersion})" -ForegroundColor $color
+        if ($row.FailureReason) { Write-Host "Reason: $($row.FailureReason)" -ForegroundColor Red }
+        if ($row.RebootRequired) { Write-Host "REBOOT REQUIRED on $vmName - not rebooting automatically." -ForegroundColor Yellow }
+    }
+}
+
+# Export final report.
+$results | Export-Csv -Path $ReportPath -NoTypeInformation -Encoding UTF8
+Write-Host "`nReport written to: $ReportPath" -ForegroundColor Cyan
+
+# Summary.
+$summary = [ordered]@{
+    'Total VMs'                    = $results.Count
+    'Already Compliant'            = ($results | Where-Object { $_.Result -eq 'Already Compliant' }).Count
+    'Successfully Installed'       = ($results | Where-Object { $_.Result -eq 'Install Successful' }).Count
+    'Successfully Upgraded'        = ($results | Where-Object { $_.Result -eq 'Upgrade Successful' }).Count
+    'Newer Version / Manual Review' = ($results | Where-Object { $_.Action -eq 'Manual Review' }).Count
+    'Failed'                       = ($results | Where-Object { $_.Action -eq 'Failed' }).Count
+    'Skipped'                      = ($results | Where-Object { $_.Action -eq 'Skipped' -and $_.Result -ne 'Already Compliant' }).Count
+    'Reboot Required (not performed)' = ($results | Where-Object { $_.RebootRequired }).Count
+}
+
+Write-Host "`n=== Summary ===" -ForegroundColor Cyan
+foreach ($key in $summary.Keys) {
+    Write-Host ("{0,-32}: {1}" -f $key, $summary[$key])
+}
+
+#endregion ============================================================
