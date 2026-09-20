@@ -24,7 +24,7 @@
 # Bump this on every change and check it against the version quoted in chat before trusting a
 # run's results - prints as the very first line of output so a stale cached copy is always
 # immediately obvious, instead of silently re-running old logic.
-$ScriptBuild = '2026.09.20-11'
+$ScriptBuild = '2026.09.20-12'
 
 # Splunk version this fleet must be running after this script completes.
 [version]$RequiredSplunkVersion = '10.4.2'
@@ -490,7 +490,17 @@ function Invoke-SplunkInstallProcedure {
         return $out
     }
 
-    # 2. Copy installer + post-install bat into the guest (VMware Tools guest-file API only).
+    # 2. Remove any stale destination files left over from a previous failed attempt first - live
+    # testing showed Copy-VMGuestFile consistently 500s when a prior partial file already sits at
+    # the destination, and -Force alone does not reliably clear that state. Non-fatal if this
+    # fails since the files may simply not exist yet on a first-ever run.
+    foreach ($stalePath in @($remoteInstaller, $remotePostBat)) {
+        $cleanupScript = $Template_MkdirAndCleanup.Replace('__PATH__', $stalePath).Replace('__MODE__', 'remove')
+        Invoke-GuestScriptWithTimeout -VM $VM -GuestCredential $GuestCredential -ScriptType Powershell `
+            -ScriptText $cleanupScript -TimeoutSeconds $QuickGuestOpTimeoutSec | Out-Null
+    }
+
+    # 3. Copy installer + post-install bat into the guest (VMware Tools guest-file API only).
     try {
         Copy-VMGuestFileWithRetry -Source $SplunkInstallerPath -Destination $remoteInstaller -VM $VM -GuestCredential $GuestCredential
         Copy-VMGuestFileWithRetry -Source $PostInstallSevenPath -Destination $remotePostBat -VM $VM -GuestCredential $GuestCredential
@@ -499,7 +509,7 @@ function Invoke-SplunkInstallProcedure {
         return $out
     }
 
-    # 3. Run the installer (as the guest admin credential) and wait for it to finish.
+    # 4. Run the installer (as the guest admin credential) and wait for it to finish.
     $installScript = $Template_RunInstaller.Replace('__INSTALLER_PATH__', $remoteInstaller).Replace('__INSTALLER_ARGS__', $SplunkInstallerArgs)
     $installResult = Invoke-GuestScriptWithTimeout -VM $VM -GuestCredential $GuestCredential -ScriptType Powershell `
         -ScriptText $installScript -TimeoutSeconds $InstallerTimeoutSec
@@ -528,7 +538,7 @@ function Invoke-SplunkInstallProcedure {
         return $out
     }
 
-    # 4. Run post_installation_Seven.bat (SEVEN configuration only) and wait for it to finish.
+    # 5. Run post_installation_Seven.bat (SEVEN configuration only) and wait for it to finish.
     $postScript = $Template_RunPostInstall.Replace('__POSTBAT_PATH__', $remotePostBat)
     $postResult = Invoke-GuestScriptWithTimeout -VM $VM -GuestCredential $GuestCredential -ScriptType Powershell `
         -ScriptText $postScript -TimeoutSeconds $PostInstallTimeoutSec
@@ -560,7 +570,7 @@ function Invoke-SplunkInstallProcedure {
         return $out
     }
 
-    # 5. Poll briefly: the installer/bat may finish while Splunk itself is still settling.
+    # 6. Poll briefly: the installer/bat may finish while Splunk itself is still settling.
     $deadline = (Get-Date).AddSeconds($PostActionPollTimeoutSec)
     $finalStatus = $null
     do {
@@ -581,7 +591,7 @@ function Invoke-SplunkInstallProcedure {
         return $out
     }
 
-    # 6. Ensure service is set to start Automatically (required post-install check).
+    # 7. Ensure service is set to start Automatically (required post-install check).
     if ($finalStatus.ServiceStartType -ne 'Auto') {
         $autoScript = $Template_EnsureAutoStart.Replace('__SVCNAME__', $SplunkServiceName)
         Invoke-GuestScriptWithTimeout -VM $VM -GuestCredential $GuestCredential -ScriptType Powershell `
