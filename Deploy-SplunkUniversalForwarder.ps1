@@ -24,7 +24,7 @@
 # Bump this on every change and check it against the version quoted in chat before trusting a
 # run's results - prints as the very first line of output so a stale cached copy is always
 # immediately obvious, instead of silently re-running old logic.
-$ScriptBuild = '2026.09.20-7'
+$ScriptBuild = '2026.09.20-8'
 
 # Splunk version this fleet must be running after this script completes.
 [version]$RequiredSplunkVersion = '10.4.2'
@@ -167,7 +167,16 @@ function Invoke-GuestScriptWithTimeout {
 # substituted explicitly with .Replace(), which also keeps filenames-with-spaces safe (no local
 # string interpolation quoting hazards).
 
-$Template_Readiness = @'
+# Split into two SMALL guest scripts rather than one large one. Live testing proved that a
+# single larger detection script (combining admin-check + service + version-file + registry scan
+# + splunk.exe + reboot-pending, ~2.5-3KB of script text) comes back with ZERO output and no
+# error at all - not even a marker string printed as the very first statement - while the exact
+# same admin-check+service logic on its own returns correctly. This is consistent with a payload
+# size limit on the VMware Tools guest-ops RPC channel that Invoke-VMScript uses, silently
+# swallowing anything over some threshold rather than raising a catchable error. Splitting into
+# two calls keeps each one comfortably small.
+
+$Template_ReadinessCore = @'
 $result = [ordered]@{
     UserName         = $null
     IsAdmin          = $false
@@ -177,56 +186,27 @@ $result = [ordered]@{
     ServiceExists    = $false
     ServiceStatus    = $null
     ServiceStartType = $null
-    Version          = $null
-    VersionSource    = $null
-    Installed        = $false
-    RebootPending    = $false
 }
 
 try {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     $result.UserName = $id.Name
-
-    # Diagnostic pass: try three independent ways to determine admin membership and record which
-    # one(s) succeeded/failed and why, instead of silently trusting one method. A prior fix
-    # (checking the Administrators SID in $id.Groups) still reported IsAdmin=$false against a
-    # confirmed local admin account, so this run needs to show WHY rather than guess again.
     $adminSid = 'S-1-5-32-544'
     $checks = [ordered]@{}
-
-    try {
-        $checks.GroupsSidMatch = [bool]($id.Groups | Where-Object { $_.Value -eq $adminSid })
-    } catch {
-        $checks.GroupsSidMatch = "ERROR: $($_.Exception.Message)"
-    }
-
+    try { $checks.GroupsSidMatch = [bool]($id.Groups | Where-Object { $_.Value -eq $adminSid }) } catch { $checks.GroupsSidMatch = "ERROR: $($_.Exception.Message)" }
     try {
         $wp = New-Object Security.Principal.WindowsPrincipal($id)
         $checks.IsInRoleAdministrator = $wp.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    } catch {
-        $checks.IsInRoleAdministrator = "ERROR: $($_.Exception.Message)"
-    }
-
-    # Get-LocalGroupMember (Microsoft.PowerShell.LocalAccounts module) was tried here and removed -
-    # it is not guaranteed present/fast on every Windows build and is the likely cause of the
-    # previous run coming back completely empty (script probably never reached its final output).
-    # Sticking to the two lightweight, dependency-free .NET checks above.
-
+    } catch { $checks.IsInRoleAdministrator = "ERROR: $($_.Exception.Message)" }
     $result.IsAdminMethod = ($checks.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join '; '
-
-    $result.IsAdmin = [bool](
-        ($checks.GroupsSidMatch -eq $true) -or
-        ($checks.IsInRoleAdministrator -eq $true)
-    )
+    $result.IsAdmin = [bool](($checks.GroupsSidMatch -eq $true) -or ($checks.IsInRoleAdministrator -eq $true))
 } catch {
     $result.IsAdminError = $_.Exception.Message
 }
 
 $installDir = '__INSTALLDIR__'
 $svcName    = '__SVCNAME__'
-
 $result.InstallDirExists = Test-Path -LiteralPath $installDir
-
 $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
 if ($svc) {
     $result.ServiceExists = $true
@@ -237,15 +217,24 @@ if ($svc) {
     } catch { $result.ServiceStartType = 'Unknown' }
 }
 
+[PSCustomObject]$result | ConvertTo-Json -Compress
+'@
+
+$Template_VersionAndReboot = @'
+$result = [ordered]@{
+    Version       = $null
+    VersionSource = $null
+    RebootPending = $false
+}
+
+$installDir = '__INSTALLDIR__'
+
 $versionFile = Join-Path $installDir 'etc\splunk.version'
 if (Test-Path -LiteralPath $versionFile) {
     try {
         $content = Get-Content -LiteralPath $versionFile -ErrorAction Stop
         $verLine = $content | Where-Object { $_ -match '^VERSION\s*=\s*(.+)$' }
-        if ($verLine) {
-            $result.Version = $Matches[1].Trim()
-            $result.VersionSource = 'VersionFile'
-        }
+        if ($verLine) { $result.Version = $Matches[1].Trim(); $result.VersionSource = 'VersionFile' }
     } catch {}
 }
 
@@ -258,10 +247,7 @@ if (-not $result.Version) {
         $app = Get-ItemProperty -Path $uninstallKeys -ErrorAction SilentlyContinue |
             Where-Object { $_.DisplayName -like 'SplunkForwarder*' -or $_.DisplayName -like '*Splunk Universal Forwarder*' } |
             Select-Object -First 1
-        if ($app -and $app.DisplayVersion) {
-            $result.Version = $app.DisplayVersion
-            $result.VersionSource = 'Registry'
-        }
+        if ($app -and $app.DisplayVersion) { $result.Version = $app.DisplayVersion; $result.VersionSource = 'Registry' }
     } catch {}
 }
 
@@ -270,15 +256,10 @@ if (-not $result.Version) {
     if (Test-Path -LiteralPath $splunkExe) {
         try {
             $verOut = & $splunkExe version --accept-license 2>$null
-            if ($verOut -match '([0-9]+\.[0-9]+\.[0-9]+)') {
-                $result.Version = $Matches[1]
-                $result.VersionSource = 'SplunkExe'
-            }
+            if ($verOut -match '([0-9]+\.[0-9]+\.[0-9]+)') { $result.Version = $Matches[1]; $result.VersionSource = 'SplunkExe' }
         } catch {}
     }
 }
-
-$result.Installed = [bool]($result.ServiceExists -or $result.InstallDirExists -or $result.Version)
 
 try {
     if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { $result.RebootPending = $true }
@@ -351,15 +332,16 @@ try {
 
 #region ======================= VM READINESS / DETECTION =======================
 
-function Get-VMReadinessAndSplunkStatus {
+function Invoke-GuestJsonQuery {
     param(
         [Parameter(Mandatory)] $VM,
-        [Parameter(Mandatory)] [System.Management.Automation.PSCredential] $GuestCredential
+        [Parameter(Mandatory)] [System.Management.Automation.PSCredential] $GuestCredential,
+        [Parameter(Mandatory)] [string] $ScriptText,
+        [int] $TimeoutSeconds = 60
     )
 
-    $script = $Template_Readiness.Replace('__INSTALLDIR__', $SplunkInstallDir).Replace('__SVCNAME__', $SplunkServiceName)
     $r = Invoke-GuestScriptWithTimeout -VM $VM -GuestCredential $GuestCredential -ScriptType Powershell `
-        -ScriptText $script -TimeoutSeconds $QuickGuestOpTimeoutSec
+        -ScriptText $ScriptText -TimeoutSeconds $TimeoutSeconds
 
     if (-not $r.Success) {
         return [PSCustomObject]@{ Success = $false; ErrorMessage = $r.ErrorMessage; Status = $null; RawOutput = $r.ScriptOutput }
@@ -372,7 +354,7 @@ function Get-VMReadinessAndSplunkStatus {
     if ([string]::IsNullOrWhiteSpace($r.ScriptOutput)) {
         return [PSCustomObject]@{
             Success      = $false
-            ErrorMessage = 'Guest script produced no output at all (it may have crashed or hung before finishing - check for a non-terminating step that never returns).'
+            ErrorMessage = 'Guest script produced no output at all (it may have crashed, hung, or the script text was too large for the guest-ops channel).'
             Status       = $null
             RawOutput    = $r.ScriptOutput
         }
@@ -384,6 +366,44 @@ function Get-VMReadinessAndSplunkStatus {
     } catch {
         [PSCustomObject]@{ Success = $false; ErrorMessage = "Could not parse guest status output: $($_.Exception.Message)"; Status = $null; RawOutput = $r.ScriptOutput }
     }
+}
+
+function Get-VMReadinessAndSplunkStatus {
+    param(
+        [Parameter(Mandatory)] $VM,
+        [Parameter(Mandatory)] [System.Management.Automation.PSCredential] $GuestCredential
+    )
+
+    $coreScript = $Template_ReadinessCore.Replace('__INSTALLDIR__', $SplunkInstallDir).Replace('__SVCNAME__', $SplunkServiceName)
+    $core = Invoke-GuestJsonQuery -VM $VM -GuestCredential $GuestCredential -ScriptText $coreScript -TimeoutSeconds $QuickGuestOpTimeoutSec
+
+    if (-not $core.Success) {
+        return [PSCustomObject]@{ Success = $false; ErrorMessage = $core.ErrorMessage; Status = $null; RawOutput = $core.RawOutput }
+    }
+
+    $verScript = $Template_VersionAndReboot.Replace('__INSTALLDIR__', $SplunkInstallDir)
+    $ver = Invoke-GuestJsonQuery -VM $VM -GuestCredential $GuestCredential -ScriptText $verScript -TimeoutSeconds $QuickGuestOpTimeoutSec
+
+    if (-not $ver.Success) {
+        return [PSCustomObject]@{ Success = $false; ErrorMessage = $ver.ErrorMessage; Status = $null; RawOutput = $ver.RawOutput }
+    }
+
+    $merged = [PSCustomObject]@{
+        UserName         = $core.Status.UserName
+        IsAdmin          = $core.Status.IsAdmin
+        IsAdminMethod    = $core.Status.IsAdminMethod
+        IsAdminError     = $core.Status.IsAdminError
+        InstallDirExists = $core.Status.InstallDirExists
+        ServiceExists    = $core.Status.ServiceExists
+        ServiceStatus    = $core.Status.ServiceStatus
+        ServiceStartType = $core.Status.ServiceStartType
+        Version          = $ver.Status.Version
+        VersionSource    = $ver.Status.VersionSource
+        RebootPending    = $ver.Status.RebootPending
+        Installed        = [bool]($core.Status.ServiceExists -or $core.Status.InstallDirExists -or $ver.Status.Version)
+    }
+
+    [PSCustomObject]@{ Success = $true; ErrorMessage = $null; Status = $merged; RawOutput = "$($core.RawOutput) | $($ver.RawOutput)" }
 }
 
 #endregion ============================================================
