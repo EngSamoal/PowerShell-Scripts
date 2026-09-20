@@ -179,8 +179,13 @@ $result = [ordered]@{
 try {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     $result.UserName = $id.Name
-    $wp = New-Object Security.Principal.WindowsPrincipal($id)
-    $result.IsAdmin = $wp.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    # IsInRole(Administrator) checks whether the CURRENT TOKEN IS ELEVATED, not group membership -
+    # under UAC, any admin account other than the literal built-in "Administrator" gets a filtered,
+    # non-elevated token by default and would wrongly read as "not admin" here. Check the
+    # Administrators group SID (S-1-5-32-544) directly instead, which reflects real membership
+    # regardless of token elevation/filtering state.
+    $adminSid = 'S-1-5-32-544'
+    $result.IsAdmin = [bool]($id.Groups | Where-Object { $_.Value -eq $adminSid })
 } catch {}
 
 $installDir = '__INSTALLDIR__'
