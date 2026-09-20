@@ -21,6 +21,11 @@
 
 #region ======================= CONFIGURATION =======================
 
+# Bump this on every change and check it against the version quoted in chat before trusting a
+# run's results - prints as the very first line of output so a stale cached copy is always
+# immediately obvious, instead of silently re-running old logic.
+$ScriptBuild = '2026.09.20-5'
+
 # Splunk version this fleet must be running after this script completes.
 [version]$RequiredSplunkVersion = '10.4.2'
 
@@ -477,6 +482,7 @@ function Invoke-SplunkInstallProcedure {
 
 #region ======================= MAIN =======================
 
+Write-Host "ScriptBuild: $ScriptBuild" -ForegroundColor Magenta
 Write-Host "`n=== Splunk Universal Forwarder Deployment (SEVEN configuration) ===" -ForegroundColor Cyan
 Write-Host "Required version: $RequiredSplunkVersion`n"
 
