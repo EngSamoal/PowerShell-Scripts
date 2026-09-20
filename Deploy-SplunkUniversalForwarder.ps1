@@ -24,7 +24,7 @@
 # Bump this on every change and check it against the version quoted in chat before trusting a
 # run's results - prints as the very first line of output so a stale cached copy is always
 # immediately obvious, instead of silently re-running old logic.
-$ScriptBuild = '2026.09.20-8'
+$ScriptBuild = '2026.09.20-9'
 
 # Splunk version this fleet must be running after this script completes.
 [version]$RequiredSplunkVersion = '10.4.2'
@@ -271,27 +271,34 @@ try {
 [PSCustomObject]$result | ConvertTo-Json -Compress
 '@
 
+# NOTE: Invoke-VMScript's -ScriptType Bat flattens multi-line batch text onto one logical line
+# joined by '&' - confirmed via live testing, which returned the literal cmd.exe error
+# "& was unexpected at this time." A parenthesized "if not exist (...)" block breaks under that
+# flattening (the closing ')' immediately followed by '&' is a known cmd.exe parsing trap).
+# Rewritten below using goto/labels instead of parentheses to avoid it entirely.
 $Template_RunInstaller = @'
 @echo off
 set "INSTALLER=__INSTALLER_PATH__"
 set "IARGS=__INSTALLER_ARGS__"
-if not exist "%INSTALLER%" (
-    echo INSTALLER_MISSING
-    exit /b 9009
-)
+if not exist "%INSTALLER%" goto :missing
 "%INSTALLER%" %IARGS%
 echo INSTALLER_EXITCODE=%ERRORLEVEL%
+goto :eof
+:missing
+echo INSTALLER_MISSING
+exit /b 9009
 '@
 
 $Template_RunPostInstall = @'
 @echo off
 set "POSTBAT=__POSTBAT_PATH__"
-if not exist "%POSTBAT%" (
-    echo POSTBAT_MISSING
-    exit /b 9009
-)
+if not exist "%POSTBAT%" goto :missing
 "%POSTBAT%"
 echo POSTBAT_EXITCODE=%ERRORLEVEL%
+goto :eof
+:missing
+echo POSTBAT_MISSING
+exit /b 9009
 '@
 
 $Template_EnsureAutoStart = @'
