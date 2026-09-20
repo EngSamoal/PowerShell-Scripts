@@ -24,7 +24,7 @@
 # Bump this on every change and check it against the version quoted in chat before trusting a
 # run's results - prints as the very first line of output so a stale cached copy is always
 # immediately obvious, instead of silently re-running old logic.
-$ScriptBuild = '2026.09.20-5'
+$ScriptBuild = '2026.09.20-6'
 
 # Splunk version this fleet must be running after this script completes.
 [version]$RequiredSplunkVersion = '10.4.2'
@@ -171,6 +171,8 @@ $Template_Readiness = @'
 $result = [ordered]@{
     UserName         = $null
     IsAdmin          = $false
+    IsAdminMethod    = $null
+    IsAdminError     = $null
     InstallDirExists = $false
     ServiceExists    = $false
     ServiceStatus    = $null
@@ -184,14 +186,49 @@ $result = [ordered]@{
 try {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     $result.UserName = $id.Name
-    # IsInRole(Administrator) checks whether the CURRENT TOKEN IS ELEVATED, not group membership -
-    # under UAC, any admin account other than the literal built-in "Administrator" gets a filtered,
-    # non-elevated token by default and would wrongly read as "not admin" here. Check the
-    # Administrators group SID (S-1-5-32-544) directly instead, which reflects real membership
-    # regardless of token elevation/filtering state.
+
+    # Diagnostic pass: try three independent ways to determine admin membership and record which
+    # one(s) succeeded/failed and why, instead of silently trusting one method. A prior fix
+    # (checking the Administrators SID in $id.Groups) still reported IsAdmin=$false against a
+    # confirmed local admin account, so this run needs to show WHY rather than guess again.
     $adminSid = 'S-1-5-32-544'
-    $result.IsAdmin = [bool]($id.Groups | Where-Object { $_.Value -eq $adminSid })
-} catch {}
+    $checks = [ordered]@{}
+
+    try {
+        $checks.GroupsSidMatch = [bool]($id.Groups | Where-Object { $_.Value -eq $adminSid })
+    } catch {
+        $checks.GroupsSidMatch = "ERROR: $($_.Exception.Message)"
+    }
+
+    try {
+        $wp = New-Object Security.Principal.WindowsPrincipal($id)
+        $checks.IsInRoleAdministrator = $wp.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch {
+        $checks.IsInRoleAdministrator = "ERROR: $($_.Exception.Message)"
+    }
+
+    try {
+        $localAdmins = @(Get-LocalGroupMember -Group 'Administrators' -ErrorAction Stop)
+        $shortName = $id.Name -replace '^.*\\', ''
+        $checks.LocalGroupMemberMatch = [bool]($localAdmins | Where-Object {
+            ($_.Name -replace '^.*\\', '') -eq $shortName
+        })
+    } catch {
+        $checks.LocalGroupMemberMatch = "ERROR: $($_.Exception.Message)"
+    }
+
+    $result.IsAdminMethod = ($checks.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join '; '
+
+    # Treat as admin if ANY method affirmatively says so (defensive OR, since we do not yet know
+    # which method is reliable in this environment).
+    $result.IsAdmin = [bool](
+        ($checks.GroupsSidMatch -eq $true) -or
+        ($checks.IsInRoleAdministrator -eq $true) -or
+        ($checks.LocalGroupMemberMatch -eq $true)
+    )
+} catch {
+    $result.IsAdminError = $_.Exception.Message
+}
 
 $installDir = '__INSTALLDIR__'
 $svcName    = '__SVCNAME__'
@@ -540,6 +577,12 @@ foreach ($vmName in $vmNames) {
         $status = $detect.Status
         $row.GuestCredentialStatus = if ($status.IsAdmin) { 'Valid (Administrator)' } else { 'Valid (NOT Administrator - install will likely fail)' }
         $row.RebootRequired = [bool]$status.RebootPending
+
+        # Diagnostic - print regardless of outcome so admin-detection results are visible in the
+        # console immediately, not just in the CSV.
+        Write-Host "  [diag] Guest user: $($status.UserName)" -ForegroundColor DarkGray
+        Write-Host "  [diag] Admin checks: $($status.IsAdminMethod)" -ForegroundColor DarkGray
+        if ($status.IsAdminError) { Write-Host "  [diag] Admin check error: $($status.IsAdminError)" -ForegroundColor DarkGray }
 
         $row.SplunkInstalledBefore = [bool]$status.Installed
         $row.PreviousVersion = if ($status.Version) { $status.Version } else { 'None' }
