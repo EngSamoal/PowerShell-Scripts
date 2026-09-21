@@ -47,7 +47,7 @@ param(
 # Bump this on every change and check it against the version quoted in chat before trusting a
 # run's results - prints as the very first line of output so a stale cached copy is always
 # immediately obvious, instead of silently re-running old logic.
-$ScriptBuild = '2026.09.21-4'
+$ScriptBuild = '2026.09.21-5'
 
 # Splunk version this fleet must be running after this script completes.
 [version]$RequiredSplunkVersion = '10.4.2'
@@ -757,12 +757,12 @@ function Build-SplunkDashboardHtml {
   body{margin:0;background:var(--bg);color:var(--ink);
        font-family:-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;line-height:1.45;}
   .wrap{max-width:1280px;margin:0 auto;padding:28px;}
-  header.hero{background:linear-gradient(135deg,#0F2A43 0%,#1D4E79 100%);color:#fff;
-       border-radius:14px;padding:34px 40px;box-shadow:0 10px 30px rgba(15,42,67,.18);}
+  header.hero{background:linear-gradient(135deg,#191919 0%,#3A2410 60%,#F1611D 100%);color:#fff;
+       border-radius:14px;padding:34px 40px;box-shadow:0 10px 30px rgba(0,0,0,.25);}
   .report-h1{font-size:32px;font-weight:800;letter-spacing:.4px;margin:0;line-height:1.15;}
-  .report-sub{font-size:16px;font-weight:600;margin:10px 0 0;color:#DCE7F2;}
+  .report-sub{font-size:16px;font-weight:600;margin:10px 0 0;color:#F2D9C9;}
   .mode-badge{display:inline-block;margin-top:14px;padding:5px 14px;border-radius:20px;
-       font-size:12px;font-weight:800;letter-spacing:.5px;text-transform:uppercase;background:#C77700;color:#fff;}
+       font-size:12px;font-weight:800;letter-spacing:.5px;text-transform:uppercase;background:#fff;color:#3A2410;}
   .kpi{display:grid;grid-template-columns:repeat(8,1fr);gap:14px;margin:22px 0 10px;}
   .kpi-card{position:relative;background:#fff;border:1px solid var(--line);border-radius:12px;
        padding:16px 14px 14px;overflow:hidden;box-shadow:0 2px 6px rgba(31,41,51,.04);}
@@ -776,7 +776,7 @@ function Build-SplunkDashboardHtml {
   .ex-table th{background:#0F2A43;color:#fff;text-align:left;padding:9px 10px;font-weight:600;white-space:nowrap;}
   .ex-table td{padding:8px 10px;border-bottom:1px solid var(--line);}
   .ex-table tr:nth-child(even){background:#FAFBFD;}
-  .badge{display:inline-block;padding:3px 10px;border-radius:20px;font-size:11.5px;font-weight:700;color:#fff;white-space:nowrap;}
+  .badge{display:inline-block;width:120px;text-align:center;padding:4px 0;border-radius:4px;font-size:11.5px;font-weight:700;color:#fff;white-space:nowrap;}
   .badge.b-green{background:#1F8A4C;} .badge.b-red{background:#C0392B;} .badge.b-amber{background:#C77700;} .badge.b-grey{background:#6B7683;}
   .notes-cell{color:var(--muted);font-size:11.5px;max-width:260px;}
   footer{margin-top:24px;font-size:12px;color:var(--muted);}
@@ -845,7 +845,7 @@ $css
 <div class="wrap">
 
   <header class="hero">
-    <h1 class="report-h1">Splunk Universal Forwarder Deployment (SEVEN configuration)</h1>
+    <h1 class="report-h1">Splunk Universal Forwarder Deployment</h1>
     <p class="report-sub">Required version: $safeVersion &nbsp;|&nbsp; Generated: $genStamp &nbsp;|&nbsp; Script build: $safeBuild</p>
     $modeBadge
   </header>
