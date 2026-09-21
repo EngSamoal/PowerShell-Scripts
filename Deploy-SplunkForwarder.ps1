@@ -39,7 +39,7 @@
 # Bump this on every change and check it against the version quoted in chat before trusting a
 # run's results - prints as the very first line of output so a stale cached copy is always
 # immediately obvious, instead of silently re-running old logic.
-$ScriptBuild = '2026.09.21-2'
+$ScriptBuild = '2026.09.21-3'
 
 # Splunk version this fleet must be running after this script completes.
 [version]$RequiredSplunkVersion = '10.4.2'
@@ -93,6 +93,7 @@ function New-ReportRow {
         RebootRequired        = $false
         Result                = ''
         FailureReason         = ''
+        Notes                 = ''
         StartTime             = Get-Date
         EndTime               = $null
         Duration              = ''
@@ -798,6 +799,8 @@ foreach ($vmName in $vmNames) {
                 $row.Action = 'Manual Review'
                 $row.Result = 'Newer Version Detected - Manual Review'
                 $row.FinalVersion = $status.Version
+                $row.Notes = "Installed version $($status.Version) is NEWER than required $RequiredSplunkVersion - not downgrading. Manual review needed."
+                Write-Host "  [notice] $($row.Notes)" -ForegroundColor Yellow
             }
             elseif ($installedVersion -eq $RequiredSplunkVersion) {
                 if ($status.ServiceExists -and $status.ServiceStatus -eq 'Running') {
@@ -814,6 +817,8 @@ foreach ($vmName in $vmNames) {
             else {
                 $row.Action = 'Upgraded'
                 $needsProcedure = $true
+                $row.Notes = "Older version detected (installed: $($status.Version), required: $RequiredSplunkVersion) - upgrading."
+                Write-Host "  [notice] $($row.Notes)" -ForegroundColor Yellow
             }
         } else {
             $row.Action = 'Installed'
@@ -879,6 +884,7 @@ foreach ($vmName in $vmNames) {
             default         { 'Green' }
         }
         Write-Host "Result: $($row.Result)  |  Action: $($row.Action)  |  Version: $($row.FinalVersion)$(if(-not $row.FinalVersion){$row.PreviousVersion})" -ForegroundColor $color
+        if ($row.Notes) { Write-Host "Notes: $($row.Notes)" -ForegroundColor Yellow }
         if ($row.FailureReason) { Write-Host "Reason: $($row.FailureReason)" -ForegroundColor Red }
         if ($row.RebootRequired) { Write-Host "REBOOT REQUIRED on $vmName - not rebooting automatically." -ForegroundColor Yellow }
     }
@@ -889,15 +895,20 @@ $results | Export-Csv -Path $ReportPath -NoTypeInformation -Encoding UTF8
 Write-Host "`nReport written to: $ReportPath" -ForegroundColor Cyan
 
 # Summary.
+# @(...) around every Where-Object result is required - piping a SINGLE matching object through
+# Where-Object in Windows PowerShell 5.1 returns a bare object, not a 1-element array, and .Count
+# on a bare object is $null (not 1), printing blank instead of a number. Confirmed live: with
+# exactly one Already Compliant VM, that line printed nothing at all. Same bug class already
+# documented in this repo's CLAUDE.md for VMware_Weekly_HealthCheck.ps1.
 $summary = [ordered]@{
-    'Total VMs'                    = $results.Count
-    'Already Compliant'            = ($results | Where-Object { $_.Result -eq 'Already Compliant' }).Count
-    'Successfully Installed'       = ($results | Where-Object { $_.Result -eq 'Install Successful' }).Count
-    'Successfully Upgraded'        = ($results | Where-Object { $_.Result -eq 'Upgrade Successful' }).Count
-    'Newer Version / Manual Review' = ($results | Where-Object { $_.Action -eq 'Manual Review' }).Count
-    'Failed'                       = ($results | Where-Object { $_.Action -eq 'Failed' }).Count
-    'Skipped'                      = ($results | Where-Object { $_.Action -eq 'Skipped' -and $_.Result -ne 'Already Compliant' }).Count
-    'Reboot Required (not performed)' = ($results | Where-Object { $_.RebootRequired }).Count
+    'Total VMs'                    = @($results).Count
+    'Already Compliant'            = @($results | Where-Object { $_.Result -eq 'Already Compliant' }).Count
+    'Successfully Installed'       = @($results | Where-Object { $_.Result -eq 'Install Successful' }).Count
+    'Successfully Upgraded'        = @($results | Where-Object { $_.Result -eq 'Upgrade Successful' }).Count
+    'Newer Version / Manual Review' = @($results | Where-Object { $_.Action -eq 'Manual Review' }).Count
+    'Failed'                       = @($results | Where-Object { $_.Action -eq 'Failed' }).Count
+    'Skipped'                      = @($results | Where-Object { $_.Action -eq 'Skipped' -and $_.Result -ne 'Already Compliant' }).Count
+    'Reboot Required (not performed)' = @($results | Where-Object { $_.RebootRequired }).Count
 }
 
 Write-Host "`n=== Summary ===" -ForegroundColor Cyan
