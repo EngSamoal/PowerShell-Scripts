@@ -1,20 +1,16 @@
 <#
 .SYNOPSIS
     Removes VM snapshots whose name matches or contains the given text.
+    Assumes an active PowerCLI session (Connect-VIServer already run).
 
 .EXAMPLE
-    ./Remove-VMSnapshots-PowerCli.ps1 -vCenter vcenter01.domain.local -NameMatch "Pre-Patch"
+    ./Remove-VMSnapshots-PowerCli.ps1 -NameMatch "Pre-Patch"
 #>
 
 param(
     [Parameter(Mandatory)]
-    [string]$vCenter,
-
-    [Parameter(Mandatory)]
     [string]$NameMatch
 )
-
-Connect-VIServer -Server $vCenter | Out-Null
 
 $snapshots = Get-VM | Get-Snapshot | Where-Object { $_.Name -like "*$NameMatch*" }
 
@@ -27,5 +23,3 @@ if (-not $snapshots) {
         Remove-Snapshot -Snapshot $snap -Confirm:$true
     }
 }
-
-Disconnect-VIServer -Server $vCenter -Confirm:$false
