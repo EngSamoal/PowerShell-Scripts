@@ -47,7 +47,7 @@ param(
 # Bump this on every change and check it against the version quoted in chat before trusting a
 # run's results - prints as the very first line of output so a stale cached copy is always
 # immediately obvious, instead of silently re-running old logic.
-$ScriptBuild = '2026.09.21-6'
+$ScriptBuild = '2026.09.21-7'
 
 # Splunk version this fleet must be running after this script completes.
 [version]$RequiredSplunkVersion = '10.4.2'
@@ -765,9 +765,11 @@ function Build-SplunkDashboardHtml {
        font-size:12px;font-weight:800;letter-spacing:.5px;text-transform:uppercase;background:#fff;color:#3A2410;}
   .kpi{display:grid;grid-template-columns:repeat(8,1fr);gap:14px;margin:22px 0 10px;}
   .kpi-card{position:relative;background:#fff;border:1px solid var(--line);border-radius:12px;
-       padding:16px 14px 14px;overflow:hidden;box-shadow:0 2px 6px rgba(31,41,51,.04);}
+       padding:16px 14px 14px;overflow:hidden;box-shadow:0 2px 6px rgba(31,41,51,.04);
+       display:flex;flex-direction:column;}
   .kpi-accent{position:absolute;top:0;left:0;right:0;height:5px;}
-  .kpi-label{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);}
+  .kpi-label{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);
+       min-height:28px;line-height:14px;}
   .kpi-value{font-size:30px;font-weight:800;margin-top:6px;}
   .panel{background:#fff;border:1px solid var(--line);border-radius:12px;padding:20px 22px;margin-top:18px;
        box-shadow:0 2px 6px rgba(31,41,51,.04);}
@@ -1072,7 +1074,9 @@ foreach ($vmName in $vmNames) {
         $row.FailureReason = $_.Exception.Message
     } finally {
         $row.EndTime = Get-Date
-        $row.Duration = [string]([timespan]($row.EndTime - $row.StartTime))
+        # hh\:mm\:ss format only - a plain [timespan] ToString() includes fractional seconds
+        # (e.g. "00:03:12.4567890"), which is noise in both the report and the dashboard.
+        $row.Duration = ($row.EndTime - $row.StartTime).ToString('hh\:mm\:ss')
         $results.Add($row)
 
         $color = switch ($row.Action) {
