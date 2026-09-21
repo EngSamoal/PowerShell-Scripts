@@ -47,7 +47,7 @@ param(
 # Bump this on every change and check it against the version quoted in chat before trusting a
 # run's results - prints as the very first line of output so a stale cached copy is always
 # immediately obvious, instead of silently re-running old logic.
-$ScriptBuild = '2026.09.21-7'
+$ScriptBuild = '2026.09.21-8'
 
 # Splunk version this fleet must be running after this script completes.
 [version]$RequiredSplunkVersion = '10.4.2'
@@ -100,7 +100,6 @@ function New-ReportRow {
         SevenPostInstallStatus = ''
         SplunkServiceStatus   = 'Unknown'
         FinalVersion          = ''
-        RebootRequired        = $false
         Result                = ''
         FailureReason         = ''
         Notes                 = ''
@@ -110,8 +109,8 @@ function New-ReportRow {
     }
 }
 
-# Appends to $row.Notes rather than overwriting, so multiple independent notes (e.g. a
-# pre-existing pending reboot AND an upgrade decision) both survive on the same row.
+# Appends to $row.Notes rather than overwriting, so multiple independent notes on the same VM
+# (e.g. an upgrade decision plus a later validation detail) all survive on the same row.
 function Add-RowNote {
     param([Parameter(Mandatory)] $Row, [Parameter(Mandatory)] [string] $Note)
     $Row.Notes = if ($Row.Notes) { "$($Row.Notes) | $Note" } else { $Note }
@@ -271,11 +270,10 @@ if ($svc) {
 [PSCustomObject]$result | ConvertTo-Json -Compress
 '@
 
-$Template_VersionAndReboot = @'
+$Template_VersionInfo = @'
 $result = [ordered]@{
     Version       = $null
     VersionSource = $null
-    RebootPending = $false
 }
 
 $installDir = '__INSTALLDIR__'
@@ -311,13 +309,6 @@ if (-not $result.Version) {
         } catch {}
     }
 }
-
-try {
-    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { $result.RebootPending = $true }
-    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { $result.RebootPending = $true }
-    $pfro = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name 'PendingFileRenameOperations' -ErrorAction SilentlyContinue
-    if ($pfro) { $result.RebootPending = $true }
-} catch {}
 
 [PSCustomObject]$result | ConvertTo-Json -Compress
 '@
@@ -462,7 +453,7 @@ function Get-VMReadinessAndSplunkStatus {
         return [PSCustomObject]@{ Success = $false; ErrorMessage = $core.ErrorMessage; Status = $null; RawOutput = $core.RawOutput }
     }
 
-    $verScript = $Template_VersionAndReboot.Replace('__INSTALLDIR__', $SplunkInstallDir)
+    $verScript = $Template_VersionInfo.Replace('__INSTALLDIR__', $SplunkInstallDir)
     $ver = Invoke-GuestJsonQuery -VM $VM -GuestCredential $GuestCredential -ScriptText $verScript -TimeoutSeconds $QuickGuestOpTimeoutSec
 
     if (-not $ver.Success) {
@@ -480,7 +471,6 @@ function Get-VMReadinessAndSplunkStatus {
         ServiceStartType = $core.Status.ServiceStartType
         Version          = $ver.Status.Version
         VersionSource    = $ver.Status.VersionSource
-        RebootPending    = $ver.Status.RebootPending
         Installed        = [bool]($core.Status.ServiceExists -or $core.Status.InstallDirExists -or $ver.Status.Version)
     }
 
@@ -607,7 +597,6 @@ function Invoke-SplunkInstallProcedure {
         FailureReason       = ''
         InstallerExitCode   = ''
         SevenPostInstallStatus = ''
-        RebootRequired      = $false
     }
 
     $installerLeaf  = Split-Path -Path $SplunkInstallerPath -Leaf
@@ -655,7 +644,10 @@ function Invoke-SplunkInstallProcedure {
     }
     if ($installResult.ScriptOutput -match 'INSTALLER_EXITCODE=(-?\d+)') {
         $out.InstallerExitCode = $Matches[1]
-        if ($Matches[1] -eq '3010') { $out.RebootRequired = $true }
+        if ($Matches[1] -eq '3010') {
+            # 3010 = success, reboot required by Windows Installer - treated as success here since
+            # reboot handling is intentionally out of scope for this script.
+        }
         elseif ($Matches[1] -ne '0') {
             $out.FailureReason = "Installer returned non-zero exit code $($Matches[1]). $(Get-RemoteMsiLogTail -VM $VM -GuestCredential $GuestCredential -LogPath $remoteMsiLog)"
             return $out
@@ -684,7 +676,7 @@ function Invoke-SplunkInstallProcedure {
     }
     if ($postResult.ScriptOutput -match 'POSTBAT_EXITCODE=(-?\d+)') {
         $code = $Matches[1]
-        if ($code -eq '3010') { $out.RebootRequired = $true; $out.SevenPostInstallStatus = "Completed (ExitCode $code, reboot pending)" }
+        if ($code -eq '3010') { $out.SevenPostInstallStatus = "Completed (ExitCode $code)" }
         elseif ($code -eq '0') { $out.SevenPostInstallStatus = 'Completed (ExitCode 0)' }
         else {
             $out.SevenPostInstallStatus = "Completed with non-zero ExitCode $code"
@@ -798,7 +790,6 @@ function Build-SplunkDashboardHtml {
     $kpi += Get-KpiCard 'Failed' $Summary['Failed'] '#C0392B'
     $kpi += Get-KpiCard 'Manual Review' $Summary['Newer Version / Manual Review'] '#C77700'
     $kpi += Get-KpiCard 'Skipped' $Summary['Skipped'] '#6B7683'
-    $kpi += Get-KpiCard 'Reboot Pending' $Summary['Reboot Required (not performed)'] '#C77700'
 
     function Get-StatusBadgeClass($row) {
         if ($row.Action -eq 'Failed') { return 'b-red' }
@@ -811,7 +802,6 @@ function Build-SplunkDashboardHtml {
     $rows = ''
     foreach ($r in $Results) {
         $badgeClass = Get-StatusBadgeClass $r
-        $rebootTxt = if ($r.RebootRequired) { '<span class="badge b-amber">Yes</span>' } else { 'No' }
         $notes = if ($r.FailureReason) { $r.FailureReason } else { $r.Notes }
         $rows += "          <tr>`n" +
             "            <td>$(ConvertTo-HtmlSafe $r.VMName)</td>`n" +
@@ -821,7 +811,6 @@ function Build-SplunkDashboardHtml {
             "            <td>$(ConvertTo-HtmlSafe $r.PreviousVersion)</td>`n" +
             "            <td>$(ConvertTo-HtmlSafe $r.FinalVersion)</td>`n" +
             "            <td>$(ConvertTo-HtmlSafe $r.SplunkServiceStatus)</td>`n" +
-            "            <td>$rebootTxt</td>`n" +
             "            <td class=`"notes-cell`">$(ConvertTo-HtmlSafe $notes)</td>`n" +
             "            <td>$(ConvertTo-HtmlSafe $r.Duration)</td>`n" +
             "          </tr>`n"
@@ -861,7 +850,7 @@ $kpi  </div>
         <tr>
           <th>VM Name</th><th>Power State</th><th>Action</th><th>Result</th>
           <th>Previous Version</th><th>Final Version</th><th>Service Status</th>
-          <th>Reboot Required</th><th>Notes / Failure Reason</th><th>Duration</th>
+          <th>Notes / Failure Reason</th><th>Duration</th>
         </tr>
       </thead>
       <tbody>
@@ -871,9 +860,7 @@ $rows      </tbody>
   </div>
 
   <footer>
-    Generated by Deploy-SplunkUniversalForwarder.ps1. Reboot Required flags reflect a generic
-    Windows pending-reboot check and are not necessarily caused by this run - see the Notes
-    column for each VM.
+    Generated by Deploy-SplunkUniversalForwarder.ps1.
   </footer>
 
 </div>
@@ -953,15 +940,6 @@ foreach ($vmName in $vmNames) {
         }
         $status = $detect.Status
         $row.GuestCredentialStatus = if ($status.IsAdmin) { 'Valid (Administrator)' } else { 'Valid (NOT Administrator - install will likely fail)' }
-        # Track whether this was pending BEFORE we touched the VM, so RebootRequired can be
-        # explained honestly - this check is generic Windows reboot-pending detection (Windows
-        # Update, Component Based Servicing, PendingFileRenameOperations), not Splunk-specific;
-        # Splunk installs do not themselves require a reboot in normal circumstances.
-        $preExistingRebootPending = [bool]$status.RebootPending
-        $row.RebootRequired = $preExistingRebootPending
-        if ($preExistingRebootPending) {
-            Add-RowNote -Row $row -Note "Reboot already pending on this VM BEFORE this script ran (unrelated to Splunk - likely Windows Update or a prior change)."
-        }
 
         # Diagnostic - print regardless of outcome so admin-detection results are visible in the
         # console immediately, not just in the CSV.
@@ -1014,8 +992,16 @@ foreach ($vmName in $vmNames) {
         }
 
         if ($needsProcedure -and $CheckOnly) {
-            # Audit only - report what WOULD happen without touching the VM.
-            $row.Result = "Check Only - Would $($row.Action)"
+            # Audit only - report what WOULD happen without touching the VM. Action must use
+            # future-tense wording here ("Would Install"), not the past-tense 'Installed'/
+            # 'Upgraded' labels used for a real run - otherwise the report reads as if the
+            # change already happened when nothing was touched.
+            $row.Action = switch ($row.Action) {
+                'Installed' { 'Would Install' }
+                'Upgraded'  { 'Would Upgrade' }
+                default     { "Would $($row.Action)" }
+            }
+            $row.Result = "Check Only - $($row.Action)"
             if ($status.Version) { $row.FinalVersion = $status.Version }
             Add-RowNote -Row $row -Note 'CheckOnly mode: no changes made to this VM.'
         }
@@ -1027,10 +1013,6 @@ foreach ($vmName in $vmNames) {
             $procResult = Invoke-SplunkInstallProcedure -VM $vm -GuestCredential $guestCred
             $row.InstallerExitCode = $procResult.InstallerExitCode
             $row.SevenPostInstallStatus = $procResult.SevenPostInstallStatus
-            if ($procResult.RebootRequired -and -not $preExistingRebootPending) {
-                $row.RebootRequired = $true
-                Add-RowNote -Row $row -Note 'Reboot required - triggered by this installation/post-install step (exit code 3010).'
-            }
 
             if (-not $procResult.Success) {
                 $row.Action = 'Failed'
@@ -1047,10 +1029,6 @@ foreach ($vmName in $vmNames) {
                     $fs = $final.Status
                     $row.SplunkServiceStatus = $fs.ServiceStatus
                     $row.FinalVersion = $fs.Version
-                    if ($fs.RebootPending -and -not $preExistingRebootPending -and -not $row.RebootRequired) {
-                        $row.RebootRequired = $true
-                        Add-RowNote -Row $row -Note 'Reboot required - detected as pending only after this installation completed.'
-                    }
 
                     $finalVersionOk = $false
                     try { $finalVersionOk = ([version]$fs.Version -eq $RequiredSplunkVersion) } catch {}
@@ -1088,7 +1066,6 @@ foreach ($vmName in $vmNames) {
         Write-Host "Result: $($row.Result)  |  Action: $($row.Action)  |  Version: $($row.FinalVersion)$(if(-not $row.FinalVersion){$row.PreviousVersion})" -ForegroundColor $color
         if ($row.Notes) { Write-Host "Notes: $($row.Notes)" -ForegroundColor Yellow }
         if ($row.FailureReason) { Write-Host "Reason: $($row.FailureReason)" -ForegroundColor Red }
-        if ($row.RebootRequired) { Write-Host "REBOOT REQUIRED on $vmName - not rebooting automatically." -ForegroundColor Yellow }
     }
 }
 
@@ -1107,7 +1084,7 @@ Write-Host "`nReport written to: $ReportPath" -ForegroundColor Cyan
 # "Argument types do not match" ArgumentException on a later run) on this PowerShell 5.1 session.
 # A loop with integer counters has no pipeline/.Count ambiguity to hit at all.
 $totalVMs = 0; $alreadyCompliant = 0; $successInstalled = 0; $successUpgraded = 0
-$manualReview = 0; $failedCount = 0; $skippedCount = 0; $rebootCount = 0; $checkOnlyCount = 0
+$manualReview = 0; $failedCount = 0; $skippedCount = 0; $checkOnlyCount = 0
 
 foreach ($r in $results) {
     $totalVMs++
@@ -1118,7 +1095,6 @@ foreach ($r in $results) {
     elseif ($r.Action -eq 'Failed') { $failedCount++ }
     elseif ($r.Result -like 'Check Only*') { $checkOnlyCount++ }
     elseif ($r.Action -eq 'Skipped') { $skippedCount++ }
-    if ($r.RebootRequired) { $rebootCount++ }
 }
 
 $summary = [ordered]@{
@@ -1130,7 +1106,6 @@ $summary = [ordered]@{
     'Failed'                          = $failedCount
     'Skipped'                         = $skippedCount
     'Check Only (no changes made)'    = $checkOnlyCount
-    'Reboot Required (not performed)' = $rebootCount
 }
 
 Write-Host "`n=== Summary ===" -ForegroundColor Cyan
