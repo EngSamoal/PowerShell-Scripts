@@ -12,11 +12,26 @@
       - The Splunk UF installer and post_installation_Seven.bat present locally at the paths
         configured below.
 
-    IMPORTANT - installer arguments:
-      "UF splunk 10.4.2.EXE" is an IExpress self-extracting package (confirmed via its own /?
-      help text), so it takes IExpress's standard switches - notably /Q for quiet/unattended mode.
-      $SplunkInstallerArgs below is set to '/Q' accordingly. If a future installer build is NOT an
-      IExpress package, re-check its /? output before assuming /Q still applies.
+    IMPORTANT - installer approach changed after live testing:
+      "UF splunk 10.4.2.EXE" is an IExpress self-extracting wrapper. Live testing found it hangs
+      indefinitely (idle at 0% CPU, no MSI log ever created) when launched non-interactively via
+      VMware guest-ops - some self-extractors depend on shell/COM components that don't
+      initialize properly without an interactive desktop (Session 0 isolation). Verbose msiexec
+      logging confirmed msiexec never even started, so this is the wrapper's own extraction
+      hanging, not an MSI/UI problem.
+
+      Fix: bypass the wrapper entirely. Extract it once on the management machine using
+      IExpress's own extract-only mode:
+        & 'C:\Splunk_Install\UF splunk 10.4.2.EXE' /T:C:\Splunk_Install\_extracted /C
+      then point $SplunkInstallerPath (below) at the extracted .msi and this script runs
+      msiexec.exe directly against it - a native OS binary, not a custom wrapper - reproducing
+      the exact command found inside the wrapper's own install.bat.
+
+    SECURITY - MSI properties file:
+      install.bat's msiexec command includes SPLUNKPASSWORD, a credential value. That must never
+      be committed to this repo, so it is NOT hardcoded here - $SplunkMsiPropertiesPath below
+      points to a local file (same pattern as $GuestCredentialPath) containing the full MSI
+      property string, read at runtime and never written to disk by this script or logged.
 #>
 
 #region ======================= CONFIGURATION =======================
@@ -24,14 +39,15 @@
 # Bump this on every change and check it against the version quoted in chat before trusting a
 # run's results - prints as the very first line of output so a stale cached copy is always
 # immediately obvious, instead of silently re-running old logic.
-$ScriptBuild = '2026.09.20-13'
+$ScriptBuild = '2026.09.21-2'
 
 # Splunk version this fleet must be running after this script completes.
 [version]$RequiredSplunkVersion = '10.4.2'
 
 # Local paths on the management machine (where this script runs).
-$SplunkInstallerPath  = 'C:\Splunk_Install\UF splunk 10.4.2.EXE'         # <-- set to the real, full path
-$SplunkInstallerArgs  = '/Q'                                              # IExpress quiet/unattended switch (confirmed via installer's /? output)
+$SplunkInstallerPath  = 'C:\Splunk_Install\_extracted\SPLUNK~1.MSI'      # <-- the EXTRACTED .msi, not the EXE wrapper - see header comment
+$SplunkMsiPropertiesPath = 'C:\temp\splunk_msi_properties.txt'           # <-- local file (never committed) holding the MSI property string, e.g.:
+                                                                           #     AGREETOLICENSE=Yes LAUNCHSPLUNK=1 PRIVILEGEBACKUP=0 PRIVILEGESECURITY=0 USE_LOCAL_SYSTEM=1 SPLUNKUSERNAME=admin SPLUNKPASSWORD=<value>
 $PostInstallSevenPath = 'C:\Splunk_Install\post_installation_Seven.bat'
 $VmListPath           = 'C:\temp\vmlist.txt'
 $GuestCredentialPath  = 'C:\temp\wincred.xml'
@@ -92,10 +108,11 @@ function Test-LocalPrerequisites {
     $missing = @()
 
     foreach ($item in @(
-        @{ Path = $SplunkInstallerPath;  Label = 'Splunk UF installer' },
-        @{ Path = $PostInstallSevenPath; Label = 'post_installation_Seven.bat' },
-        @{ Path = $VmListPath;           Label = 'VM list file' },
-        @{ Path = $GuestCredentialPath;  Label = 'Guest credential XML' }
+        @{ Path = $SplunkInstallerPath;      Label = 'Splunk UF installer (.msi)' },
+        @{ Path = $SplunkMsiPropertiesPath;  Label = 'Splunk MSI properties file' },
+        @{ Path = $PostInstallSevenPath;     Label = 'post_installation_Seven.bat' },
+        @{ Path = $VmListPath;               Label = 'VM list file' },
+        @{ Path = $GuestCredentialPath;      Label = 'Guest credential XML' }
     )) {
         if (-not (Test-Path -LiteralPath $item.Path)) {
             $missing += "$($item.Label) not found: $($item.Path)"
@@ -114,6 +131,16 @@ function Test-LocalPrerequisites {
         foreach ($m in $missing) { Write-Host "PREREQUISITE FAILED: $m" -ForegroundColor Red }
         throw "One or more local prerequisites are missing. Aborting before touching any VM."
     }
+}
+
+# Reads the MSI property string from $SplunkMsiPropertiesPath at runtime - kept out of the script
+# itself (and out of git) since it contains SPLUNKPASSWORD. Never logged or written anywhere.
+function Get-SplunkMsiProperties {
+    $raw = (Get-Content -LiteralPath $SplunkMsiPropertiesPath -Raw -ErrorAction Stop).Trim()
+    if ([string]::IsNullOrWhiteSpace($raw)) {
+        throw "$SplunkMsiPropertiesPath is empty - it must contain the MSI property string (AGREETOLICENSE=Yes ... SPLUNKPASSWORD=<value>)."
+    }
+    return $raw
 }
 
 #endregion ============================================================
@@ -278,18 +305,21 @@ try {
 # one line either. Abandoning -ScriptType Bat entirely for anything beyond a single command.
 # These are now Powershell scripts that launch the target executable via .NET's Start-Process,
 # which hands back a real exit code without ever touching cmd.exe's batch parser.
+# Runs msiexec.exe directly against the extracted .msi - NOT the IExpress EXE wrapper, which live
+# testing proved hangs indefinitely under non-interactive VMware guest-ops (see header comment).
+# msiexec is a native OS binary, so this sidesteps that wrapper-specific problem entirely. Always
+# appends /quiet and /l*v (a verbose log at a known path) regardless of what's in the properties
+# string, so a real failure is diagnosable from the log rather than a silent hang.
 $Template_RunInstaller = @'
 $installer = '__INSTALLER_PATH__'
 $installerArgs = '__INSTALLER_ARGS__'
+$logPath = '__LOG_PATH__'
 if (-not (Test-Path -LiteralPath $installer)) {
     'INSTALLER_MISSING'
 } else {
     try {
-        if ([string]::IsNullOrWhiteSpace($installerArgs)) {
-            $proc = Start-Process -FilePath $installer -Wait -PassThru -ErrorAction Stop
-        } else {
-            $proc = Start-Process -FilePath $installer -ArgumentList $installerArgs -Wait -PassThru -ErrorAction Stop
-        }
+        $msiArgs = "/i `"$installer`" $installerArgs /quiet /l*v `"$logPath`""
+        $proc = Start-Process -FilePath 'msiexec.exe' -ArgumentList $msiArgs -Wait -PassThru -ErrorAction Stop
         "INSTALLER_EXITCODE=$($proc.ExitCode)"
     } catch {
         "INSTALLER_LAUNCH_ERROR: $($_.Exception.Message)"
@@ -433,6 +463,36 @@ function Get-VMReadinessAndSplunkStatus {
     [PSCustomObject]@{ Success = $true; ErrorMessage = $null; Status = $merged; RawOutput = "$($core.RawOutput) | $($ver.RawOutput)" }
 }
 
+$Template_GetFileTail = @'
+$path = '__PATH__'
+if (Test-Path -LiteralPath $path) {
+    (Get-Content -LiteralPath $path -Tail 25 -ErrorAction Stop) -join ' | '
+} else {
+    'LOG_NOT_FOUND'
+}
+'@
+
+# Best-effort: pulls the tail of the msiexec verbose log for a real diagnostic instead of a bare
+# exit code. Never throws - installer failure reporting must not itself fail the run.
+function Get-RemoteMsiLogTail {
+    param(
+        [Parameter(Mandatory)] $VM,
+        [Parameter(Mandatory)] [System.Management.Automation.PSCredential] $GuestCredential,
+        [Parameter(Mandatory)] [string] $LogPath
+    )
+    try {
+        $script = $Template_GetFileTail.Replace('__PATH__', $LogPath)
+        $r = Invoke-GuestScriptWithTimeout -VM $VM -GuestCredential $GuestCredential -ScriptType Powershell `
+            -ScriptText $script -TimeoutSeconds $QuickGuestOpTimeoutSec
+        if ($r.Success -and $r.ScriptOutput) {
+            return "MSI log tail ($LogPath): $($r.ScriptOutput)"
+        }
+        return "(could not read MSI log at $LogPath)"
+    } catch {
+        return "(error reading MSI log: $($_.Exception.Message))"
+    }
+}
+
 #endregion ============================================================
 
 
@@ -552,7 +612,8 @@ function Invoke-SplunkInstallProcedure {
     }
 
     # 4. Run the installer (as the guest admin credential) and wait for it to finish.
-    $installScript = $Template_RunInstaller.Replace('__INSTALLER_PATH__', $remoteInstaller).Replace('__INSTALLER_ARGS__', $SplunkInstallerArgs)
+    $remoteMsiLog = Join-Path $RemoteTempFolder 'splkInstall.log'
+    $installScript = $Template_RunInstaller.Replace('__INSTALLER_PATH__', $remoteInstaller).Replace('__INSTALLER_ARGS__', $SplunkInstallerArgs).Replace('__LOG_PATH__', $remoteMsiLog)
     $installResult = Invoke-GuestScriptWithTimeout -VM $VM -GuestCredential $GuestCredential -ScriptType Powershell `
         -ScriptText $installScript -TimeoutSeconds $InstallerTimeoutSec
 
@@ -572,11 +633,11 @@ function Invoke-SplunkInstallProcedure {
         $out.InstallerExitCode = $Matches[1]
         if ($Matches[1] -eq '3010') { $out.RebootRequired = $true }
         elseif ($Matches[1] -ne '0') {
-            $out.FailureReason = "Installer returned non-zero exit code $($Matches[1])."
+            $out.FailureReason = "Installer returned non-zero exit code $($Matches[1]). $(Get-RemoteMsiLogTail -VM $VM -GuestCredential $GuestCredential -LogPath $remoteMsiLog)"
             return $out
         }
     } else {
-        $out.FailureReason = "Could not determine installer exit code from output."
+        $out.FailureReason = "Could not determine installer exit code from output. $(Get-RemoteMsiLogTail -VM $VM -GuestCredential $GuestCredential -LogPath $remoteMsiLog)"
         return $out
     }
 
@@ -654,6 +715,10 @@ Write-Host "`n=== Splunk Universal Forwarder Deployment (SEVEN configuration) ==
 Write-Host "Required version: $RequiredSplunkVersion`n"
 
 Test-LocalPrerequisites
+
+# MSI property string (contains SPLUNKPASSWORD) - read from a local file that is never committed
+# to this repo, not hardcoded here. Never logged or echoed.
+$SplunkInstallerArgs = Get-SplunkMsiProperties
 
 if (-not $global:DefaultVIServer -or -not $global:DefaultVIServer.IsConnected) {
     throw "No active vCenter connection found. Connect with Connect-VIServer before running this script."
