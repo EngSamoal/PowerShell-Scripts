@@ -47,7 +47,7 @@ param(
 # Bump this on every change and check it against the version quoted in chat before trusting a
 # run's results - prints as the very first line of output so a stale cached copy is always
 # immediately obvious, instead of silently re-running old logic.
-$ScriptBuild = '2026.09.21-5'
+$ScriptBuild = '2026.09.21-6'
 
 # Splunk version this fleet must be running after this script completes.
 [version]$RequiredSplunkVersion = '10.4.2'
@@ -826,8 +826,6 @@ function Build-SplunkDashboardHtml {
     }
 
     $modeBadge = if ($CheckOnly) { '<div class="mode-badge">CHECK ONLY - NO CHANGES MADE</div>' } else { '' }
-    $genStamp = ConvertTo-HtmlSafe (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
-    $safeBuild = ConvertTo-HtmlSafe $ScriptBuild
     $safeVersion = ConvertTo-HtmlSafe $RequiredVersion
 
     return @"
@@ -846,7 +844,7 @@ $css
 
   <header class="hero">
     <h1 class="report-h1">Splunk Universal Forwarder Deployment</h1>
-    <p class="report-sub">Required version: $safeVersion &nbsp;|&nbsp; Generated: $genStamp &nbsp;|&nbsp; Script build: $safeBuild</p>
+    <p class="report-sub">Required version: $safeVersion</p>
     $modeBadge
   </header>
 
