@@ -34,12 +34,20 @@
       property string, read at runtime and never written to disk by this script or logged.
 #>
 
+param(
+    # Audit-only mode: validates every VM and reports current Splunk status (installed?, version,
+    # service running?) WITHOUT installing/upgrading anything. Use this to see what a full run
+    # would do first, or to trim vmlist.txt down to only the VMs that actually need work. The
+    # installer/MSI-properties files are not required in this mode since nothing gets installed.
+    [switch]$CheckOnly
+)
+
 #region ======================= CONFIGURATION =======================
 
 # Bump this on every change and check it against the version quoted in chat before trusting a
 # run's results - prints as the very first line of output so a stale cached copy is always
 # immediately obvious, instead of silently re-running old logic.
-$ScriptBuild = '2026.09.21-3'
+$ScriptBuild = '2026.09.21-6'
 
 # Splunk version this fleet must be running after this script completes.
 [version]$RequiredSplunkVersion = '10.4.2'
@@ -59,7 +67,9 @@ $SplunkServiceName = 'SplunkForwarder'
 
 # Report output.
 $ReportFolder = 'C:\temp'
-$ReportPath   = Join-Path $ReportFolder ("SplunkDeploymentReport_{0}.csv" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+$script:ReportTimestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+$ReportPath     = Join-Path $ReportFolder ("SplunkDeploymentReport_{0}.csv" -f $script:ReportTimestamp)
+$ReportHtmlPath = Join-Path $ReportFolder ("SplunkDeploymentDashboard_{0}.html" -f $script:ReportTimestamp)
 
 # Timeouts (seconds). Keep the installer/post-install ceilings generous - real installs can take
 # several minutes - but bounded, so one stuck VM cannot hang the whole run.
@@ -100,6 +110,13 @@ function New-ReportRow {
     }
 }
 
+# Appends to $row.Notes rather than overwriting, so multiple independent notes (e.g. a
+# pre-existing pending reboot AND an upgrade decision) both survive on the same row.
+function Add-RowNote {
+    param([Parameter(Mandatory)] $Row, [Parameter(Mandatory)] [string] $Note)
+    $Row.Notes = if ($Row.Notes) { "$($Row.Notes) | $Note" } else { $Note }
+}
+
 #endregion ============================================================
 
 
@@ -108,13 +125,19 @@ function New-ReportRow {
 function Test-LocalPrerequisites {
     $missing = @()
 
-    foreach ($item in @(
-        @{ Path = $SplunkInstallerPath;      Label = 'Splunk UF installer (.msi)' },
-        @{ Path = $SplunkMsiPropertiesPath;  Label = 'Splunk MSI properties file' },
-        @{ Path = $PostInstallSevenPath;     Label = 'post_installation_Seven.bat' },
+    $requiredFiles = @(
         @{ Path = $VmListPath;               Label = 'VM list file' },
         @{ Path = $GuestCredentialPath;      Label = 'Guest credential XML' }
-    )) {
+    )
+    if (-not $CheckOnly) {
+        # Only needed when actually installing/upgrading something - CheckOnly mode never
+        # touches these, so don't force the user to have them staged just to run an audit.
+        $requiredFiles += @{ Path = $SplunkInstallerPath;      Label = 'Splunk UF installer (.msi)' }
+        $requiredFiles += @{ Path = $SplunkMsiPropertiesPath;  Label = 'Splunk MSI properties file' }
+        $requiredFiles += @{ Path = $PostInstallSevenPath;     Label = 'post_installation_Seven.bat' }
+    }
+
+    foreach ($item in $requiredFiles) {
         if (-not (Test-Path -LiteralPath $item.Path)) {
             $missing += "$($item.Label) not found: $($item.Path)"
         }
@@ -709,6 +732,157 @@ function Invoke-SplunkInstallProcedure {
 #endregion ============================================================
 
 
+#region ======================= HTML DASHBOARD =======================
+
+function ConvertTo-HtmlSafe {
+    param([string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return '' }
+    return $Text.Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;').Replace('"', '&quot;').Replace("'", '&#39;')
+}
+
+# Same visual language as Generate-PatchingDashboard.ps1 elsewhere in this repo (dark blue
+# gradient header, KPI cards, colored status badges) so reports across this repo look consistent.
+function Build-SplunkDashboardHtml {
+    param(
+        [Parameter(Mandatory)] [System.Collections.IEnumerable] $Results,
+        [Parameter(Mandatory)] [hashtable] $Summary,
+        [Parameter(Mandatory)] [string] $RequiredVersion,
+        [Parameter(Mandatory)] [string] $ScriptBuild,
+        [bool] $CheckOnly
+    )
+
+    $css = @'
+  :root{--ink:#1F2933;--line:#E3E8EF;--muted:#6B7683;--bg:#F4F6F9;}
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font-family:-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;line-height:1.45;}
+  .wrap{max-width:1280px;margin:0 auto;padding:28px;}
+  header.hero{background:linear-gradient(135deg,#191919 0%,#3A2410 60%,#F1611D 100%);color:#fff;
+       border-radius:14px;padding:34px 40px;box-shadow:0 10px 30px rgba(0,0,0,.25);}
+  .report-h1{font-size:32px;font-weight:800;letter-spacing:.4px;margin:0;line-height:1.15;}
+  .report-sub{font-size:16px;font-weight:600;margin:10px 0 0;color:#F2D9C9;}
+  .mode-badge{display:inline-block;margin-top:14px;padding:5px 14px;border-radius:20px;
+       font-size:12px;font-weight:800;letter-spacing:.5px;text-transform:uppercase;background:#fff;color:#3A2410;}
+  .kpi{display:grid;grid-template-columns:repeat(8,1fr);gap:14px;margin:22px 0 10px;}
+  .kpi-card{position:relative;background:#fff;border:1px solid var(--line);border-radius:12px;
+       padding:16px 14px 14px;overflow:hidden;box-shadow:0 2px 6px rgba(31,41,51,.04);}
+  .kpi-accent{position:absolute;top:0;left:0;right:0;height:5px;}
+  .kpi-label{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);}
+  .kpi-value{font-size:30px;font-weight:800;margin-top:6px;}
+  .panel{background:#fff;border:1px solid var(--line);border-radius:12px;padding:20px 22px;margin-top:18px;
+       box-shadow:0 2px 6px rgba(31,41,51,.04);}
+  h2{font-size:15px;text-transform:uppercase;letter-spacing:.7px;margin:0 0 16px;color:#334155;}
+  table.ex-table{width:100%;border-collapse:collapse;font-size:12.5px;}
+  .ex-table th{background:#0F2A43;color:#fff;text-align:left;padding:9px 10px;font-weight:600;white-space:nowrap;}
+  .ex-table td{padding:8px 10px;border-bottom:1px solid var(--line);}
+  .ex-table tr:nth-child(even){background:#FAFBFD;}
+  .badge{display:inline-block;width:120px;text-align:center;padding:4px 0;border-radius:4px;font-size:11.5px;font-weight:700;color:#fff;white-space:nowrap;}
+  .badge.b-green{background:#1F8A4C;} .badge.b-red{background:#C0392B;} .badge.b-amber{background:#C77700;} .badge.b-grey{background:#6B7683;}
+  .notes-cell{color:var(--muted);font-size:11.5px;max-width:260px;}
+  footer{margin-top:24px;font-size:12px;color:var(--muted);}
+  @media (max-width:1100px){.kpi{grid-template-columns:repeat(4,1fr);}}
+  @media (max-width:640px){.kpi{grid-template-columns:repeat(2,1fr);}}
+'@
+
+    function Get-KpiCard($label, $value, $color) {
+        return "  <div class=`"kpi-card`"><div class=`"kpi-accent`" style=`"background:$color`"></div><div class=`"kpi-label`">$(ConvertTo-HtmlSafe $label)</div><div class=`"kpi-value`" style=`"color:$color`">$value</div></div>`n"
+    }
+
+    $kpi = ''
+    $kpi += Get-KpiCard 'Total VMs' $Summary['Total VMs'] '#1D4E79'
+    $kpi += Get-KpiCard 'Already Compliant' $Summary['Already Compliant'] '#1F8A4C'
+    $kpi += Get-KpiCard 'Installed' $Summary['Successfully Installed'] '#1F8A4C'
+    $kpi += Get-KpiCard 'Upgraded' $Summary['Successfully Upgraded'] '#1F8A4C'
+    $kpi += Get-KpiCard 'Failed' $Summary['Failed'] '#C0392B'
+    $kpi += Get-KpiCard 'Manual Review' $Summary['Newer Version / Manual Review'] '#C77700'
+    $kpi += Get-KpiCard 'Skipped' $Summary['Skipped'] '#6B7683'
+    $kpi += Get-KpiCard 'Reboot Pending' $Summary['Reboot Required (not performed)'] '#C77700'
+
+    function Get-StatusBadgeClass($row) {
+        if ($row.Action -eq 'Failed') { return 'b-red' }
+        if ($row.Action -eq 'Manual Review') { return 'b-amber' }
+        if ($row.Result -like 'Check Only*') { return 'b-grey' }
+        if ($row.Action -eq 'Skipped') { return 'b-grey' }
+        return 'b-green'
+    }
+
+    $rows = ''
+    foreach ($r in $Results) {
+        $badgeClass = Get-StatusBadgeClass $r
+        $rebootTxt = if ($r.RebootRequired) { '<span class="badge b-amber">Yes</span>' } else { 'No' }
+        $notes = if ($r.FailureReason) { $r.FailureReason } else { $r.Notes }
+        $rows += "          <tr>`n" +
+            "            <td>$(ConvertTo-HtmlSafe $r.VMName)</td>`n" +
+            "            <td>$(ConvertTo-HtmlSafe $r.PowerState)</td>`n" +
+            "            <td><span class=`"badge $badgeClass`">$(ConvertTo-HtmlSafe $r.Action)</span></td>`n" +
+            "            <td>$(ConvertTo-HtmlSafe $r.Result)</td>`n" +
+            "            <td>$(ConvertTo-HtmlSafe $r.PreviousVersion)</td>`n" +
+            "            <td>$(ConvertTo-HtmlSafe $r.FinalVersion)</td>`n" +
+            "            <td>$(ConvertTo-HtmlSafe $r.SplunkServiceStatus)</td>`n" +
+            "            <td>$rebootTxt</td>`n" +
+            "            <td class=`"notes-cell`">$(ConvertTo-HtmlSafe $notes)</td>`n" +
+            "            <td>$(ConvertTo-HtmlSafe $r.Duration)</td>`n" +
+            "          </tr>`n"
+    }
+
+    $modeBadge = if ($CheckOnly) { '<div class="mode-badge">CHECK ONLY - NO CHANGES MADE</div>' } else { '' }
+    $safeVersion = ConvertTo-HtmlSafe $RequiredVersion
+
+    return @"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Splunk UF Deployment Dashboard</title>
+<style>
+$css
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1 class="report-h1">Splunk Universal Forwarder Deployment</h1>
+    <p class="report-sub">Required version: $safeVersion</p>
+    $modeBadge
+  </header>
+
+  <div class="kpi">
+$kpi  </div>
+
+  <div class="panel">
+    <h2>Per-VM Results</h2>
+    <div style="overflow-x:auto;">
+    <table class="ex-table">
+      <thead>
+        <tr>
+          <th>VM Name</th><th>Power State</th><th>Action</th><th>Result</th>
+          <th>Previous Version</th><th>Final Version</th><th>Service Status</th>
+          <th>Reboot Required</th><th>Notes / Failure Reason</th><th>Duration</th>
+        </tr>
+      </thead>
+      <tbody>
+$rows      </tbody>
+    </table>
+    </div>
+  </div>
+
+  <footer>
+    Generated by Deploy-SplunkUniversalForwarder.ps1. Reboot Required flags reflect a generic
+    Windows pending-reboot check and are not necessarily caused by this run - see the Notes
+    column for each VM.
+  </footer>
+
+</div>
+</body>
+</html>
+"@
+}
+
+#endregion ============================================================
+
+
 #region ======================= MAIN =======================
 
 Write-Host "ScriptBuild: $ScriptBuild" -ForegroundColor Magenta
@@ -718,8 +892,12 @@ Write-Host "Required version: $RequiredSplunkVersion`n"
 Test-LocalPrerequisites
 
 # MSI property string (contains SPLUNKPASSWORD) - read from a local file that is never committed
-# to this repo, not hardcoded here. Never logged or echoed.
-$SplunkInstallerArgs = Get-SplunkMsiProperties
+# to this repo, not hardcoded here. Never logged or echoed. Not needed in CheckOnly mode.
+$SplunkInstallerArgs = if ($CheckOnly) { '' } else { Get-SplunkMsiProperties }
+
+if ($CheckOnly) {
+    Write-Host "*** CHECK-ONLY MODE: no VM will be modified. Reporting current status only. ***`n" -ForegroundColor Magenta
+}
 
 if (-not $global:DefaultVIServer -or -not $global:DefaultVIServer.IsConnected) {
     throw "No active vCenter connection found. Connect with Connect-VIServer before running this script."
@@ -773,7 +951,15 @@ foreach ($vmName in $vmNames) {
         }
         $status = $detect.Status
         $row.GuestCredentialStatus = if ($status.IsAdmin) { 'Valid (Administrator)' } else { 'Valid (NOT Administrator - install will likely fail)' }
-        $row.RebootRequired = [bool]$status.RebootPending
+        # Track whether this was pending BEFORE we touched the VM, so RebootRequired can be
+        # explained honestly - this check is generic Windows reboot-pending detection (Windows
+        # Update, Component Based Servicing, PendingFileRenameOperations), not Splunk-specific;
+        # Splunk installs do not themselves require a reboot in normal circumstances.
+        $preExistingRebootPending = [bool]$status.RebootPending
+        $row.RebootRequired = $preExistingRebootPending
+        if ($preExistingRebootPending) {
+            Add-RowNote -Row $row -Note "Reboot already pending on this VM BEFORE this script ran (unrelated to Splunk - likely Windows Update or a prior change)."
+        }
 
         # Diagnostic - print regardless of outcome so admin-detection results are visible in the
         # console immediately, not just in the CSV.
@@ -799,7 +985,7 @@ foreach ($vmName in $vmNames) {
                 $row.Action = 'Manual Review'
                 $row.Result = 'Newer Version Detected - Manual Review'
                 $row.FinalVersion = $status.Version
-                $row.Notes = "Installed version $($status.Version) is NEWER than required $RequiredSplunkVersion - not downgrading. Manual review needed."
+                Add-RowNote -Row $row -Note "Installed version $($status.Version) is NEWER than required $RequiredSplunkVersion - not downgrading. Manual review needed."
                 Write-Host "  [notice] $($row.Notes)" -ForegroundColor Yellow
             }
             elseif ($installedVersion -eq $RequiredSplunkVersion) {
@@ -817,7 +1003,7 @@ foreach ($vmName in $vmNames) {
             else {
                 $row.Action = 'Upgraded'
                 $needsProcedure = $true
-                $row.Notes = "Older version detected (installed: $($status.Version), required: $RequiredSplunkVersion) - upgrading."
+                Add-RowNote -Row $row -Note "Older version detected (installed: $($status.Version), required: $RequiredSplunkVersion) - upgrading."
                 Write-Host "  [notice] $($row.Notes)" -ForegroundColor Yellow
             }
         } else {
@@ -825,7 +1011,13 @@ foreach ($vmName in $vmNames) {
             $needsProcedure = $true
         }
 
-        if ($needsProcedure) {
+        if ($needsProcedure -and $CheckOnly) {
+            # Audit only - report what WOULD happen without touching the VM.
+            $row.Result = "Check Only - Would $($row.Action)"
+            if ($status.Version) { $row.FinalVersion = $status.Version }
+            Add-RowNote -Row $row -Note 'CheckOnly mode: no changes made to this VM.'
+        }
+        elseif ($needsProcedure) {
             if (-not $status.IsAdmin) {
                 throw "Guest credential is not a local Administrator; cannot proceed with install/upgrade."
             }
@@ -833,7 +1025,10 @@ foreach ($vmName in $vmNames) {
             $procResult = Invoke-SplunkInstallProcedure -VM $vm -GuestCredential $guestCred
             $row.InstallerExitCode = $procResult.InstallerExitCode
             $row.SevenPostInstallStatus = $procResult.SevenPostInstallStatus
-            if ($procResult.RebootRequired) { $row.RebootRequired = $true }
+            if ($procResult.RebootRequired -and -not $preExistingRebootPending) {
+                $row.RebootRequired = $true
+                Add-RowNote -Row $row -Note 'Reboot required - triggered by this installation/post-install step (exit code 3010).'
+            }
 
             if (-not $procResult.Success) {
                 $row.Action = 'Failed'
@@ -850,7 +1045,10 @@ foreach ($vmName in $vmNames) {
                     $fs = $final.Status
                     $row.SplunkServiceStatus = $fs.ServiceStatus
                     $row.FinalVersion = $fs.Version
-                    if ($fs.RebootPending) { $row.RebootRequired = $true }
+                    if ($fs.RebootPending -and -not $preExistingRebootPending -and -not $row.RebootRequired) {
+                        $row.RebootRequired = $true
+                        Add-RowNote -Row $row -Note 'Reboot required - detected as pending only after this installation completed.'
+                    }
 
                     $finalVersionOk = $false
                     try { $finalVersionOk = ([version]$fs.Version -eq $RequiredSplunkVersion) } catch {}
@@ -900,20 +1098,50 @@ Write-Host "`nReport written to: $ReportPath" -ForegroundColor Cyan
 # on a bare object is $null (not 1), printing blank instead of a number. Confirmed live: with
 # exactly one Already Compliant VM, that line printed nothing at all. Same bug class already
 # documented in this repo's CLAUDE.md for VMware_Weekly_HealthCheck.ps1.
+# Plain loop counters instead of "(Where-Object {...}).Count" - that pattern has now caused two
+# separate real failures live (a blank count when exactly one item matched, then an
+# "Argument types do not match" ArgumentException on a later run) on this PowerShell 5.1 session.
+# A loop with integer counters has no pipeline/.Count ambiguity to hit at all.
+$totalVMs = 0; $alreadyCompliant = 0; $successInstalled = 0; $successUpgraded = 0
+$manualReview = 0; $failedCount = 0; $skippedCount = 0; $rebootCount = 0; $checkOnlyCount = 0
+
+foreach ($r in $results) {
+    $totalVMs++
+    if ($r.Result -eq 'Already Compliant') { $alreadyCompliant++ }
+    elseif ($r.Result -eq 'Install Successful') { $successInstalled++ }
+    elseif ($r.Result -eq 'Upgrade Successful') { $successUpgraded++ }
+    elseif ($r.Action -eq 'Manual Review') { $manualReview++ }
+    elseif ($r.Action -eq 'Failed') { $failedCount++ }
+    elseif ($r.Result -like 'Check Only*') { $checkOnlyCount++ }
+    elseif ($r.Action -eq 'Skipped') { $skippedCount++ }
+    if ($r.RebootRequired) { $rebootCount++ }
+}
+
 $summary = [ordered]@{
-    'Total VMs'                    = @($results).Count
-    'Already Compliant'            = @($results | Where-Object { $_.Result -eq 'Already Compliant' }).Count
-    'Successfully Installed'       = @($results | Where-Object { $_.Result -eq 'Install Successful' }).Count
-    'Successfully Upgraded'        = @($results | Where-Object { $_.Result -eq 'Upgrade Successful' }).Count
-    'Newer Version / Manual Review' = @($results | Where-Object { $_.Action -eq 'Manual Review' }).Count
-    'Failed'                       = @($results | Where-Object { $_.Action -eq 'Failed' }).Count
-    'Skipped'                      = @($results | Where-Object { $_.Action -eq 'Skipped' -and $_.Result -ne 'Already Compliant' }).Count
-    'Reboot Required (not performed)' = @($results | Where-Object { $_.RebootRequired }).Count
+    'Total VMs'                       = $totalVMs
+    'Already Compliant'               = $alreadyCompliant
+    'Successfully Installed'          = $successInstalled
+    'Successfully Upgraded'           = $successUpgraded
+    'Newer Version / Manual Review'   = $manualReview
+    'Failed'                          = $failedCount
+    'Skipped'                         = $skippedCount
+    'Check Only (no changes made)'    = $checkOnlyCount
+    'Reboot Required (not performed)' = $rebootCount
 }
 
 Write-Host "`n=== Summary ===" -ForegroundColor Cyan
 foreach ($key in $summary.Keys) {
     Write-Host ("{0,-32}: {1}" -f $key, $summary[$key])
+}
+
+# HTML dashboard - best-effort, never fails the run if it can't be written.
+try {
+    $dashboardHtml = Build-SplunkDashboardHtml -Results $results -Summary $summary `
+        -RequiredVersion $RequiredSplunkVersion.ToString() -ScriptBuild $ScriptBuild -CheckOnly:$CheckOnly.IsPresent
+    [System.IO.File]::WriteAllText($ReportHtmlPath, $dashboardHtml, (New-Object System.Text.UTF8Encoding($false)))
+    Write-Host "Dashboard written to: $ReportHtmlPath" -ForegroundColor Cyan
+} catch {
+    Write-Host "WARNING: Could not write HTML dashboard: $($_.Exception.Message)" -ForegroundColor Yellow
 }
 
 #endregion ============================================================
