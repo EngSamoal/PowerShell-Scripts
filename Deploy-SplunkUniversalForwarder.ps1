@@ -47,7 +47,7 @@ param(
 # Bump this on every change and check it against the version quoted in chat before trusting a
 # run's results - prints as the very first line of output so a stale cached copy is always
 # immediately obvious, instead of silently re-running old logic.
-$ScriptBuild = '2026.09.21-8'
+$ScriptBuild = '2026.09.21-9'
 
 # Splunk version this fleet must be running after this script completes.
 [version]$RequiredSplunkVersion = '10.4.2'
@@ -749,12 +749,12 @@ function Build-SplunkDashboardHtml {
   body{margin:0;background:var(--bg);color:var(--ink);
        font-family:-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;line-height:1.45;}
   .wrap{max-width:1280px;margin:0 auto;padding:28px;}
-  header.hero{background:linear-gradient(135deg,#191919 0%,#3A2410 60%,#F1611D 100%);color:#fff;
+  header.hero{background:linear-gradient(135deg,#0B2A1B 0%,#146339 60%,#1FA85C 100%);color:#fff;
        border-radius:14px;padding:34px 40px;box-shadow:0 10px 30px rgba(0,0,0,.25);}
   .report-h1{font-size:32px;font-weight:800;letter-spacing:.4px;margin:0;line-height:1.15;}
-  .report-sub{font-size:16px;font-weight:600;margin:10px 0 0;color:#F2D9C9;}
+  .report-sub{font-size:16px;font-weight:600;margin:10px 0 0;color:#CFEFD9;}
   .mode-badge{display:inline-block;margin-top:14px;padding:5px 14px;border-radius:20px;
-       font-size:12px;font-weight:800;letter-spacing:.5px;text-transform:uppercase;background:#fff;color:#3A2410;}
+       font-size:12px;font-weight:800;letter-spacing:.5px;text-transform:uppercase;background:#fff;color:#146339;}
   .kpi{display:grid;grid-template-columns:repeat(8,1fr);gap:14px;margin:22px 0 10px;}
   .kpi-card{position:relative;background:#fff;border:1px solid var(--line);border-radius:12px;
        padding:16px 14px 14px;overflow:hidden;box-shadow:0 2px 6px rgba(31,41,51,.04);
