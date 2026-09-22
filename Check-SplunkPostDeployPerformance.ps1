@@ -9,10 +9,11 @@ starts/stops, or changes anything - it only reads:
     (same guest-credential/guest-ops approach as the deploy script - no WinRM).
 
 This is a SANITY CHECK, not a full performance audit: it catches an obvious problem
-(service not running, process missing, VM-level CPU/memory pegged) in the few minutes
-right after a deployment. Real performance impact from a UF is normally negligible and,
-if it does show up, tends to do so over hours - for real assurance, keep an eye on these
-VMs over the following day through vCenter/your normal monitoring, not just this script.
+(service not running, process missing, VM-level CPU/memory pegged) in the hours
+right after a deployment (3 hours back by default - see -MinutesBack). Real performance
+impact from a UF is normally negligible and, if it does show up, tends to do so over
+longer than that - for real assurance, keep an eye on these VMs over the following day
+through vCenter/your normal monitoring, not just this script.
 
 Requirements:
   - Already connected to the target vCenter via Connect-VIServer before running this script.
@@ -23,7 +24,7 @@ Requirements:
 param(
     [string]$VmListPath = 'C:\temp\vmlist.txt',
     [string]$GuestCredentialPath = 'C:\temp\wincred.xml',
-    [int]$MinutesBack = 15,
+    [int]$MinutesBack = 180,
     [double]$CpuWarnPercent = 80,
     [double]$MemWarnPercent = 90,
     [string]$SplunkProcessName = 'splunkd',
@@ -31,7 +32,7 @@ param(
     [string]$ReportFolder = 'C:\temp'
 )
 
-$ScriptBuild = '2026.09.22-2'
+$ScriptBuild = '2026.09.22-3'
 Write-Host "Check-SplunkPostDeployPerformance.ps1 - build $ScriptBuild" -ForegroundColor Cyan
 Write-Host "READ-ONLY sanity check - nothing on any VM will be installed, started, stopped, or changed.`n" -ForegroundColor Cyan
 
@@ -270,8 +271,16 @@ foreach ($vmName in $vmNames) {
         }
 
         # vCenter-side performance counters - read-only, does not touch the guest.
-        $cpuStat = Get-Stat -Entity $vm -Stat 'cpu.usage.average' -Start $statStart -Realtime -ErrorAction SilentlyContinue
-        $memStat = Get-Stat -Entity $vm -Stat 'mem.usage.average' -Start $statStart -Realtime -ErrorAction SilentlyContinue
+        # -Realtime data (20-second samples) is only retained by vCenter for about the last
+        # hour; anything further back has to come from the "Past Day" rollup (5-minute
+        # samples, retained for 24h) instead, or Get-Stat returns nothing for that range.
+        if ($MinutesBack -le 60) {
+            $cpuStat = Get-Stat -Entity $vm -Stat 'cpu.usage.average' -Start $statStart -Realtime -ErrorAction SilentlyContinue
+            $memStat = Get-Stat -Entity $vm -Stat 'mem.usage.average' -Start $statStart -Realtime -ErrorAction SilentlyContinue
+        } else {
+            $cpuStat = Get-Stat -Entity $vm -Stat 'cpu.usage.average' -Start $statStart -IntervalMins 5 -ErrorAction SilentlyContinue
+            $memStat = Get-Stat -Entity $vm -Stat 'mem.usage.average' -Start $statStart -IntervalMins 5 -ErrorAction SilentlyContinue
+        }
 
         if ($cpuStat) { $row.CpuAvgPercent = [Math]::Round((($cpuStat | Measure-Object -Property Value -Average).Average), 1) }
         else { Add-RowNote -Row $row -Note 'Could not read vCenter CPU performance counter for this VM.' }
