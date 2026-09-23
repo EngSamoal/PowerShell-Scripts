@@ -60,11 +60,11 @@ param(
 #   TabColor   : hex RGB for the tab and the sheet title banner
 #   VCenter = @() leaves that tab blank for manual entry (nothing is collected for it)
 $Sites = @(
-    [pscustomobject]@{ Name = 'Site A'; VCenter = @('10.10.1.20'); Datacenter = @(); TabColor = '1F4E79' }
-    [pscustomobject]@{ Name = 'Site B'; VCenter = @(); Datacenter = @(); TabColor = '2E7D32' }   # same vCenter as Site A - left blank, fill manually
-    [pscustomobject]@{ Name = 'Site C'; VCenter = @('10.30.1.20'); Datacenter = @(); TabColor = 'C55A11' }
-    [pscustomobject]@{ Name = 'Site D'; VCenter = @('10.40.1.20'); Datacenter = @(); TabColor = '7030A0' }
-    [pscustomobject]@{ Name = 'Site E'; VCenter = @('10.50.1.20'); Datacenter = @(); TabColor = 'A50021' }
+    [pscustomobject]@{ Name = 'SixFlags'; VCenter = @('10.50.10.10'); Datacenter = @(); TabColor = '1F4E79' }
+    [pscustomobject]@{ Name = 'AquaArabia'; VCenter = @(); Datacenter = @(); TabColor = '2E7D32' }   # same vCenter as SixFlags - left blank, fill manually
+    [pscustomobject]@{ Name = 'SEVEN Tabuk'; VCenter = @('10.52.6.140'); Datacenter = @(); TabColor = 'C55A11' }
+    [pscustomobject]@{ Name = 'SEVEN ABHA'; VCenter = @('10.61.6.140'); Datacenter = @(); TabColor = '7030A0' }
+    [pscustomobject]@{ Name = 'SEVEN ALHamra'; VCenter = @('10.11.7.120'); Datacenter = @(); TabColor = 'A50021' }
 )
 
 # OT worksheet - added after the site tabs. Same columns plus 'Site', so OT VMs from every site
