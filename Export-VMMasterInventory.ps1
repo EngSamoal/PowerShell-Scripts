@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Builds a single, formatted master VM inventory workbook (.xlsx) with one worksheet per site.
 
@@ -63,6 +63,10 @@ $Sites = @(
     [pscustomobject]@{ Name = 'Site C'; VCenter = @('vcenter-sitec.corp.local'); Datacenter = @(); TabColor = 'C55A11' }
     [pscustomobject]@{ Name = 'Site D'; VCenter = @('vcenter-sited.corp.local'); Datacenter = @(); TabColor = '7030A0' }
 )
+
+# OT worksheet - added after the site tabs. Same columns plus 'Site', so OT VMs from every site
+# are listed together. (How OT VMs are identified in vCenter is still to be confirmed.)
+$OTSheet = [pscustomobject]@{ Name = 'OT'; TabColor = '00838F' }
 #endregion ==========================================================================
 
 #region ---------- Style constants ----------
@@ -77,6 +81,7 @@ $Style = @{
     UnknownOS     = 'Unknown'  # shown when no OS could be read
 }
 $Headers = '#', 'VM NAME', 'IP', 'OS', 'Power Status', 'Implementor'
+$OTHeaders = '#', 'Site', 'VM NAME', 'IP', 'OS', 'Power Status', 'Implementor'
 #endregion
 
 $ErrorActionPreference = 'Stop'
@@ -106,9 +111,10 @@ function Get-SafeSheetName([string]$Name) {
     return $n
 }
 
-function New-SiteResult($Site) {
+function New-SiteResult($Site, [string[]]$Columns = $Headers) {
     [pscustomobject]@{
         Site        = $Site.Name
+        Columns     = $Columns
         VCenter     = (@($Site.VCenter) -join ', ')
         TabColor    = $Site.TabColor
         Rows        = New-Object System.Collections.Generic.List[object]
@@ -273,6 +279,40 @@ function Get-SampleInventory($Site, [int]$Index) {
     foreach ($r in $sorted) { $result.Rows.Add($r) }
     return $result
 }
+
+function Get-SampleOTInventory($OT) {
+    $result = New-SiteResult $OT $OTHeaders
+    $result.QueryOk = 1
+    $result.VCenter = 'OT'
+    $w16 = 'Microsoft Windows Server 2016 (64-bit)'
+    $w19 = 'Microsoft Windows Server 2019 (64-bit)'
+    $w22 = 'Microsoft Windows Server 2022 (64-bit)'
+    $w10 = 'Microsoft Windows 10 (64-bit)'
+    $r8 = 'Red Hat Enterprise Linux 8 (64-bit)'
+    $set = @(
+        @('Site A', 'OT-SA-SCADA01', '172.16.10.11', $w19, 'PoweredOn'),
+        @('Site A', 'OT-SA-HMI01', '172.16.10.21', $w10, 'PoweredOn'),
+        @('Site A', 'OT-SA-HIST01', '172.16.10.31', $w22, 'PoweredOn'),
+        @('Site B', 'OT-SB-SCADA01', '172.16.20.11', $w19, 'PoweredOn'),
+        @('Site B', 'OT-SB-EWS01', $null, $w10, 'PoweredOff'),
+        @('Site B', 'OT-SB-OPC01', '172.16.20.41', $w16, 'PoweredOn'),
+        @('Site C', 'OT-SC-SCADA01', '172.16.30.11', $w22, 'PoweredOn'),
+        @('Site C', 'OT-SC-HIST01', $null, $w19, 'Suspended'),
+        @('Site D', 'OT-SD-SCADA01', '172.16.40.11', $w22, 'PoweredOn'),
+        @('Site D', 'OT-SD-LOG01', '172.16.40.51', $r8, 'PoweredOn'),
+        @('Site D', 'OT-SD-PLCGW01', $null, $null, 'PoweredOff')
+    )
+    foreach ($s in $set) {
+        $result.Rows.Add([pscustomobject]@{
+                Site  = $s[0]
+                Name  = $s[1]
+                IP    = $(if ($s[2]) { $s[2] } else { $Style.NotAvailable })
+                OS    = $(if ($s[3]) { $s[3] } else { $Style.UnknownOS })
+                Power = $s[4]
+            })
+    }
+    return $result
+}
 #endregion
 
 #region ---------- Excel output (Excel COM) ----------
@@ -299,39 +339,46 @@ function Format-SiteSheet($Excel, $Ws, $SiteResult, [bool]$IsSample) {
         $src, (Get-Date -Format 'yyyy-MM-dd HH:mm'), $n, $on, $off, $sus
     if ($SiteResult.QueryFailed -gt 0) { $info = "COLLECTION INCOMPLETE - $($SiteResult.QueryFailed) vCenter query failed (see log)   |   " + $info }
 
+    # Column layout is driven by the header list, so sheets can carry extra columns (e.g. OT + Site)
+    $cols = @($SiteResult.Columns)
+    $nc = $cols.Count
+    $lc = [string][char](64 + $nc)                        # last column letter
+    $ci = @{}; for ($c = 0; $c -lt $nc; $c++) { $ci[$cols[$c]] = $c + 1 }
+    $field = @{ 'Site' = 'Site'; 'VM NAME' = 'Name'; 'IP' = 'IP'; 'OS' = 'OS'; 'Power Status' = 'Power' }
+
     $h = $headerRow - 1                                   # array row index of the header
-    $data = New-Object 'object[,]' $lastRow, 6
+    $data = New-Object 'object[,]' $lastRow, $nc
     $data[0, 0] = "$($SiteResult.Site)  -  VM Inventory"
     $data[1, 0] = $info
-    for ($c = 0; $c -lt 6; $c++) { $data[$h, $c] = $Headers[$c] }
+    for ($c = 0; $c -lt $nc; $c++) { $data[$h, $c] = $cols[$c] }
     for ($i = 0; $i -lt $n; $i++) {
         $r = $rows[$i]
-        $data[($h + 1 + $i), 0] = $i + 1
-        $data[($h + 1 + $i), 1] = [string]$r.Name
-        $data[($h + 1 + $i), 2] = [string]$r.IP
-        $data[($h + 1 + $i), 3] = [string]$r.OS
-        $data[($h + 1 + $i), 4] = [string]$r.Power
-        $data[($h + 1 + $i), 5] = ''
+        for ($c = 0; $c -lt $nc; $c++) {
+            $name = $cols[$c]
+            if ($name -eq '#') { $data[($h + 1 + $i), $c] = $i + 1 }
+            elseif ($field.ContainsKey($name)) { $data[($h + 1 + $i), $c] = [string]$r.($field[$name]) }
+            else { $data[($h + 1 + $i), $c] = '' }
+        }
     }
-    if ($n -eq 0) { $data[($h + 1), 1] = $(if ($SiteResult.QueryFailed -gt 0) { 'No data - vCenter query failed' } else { 'No VMs found' }) }
+    if ($n -eq 0) { $data[($h + 1), ($ci['VM NAME'] - 1)] = $(if ($SiteResult.QueryFailed -gt 0) { 'No data - vCenter query failed' } else { 'No VMs found' }) }
 
-    $Ws.Range("C$($headerRow + 1):C$lastRow").NumberFormat = '@'     # IP stored as text
+    $Ws.Range($Ws.Cells.Item($headerRow + 1, $ci['IP']), $Ws.Cells.Item($lastRow, $ci['IP'])).NumberFormat = '@'   # IP stored as text
     try {
-        $Ws.Range("A1:F$lastRow").Value2 = $data
-        if ([string]$Ws.Cells.Item($headerRow, 2).Value2 -ne $Headers[1]) { throw 'bulk write verification failed' }
+        $Ws.Range("A1:$lc$lastRow").Value2 = $data
+        if ([string]$Ws.Cells.Item($headerRow, $nc).Value2 -ne $cols[$nc - 1]) { throw 'bulk write verification failed' }
     }
     catch {
         Write-Log "Bulk write not accepted ($($_.Exception.Message)) - writing cell by cell" 'WARN'
-        $Ws.Range("A1:F$lastRow").ClearContents() | Out-Null
+        $Ws.Range("A1:$lc$lastRow").ClearContents() | Out-Null
         for ($r = 0; $r -lt $lastRow; $r++) {
-            for ($c = 0; $c -lt 6; $c++) {
+            for ($c = 0; $c -lt $nc; $c++) {
                 if ($null -ne $data[$r, $c] -and $data[$r, $c] -ne '') { $Ws.Cells.Item($r + 1, $c + 1).Value2 = $data[$r, $c] }
             }
         }
     }
 
     # --- Title banner (row 1) and info line (row 2)
-    $title = $Ws.Range('A1:F1')
+    $title = $Ws.Range("A1:${lc}1")
     $title.HorizontalAlignment = 7            # centre across selection (no merged cells)
     $title.VerticalAlignment = -4108
     $title.Interior.Color = $siteColor
@@ -340,14 +387,14 @@ function Format-SiteSheet($Excel, $Ws, $SiteResult, [bool]$IsSample) {
     $title.Font.Size = 14
     $Ws.Rows.Item(1).RowHeight = 30
 
-    $infoRange = $Ws.Range('A2:F2')
+    $infoRange = $Ws.Range("A2:${lc}2")
     $infoRange.Font.Size = 9
     $infoRange.Font.Italic = $true
     $infoRange.Font.Color = ConvertTo-OleColor $(if ($SiteResult.QueryFailed -gt 0) { 'C00000' } else { '595959' })
     $Ws.Rows.Item(2).RowHeight = 18
 
     # --- Excel Table (filters, banding, easy to extend)
-    $lo = $Ws.ListObjects.Add(1, $Ws.Range("A${headerRow}:F$lastRow"), $null, 1)
+    $lo = $Ws.ListObjects.Add(1, $Ws.Range("A${headerRow}:$lc$lastRow"), $null, 1)
     $lo.Name = 'tbl_' + (($SiteResult.Site -replace '[^A-Za-z0-9_]', '_'))
     $lo.TableStyle = $Style.TableStyle
     $lo.ShowTableStyleRowStripes = $true
@@ -368,12 +415,23 @@ function Format-SiteSheet($Excel, $Ws, $SiteResult, [bool]$IsSample) {
     $lo.Range.Borders.Weight = 2
     $lo.Range.Borders.Color = ConvertTo-OleColor $Style.GridLine
 
-    $colNum = $lo.ListColumns.Item(1).DataBodyRange
-    $colName = $lo.ListColumns.Item(2).DataBodyRange
-    $colIP = $lo.ListColumns.Item(3).DataBodyRange
-    $colOS = $lo.ListColumns.Item(4).DataBodyRange
-    $colPwr = $lo.ListColumns.Item(5).DataBodyRange
-    $colImpl = $lo.ListColumns.Item(6).DataBodyRange
+    $colNum = $lo.ListColumns.Item($ci['#']).DataBodyRange
+    $colName = $lo.ListColumns.Item($ci['VM NAME']).DataBodyRange
+    $colIP = $lo.ListColumns.Item($ci['IP']).DataBodyRange
+    $colOS = $lo.ListColumns.Item($ci['OS']).DataBodyRange
+    $colPwr = $lo.ListColumns.Item($ci['Power Status']).DataBodyRange
+    $colImpl = $lo.ListColumns.Item($ci['Implementor']).DataBodyRange
+
+    # Optional Site column: centred, bold, text in that site's tab colour
+    if ($ci.ContainsKey('Site')) {
+        $colSite = $lo.ListColumns.Item($ci['Site']).DataBodyRange
+        $colSite.HorizontalAlignment = -4108
+        $colSite.Font.Bold = $true
+        foreach ($s in $Sites) {
+            $fc = $colSite.FormatConditions.Add(1, 3, "=""$($s.Name)""")
+            $fc.Font.Color = ConvertTo-OleColor $s.TabColor
+        }
+    }
 
     $colNum.HorizontalAlignment = -4108
     $colName.HorizontalAlignment = -4131
@@ -407,8 +465,9 @@ function Format-SiteSheet($Excel, $Ws, $SiteResult, [bool]$IsSample) {
     }
 
     # --- Column widths: longest value per column (not the banner rows), clamped to min / max
-    $limits = @{ 0 = @(6, 8); 1 = @(26, 45); 2 = @(16, 40); 3 = @(34, 55); 4 = @(19, 20); 5 = @(24, 40) }
-    for ($c = 0; $c -lt 6; $c++) {
+    $limitsByName = @{ '#' = @(6, 8); 'Site' = @(12, 24); 'VM NAME' = @(26, 45); 'IP' = @(16, 40); 'OS' = @(34, 55); 'Power Status' = @(19, 20); 'Implementor' = @(24, 40) }
+    $limits = @{}; for ($c = 0; $c -lt $nc; $c++) { $limits[$c] = $(if ($limitsByName.ContainsKey($cols[$c])) { $limitsByName[$cols[$c]] } else { @(12, 40) }) }
+    for ($c = 0; $c -lt $nc; $c++) {
         $longest = 0
         for ($r = $h; $r -le $data.GetUpperBound(0); $r++) {
             $len = ([string]$data[$r, $c]).Length
@@ -464,9 +523,17 @@ function Export-InventoryWorkbook($SiteResults, [string]$Path, [bool]$IsSample) 
         $wb.Worksheets.Item(1).Activate()
         $excel.ScreenUpdating = $true
 
-        if (Test-Path $Path) { Remove-Item $Path -Force }
+        if (Test-Path $Path) {
+            try { Remove-Item $Path -Force -ErrorAction Stop }
+            catch {
+                # Usually the previous copy is still open in Excel - save alongside instead of failing
+                $Path = Join-Path (Split-Path $Path -Parent) ('{0}_{1}.xlsx' -f [IO.Path]::GetFileNameWithoutExtension($Path), (Get-Date -Format 'HHmmss'))
+                Write-Log "Existing file is locked (open in Excel?) - saving as $Path instead" 'WARN'
+            }
+        }
         $wb.SaveAs($Path, 51)   # 51 = xlOpenXMLWorkbook (.xlsx)
         $wb.Close($false)
+        return $Path
     }
     finally {
         if ($excel) { $excel.Quit() }
@@ -507,16 +574,26 @@ for ($i = 0; $i -lt $Sites.Count; $i++) {
     }
 }
 
+if ($OTSheet) {
+    Write-Log "----- $($OTSheet.Name) -----"
+    if ($SampleData) { $results.Add((Get-SampleOTInventory $OTSheet)) }
+    else {
+        # Live OT collection is wired in once the OT identification rule is confirmed.
+        Write-Log "[$($OTSheet.Name)] OT source not configured yet - worksheet will be empty" 'WARN'
+        $r = New-SiteResult $OTSheet $OTHeaders; $r.VCenter = 'not configured'; $results.Add($r)
+    }
+}
+
 $saved = $false
 try {
-    Export-InventoryWorkbook $results $OutputPath ([bool]$SampleData)
+    $OutputPath = @(Export-InventoryWorkbook $results $OutputPath ([bool]$SampleData))[-1]
     $saved = $true
     Write-Log "Workbook saved: $OutputPath" 'OK'
 }
 catch {
     Write-Log "Excel export FAILED: $($_.Exception.Message) $($_.ScriptStackTrace)" 'ERROR'
     $csv = [IO.Path]::ChangeExtension($OutputPath, '.fallback.csv')
-    $results | ForEach-Object { $s = $_.Site; $_.Rows | Select-Object @{n = 'Site'; e = { $s } }, * } | Export-Csv $csv -NoTypeInformation
+    $results | ForEach-Object { $s = $_.Site; $_.Rows | Select-Object @{n = 'Sheet'; e = { $s } }, * } | Export-Csv $csv -NoTypeInformation
     Write-Log "Raw data saved to fallback CSV: $csv" 'WARN'
 }
 finally {
