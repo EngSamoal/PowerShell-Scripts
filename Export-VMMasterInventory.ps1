@@ -58,8 +58,8 @@ param(
 #   Datacenter : optional - limit to these vCenter datacenters (use when sites share a vCenter)
 #   TabColor   : hex RGB for the tab and the sheet title banner
 $Sites = @(
-    [pscustomobject]@{ Name = 'Site A'; VCenter = @('vcenter-sitea.corp.local'); Datacenter = @(); TabColor = '1F4E79' }
-    [pscustomobject]@{ Name = 'Site B'; VCenter = @('vcenter-siteb.corp.local'); Datacenter = @(); TabColor = '2E7D32' }
+    [pscustomobject]@{ Name = 'SixFlags'; VCenter = @('10.50.10.10'); Datacenter = @(); TabColor = '1F4E79' }
+    [pscustomobject]@{ Name = 'AquaArabia'; VCenter = @('vcenter-siteb.corp.local'); Datacenter = @(); TabColor = '2E7D32' }
     [pscustomobject]@{ Name = 'Site C'; VCenter = @('vcenter-sitec.corp.local'); Datacenter = @(); TabColor = 'C55A11' }
     [pscustomobject]@{ Name = 'Site D'; VCenter = @('vcenter-sited.corp.local'); Datacenter = @(); TabColor = '7030A0' }
 )
