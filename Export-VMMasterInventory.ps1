@@ -54,14 +54,17 @@ param(
 #region ======================= SITE CONFIGURATION (edit here) =======================
 # One entry per worksheet, in tab order. To add a site, copy a line and change the values.
 #   Name       : worksheet / tab name (max 31 chars, no  [ ] : * ? / \ )
-#   VCenter    : one or more vCenter FQDNs/IPs for this site
+#   VCenter    : one or more vCenter IPs or FQDNs for this site, e.g. @('10.1.1.20')
+#                (an existing PowerCLI session is reused whether it was opened by IP or by name)
 #   Datacenter : optional - limit to these vCenter datacenters (use when sites share a vCenter)
 #   TabColor   : hex RGB for the tab and the sheet title banner
+#   VCenter = @() leaves that tab blank for manual entry (nothing is collected for it)
 $Sites = @(
-    [pscustomobject]@{ Name = 'SixFlags'; VCenter = @('10.50.10.10'); Datacenter = @(); TabColor = '1F4E79' }
-    [pscustomobject]@{ Name = 'AquaArabia'; VCenter = @('vcenter-siteb.corp.local'); Datacenter = @(); TabColor = '2E7D32' }
-    [pscustomobject]@{ Name = 'Site C'; VCenter = @('vcenter-sitec.corp.local'); Datacenter = @(); TabColor = 'C55A11' }
-    [pscustomobject]@{ Name = 'Site D'; VCenter = @('vcenter-sited.corp.local'); Datacenter = @(); TabColor = '7030A0' }
+    [pscustomobject]@{ Name = 'Site A'; VCenter = @('10.10.1.20'); Datacenter = @(); TabColor = '1F4E79' }
+    [pscustomobject]@{ Name = 'Site B'; VCenter = @(); Datacenter = @(); TabColor = '2E7D32' }   # same vCenter as Site A - left blank, fill manually
+    [pscustomobject]@{ Name = 'Site C'; VCenter = @('10.30.1.20'); Datacenter = @(); TabColor = 'C55A11' }
+    [pscustomobject]@{ Name = 'Site D'; VCenter = @('10.40.1.20'); Datacenter = @(); TabColor = '7030A0' }
+    [pscustomobject]@{ Name = 'Site E'; VCenter = @('10.50.1.20'); Datacenter = @(); TabColor = 'A50021' }
 )
 
 # OT worksheet - added after the site tabs. Same columns plus 'Site', so OT VMs from every site
@@ -116,6 +119,7 @@ function New-SiteResult($Site, [string[]]$Columns = $Headers) {
         Site        = $Site.Name
         Columns     = $Columns
         VCenter     = (@($Site.VCenter) -join ', ')
+        Manual      = (@($Site.VCenter).Count -eq 0)
         TabColor    = $Site.TabColor
         Rows        = New-Object System.Collections.Generic.List[object]
         QueryOk     = 0
@@ -126,10 +130,29 @@ function New-SiteResult($Site, [string[]]$Columns = $Headers) {
 }
 
 #region ---------- vCenter collection (read-only) ----------
+function Resolve-HostAddress([string]$HostName) {
+    # Returns the IP address(es) for a name or IP; empty if it cannot be resolved
+    $ip = $null
+    if ([Net.IPAddress]::TryParse($HostName, [ref]$ip)) { return $ip.ToString() }
+    try { return @([Net.Dns]::GetHostAddresses($HostName) | ForEach-Object { $_.ToString() }) } catch { return @() }
+}
+
 function Get-VCenterSession([string]$Server) {
-    $existing = @($global:DefaultVIServers | Where-Object {
-            $_.IsConnected -and ($_.Name -eq $Server -or $_.ServiceUri.Host -eq $Server)
-        })
+    $live = @($global:DefaultVIServers | Where-Object { $_.IsConnected })
+    $existing = @($live | Where-Object { $_.Name -eq $Server -or $_.ServiceUri.Host -eq $Server })
+
+    # Config may use an IP while the session was opened by FQDN (or the reverse):
+    # compare the resolved IP addresses before deciding a new login is needed.
+    if ($existing.Count -eq 0 -and $live.Count -gt 0) {
+        $wanted = @(Resolve-HostAddress $Server)
+        if ($wanted.Count -gt 0) {
+            $existing = @($live | Where-Object {
+                    $have = @(Resolve-HostAddress $_.Name)
+                    @($have | Where-Object { $wanted -contains $_ }).Count -gt 0
+                })
+        }
+    }
+
     if ($existing.Count -gt 0) {
         Write-Log "Reusing existing PowerCLI session to $Server (user: $($existing[0].User))"
         return $existing[0]
@@ -290,17 +313,17 @@ function Get-SampleOTInventory($OT) {
     $w10 = 'Microsoft Windows 10 (64-bit)'
     $r8 = 'Red Hat Enterprise Linux 8 (64-bit)'
     $set = @(
-        @('Site A', 'OT-SA-SCADA01', '172.16.10.11', $w19, 'PoweredOn'),
-        @('Site A', 'OT-SA-HMI01', '172.16.10.21', $w10, 'PoweredOn'),
-        @('Site A', 'OT-SA-HIST01', '172.16.10.31', $w22, 'PoweredOn'),
-        @('Site B', 'OT-SB-SCADA01', '172.16.20.11', $w19, 'PoweredOn'),
-        @('Site B', 'OT-SB-EWS01', $null, $w10, 'PoweredOff'),
-        @('Site B', 'OT-SB-OPC01', '172.16.20.41', $w16, 'PoweredOn'),
-        @('Site C', 'OT-SC-SCADA01', '172.16.30.11', $w22, 'PoweredOn'),
-        @('Site C', 'OT-SC-HIST01', $null, $w19, 'Suspended'),
-        @('Site D', 'OT-SD-SCADA01', '172.16.40.11', $w22, 'PoweredOn'),
-        @('Site D', 'OT-SD-LOG01', '172.16.40.51', $r8, 'PoweredOn'),
-        @('Site D', 'OT-SD-PLCGW01', $null, $null, 'PoweredOff')
+        @($Sites[0 % $Sites.Count].Name, 'OT-SA-SCADA01', '172.16.10.11', $w19, 'PoweredOn'),
+        @($Sites[0 % $Sites.Count].Name, 'OT-SA-HMI01', '172.16.10.21', $w10, 'PoweredOn'),
+        @($Sites[0 % $Sites.Count].Name, 'OT-SA-HIST01', '172.16.10.31', $w22, 'PoweredOn'),
+        @($Sites[1 % $Sites.Count].Name, 'OT-SB-SCADA01', '172.16.20.11', $w19, 'PoweredOn'),
+        @($Sites[1 % $Sites.Count].Name, 'OT-SB-EWS01', $null, $w10, 'PoweredOff'),
+        @($Sites[1 % $Sites.Count].Name, 'OT-SB-OPC01', '172.16.20.41', $w16, 'PoweredOn'),
+        @($Sites[2 % $Sites.Count].Name, 'OT-SC-SCADA01', '172.16.30.11', $w22, 'PoweredOn'),
+        @($Sites[2 % $Sites.Count].Name, 'OT-SC-HIST01', $null, $w19, 'Suspended'),
+        @($Sites[3 % $Sites.Count].Name, 'OT-SD-SCADA01', '172.16.40.11', $w22, 'PoweredOn'),
+        @($Sites[3 % $Sites.Count].Name, 'OT-SD-LOG01', '172.16.40.51', $r8, 'PoweredOn'),
+        @($Sites[3 % $Sites.Count].Name, 'OT-SD-PLCGW01', $null, $null, 'PoweredOff')
     )
     foreach ($s in $set) {
         $result.Rows.Add([pscustomobject]@{
@@ -337,6 +360,7 @@ function Format-SiteSheet($Excel, $Ws, $SiteResult, [bool]$IsSample) {
     $src = if ($IsSample) { 'SAMPLE DATA (fictitious VMs)' } else { "vCenter: $($SiteResult.VCenter)" }
     $info = "{0}  |  Generated {1}  |  {2} VMs: {3} on, {4} off, {5} suspended  |  Yellow = manual entry, orange name = duplicate" -f `
         $src, (Get-Date -Format 'yyyy-MM-dd HH:mm'), $n, $on, $off, $sus
+    if ($SiteResult.Manual) { $info = 'Filled in manually  |  Yellow = manual entry, orange name = duplicate' }
     if ($SiteResult.QueryFailed -gt 0) { $info = "COLLECTION INCOMPLETE - $($SiteResult.QueryFailed) vCenter query failed (see log)   |   " + $info }
 
     # Column layout is driven by the header list, so sheets can carry extra columns (e.g. OT + Site)
@@ -360,7 +384,7 @@ function Format-SiteSheet($Excel, $Ws, $SiteResult, [bool]$IsSample) {
             else { $data[($h + 1 + $i), $c] = '' }
         }
     }
-    if ($n -eq 0) { $data[($h + 1), ($ci['VM NAME'] - 1)] = $(if ($SiteResult.QueryFailed -gt 0) { 'No data - vCenter query failed' } else { 'No VMs found' }) }
+    if ($n -eq 0 -and -not $SiteResult.Manual) { $data[($h + 1), ($ci['VM NAME'] - 1)] = $(if ($SiteResult.QueryFailed -gt 0) { 'No data - vCenter query failed' } else { 'No VMs found' }) }
 
     $Ws.Range($Ws.Cells.Item($headerRow + 1, $ci['IP']), $Ws.Cells.Item($lastRow, $ci['IP'])).NumberFormat = '@'   # IP stored as text
     try {
@@ -565,7 +589,8 @@ for ($i = 0; $i -lt $Sites.Count; $i++) {
     if (-not $site.TabColor) { $site.TabColor = @('1F4E79', '2E7D32', 'C55A11', '7030A0', '00838F', '8B1A1A', '5D4037', '37474F')[$i % 8] }
     Write-Log "----- $($site.Name) -----"
     try {
-        if ($SampleData) { $results.Add((Get-SampleInventory $site $i)) }
+        if (@($site.VCenter).Count -eq 0) { Write-Log "[$($site.Name)] No vCenter configured - tab left blank for manual entry"; $results.Add((New-SiteResult $site)) }
+        elseif ($SampleData) { $results.Add((Get-SampleInventory $site $i)) }
         else { $results.Add((Get-SiteInventory $site)) }
     }
     catch {
@@ -612,7 +637,7 @@ $summary = foreach ($r in $results) {
         'Queries OK'   = $r.QueryOk
         'Queries Failed' = $r.QueryFailed
         'VM Read Errors' = $r.VmErrors
-        Status         = $(if ($r.QueryFailed -gt 0 -and $r.QueryOk -eq 0) { 'FAILED' } elseif ($r.QueryFailed -gt 0 -or $r.VmErrors -gt 0) { 'PARTIAL' } else { 'OK' })
+        Status         = $(if ($r.Manual) { 'MANUAL' } elseif ($r.QueryFailed -gt 0 -and $r.QueryOk -eq 0) { 'FAILED' } elseif ($r.QueryFailed -gt 0 -or $r.VmErrors -gt 0) { 'PARTIAL' } else { 'OK' })
     }
 }
 Write-Host ''
