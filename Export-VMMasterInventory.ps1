@@ -45,7 +45,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$OutputPath = (Join-Path ([Environment]::GetFolderPath('MyDocuments')) ('VM_Master_Inventory_{0}.xlsx' -f (Get-Date -Format 'yyyyMMdd_HHmm'))),
+    [string]$OutputPath = (Join-Path ([Environment]::GetFolderPath('C:\Temp')) ('VM_Master_Inventory_{0}.xlsx' -f (Get-Date -Format 'yyyyMMdd_HHmm'))),
     [switch]$SampleData,
     [switch]$NoConnect,
     [switch]$IncludeTemplates
