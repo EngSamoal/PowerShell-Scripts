@@ -12,7 +12,7 @@
 #>
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)][string]$InputFile,
+    [string]$InputFile = 'C:\Temp\master.xlsx',     # <-- input Excel file (the AMC tab is added to this file)
     [switch]$SampleData,
     [switch]$NoConnect,
     [switch]$IncludeTemplates
