@@ -110,7 +110,9 @@ param(
     # Cluster names to skip entirely (e.g. one that's been migrated to another platform but is
     # still visible in vCenter inventory) - excluded from every section of every site's report and
     # the dashboard, as if it didn't exist. Matched by exact cluster name, case-insensitive.
-    [string[]]$ExcludeClusters = @(),
+    # RGL defaults on since it's already been migrated off this vCenter - override with
+    # -ExcludeClusters @() to include it again, or add more names as needed.
+    [string[]]$ExcludeClusters = @('RGL'),
 
     # Configurable thresholds - NOT vendor/company-defined standards. Raw values are always
     # shown regardless of these; these only drive the Warning/Critical flag shown alongside them.
@@ -127,7 +129,7 @@ param(
 # Bump this on every change. Printed first thing at startup and written into the log file, so
 # it's always possible to confirm exactly which script version produced a given run/report
 # instead of guessing whether an old cached copy is being executed somewhere.
-$ScriptBuild = '2026-09-27-15-exclude-clusters'
+$ScriptBuild = '2026-09-27-16-rgl-excluded-by-default'
 Write-Host "VMware_Weekly_HealthCheck.ps1 - build $ScriptBuild" -ForegroundColor Magenta
 
 $ErrorActionPreference = 'Stop'
