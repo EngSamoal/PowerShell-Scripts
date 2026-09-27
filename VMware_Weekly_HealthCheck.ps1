@@ -122,7 +122,7 @@ param(
 # Bump this on every change. Printed first thing at startup and written into the log file, so
 # it's always possible to confirm exactly which script version produced a given run/report
 # instead of guessing whether an old cached copy is being executed somewhere.
-$ScriptBuild = '2026-09-27-13-html-dashboard'
+$ScriptBuild = '2026-09-27-14-dashboard-capacity-storage-appliance'
 Write-Host "VMware_Weekly_HealthCheck.ps1 - build $ScriptBuild" -ForegroundColor Magenta
 
 $ErrorActionPreference = 'Stop'
@@ -1378,6 +1378,54 @@ function Get-SiteDashboardSummary {
     $drsOn = [bool]($drsAll) -and -not ($drsAll | Where-Object { $_.Value -eq 'False' })
     $haOn  = [bool]($haAll)  -and -not ($haAll  | Where-Object { $_.Value -eq 'False' })
 
+    # Capacity: same capacity-weighted average formula as docx section 6.1/6.2 (line ~1148) -
+    # matched exactly so the dashboard and the site's own report never disagree on the %.
+    $capFindings = $SiteFindings | Where-Object { $_.Area -eq 'Capacity' }
+    $cpuCapTotal = 0.0; $cpuUsedTotal = 0.0
+    $memCapTotal = 0.0; $memUsedTotal = 0.0
+    foreach ($cf in ($capFindings | Where-Object { $_.Item -eq 'CPU' })) {
+        $p = $cf.Value -split '\|'; $cap = [double]$p[0]; $cpuCapTotal += $cap
+        if ($p[1] -and $p[1] -ne '') { $cpuUsedTotal += ($cap * [double]$p[1] / 100) }
+    }
+    foreach ($cf in ($capFindings | Where-Object { $_.Item -eq 'Memory' })) {
+        $p = $cf.Value -split '\|'; $cap = [double]$p[0]; $memCapTotal += $cap
+        if ($p[1] -and $p[1] -ne '') { $memUsedTotal += ($cap * [double]$p[1] / 100) }
+    }
+    $cpuUsagePct = if ($cpuCapTotal -gt 0) { ($cpuUsedTotal / $cpuCapTotal) * 100 } else { $null }
+    $memUsagePct = if ($memCapTotal -gt 0) { ($memUsedTotal / $memCapTotal) * 100 } else { $null }
+
+    # Storage: same total-capacity/total-free rollup as docx section 6.3.
+    $AllDsFindings = $SiteFindings | Where-Object { $_.Area -eq 'Storage' -and $_.Item -eq 'Datastore' }
+    $dsCapTotal = 0.0; $dsFreeTotal = 0.0
+    foreach ($df in $AllDsFindings) {
+        $p = $df.Value -split '\|'; $dsCapTotal += [double]$p[0]; $dsFreeTotal += [double]$p[1]
+    }
+    $dsUsagePct = if ($dsCapTotal -gt 0) { (($dsCapTotal - $dsFreeTotal) / $dsCapTotal) * 100 } else { $null }
+    $dsInaccessible = [bool]($AllDsFindings | Where-Object { ($_.Value -split '\|')[2] -eq 'False' })
+
+    # Networking: same uplink/VLAN-0 exclusion as the docx (line ~926).
+    $PgFindings = $SiteFindings | Where-Object { $_.Item -eq 'Port Group' }
+    $VdsCountVal = @($SiteFindings | Where-Object { $_.Item -eq 'vDS' } | Select-Object -ExpandProperty Object -Unique).Count
+    $VlanCountVal = @($PgFindings | Where-Object {
+        $parts = $_.Value -split '\|'
+        $parts[2] -eq 'True' -and $parts[0] -ne '0'
+    } | ForEach-Object { ($_.Value -split '\|')[0] } | Select-Object -Unique).Count
+
+    # Appliance: overall rollup status + certificate expiry text, same source findings as docx 3.1.
+    $applianceStatuses = @($SiteFindings | Where-Object { $_.Area -eq 'Appliance' } | Select-Object -ExpandProperty Status)
+    $applianceWorst = if ($applianceStatuses.Count -gt 0) { Get-WorstStatus $applianceStatuses } else { 'Manual/External Required' }
+    $certF = $SiteFindings | Where-Object { $_.Area -eq 'Appliance' -and $_.Item -eq 'Certificates' } | Select-Object -First 1
+    $certText = if ($certF) { $certF.Value } else { 'n/a' }
+
+    # Backup: whether -BackupInfo was supplied for this site (the report itself is the source of
+    # truth for detail - this is just a yes/no flag so a missing backup config is visible at a glance).
+    $backupSupplied = $BackupInfo.ContainsKey($SiteLabel)
+
+    # Matches the docx's own filename pattern (line ~1308) for a "view full report" link. Doesn't
+    # account for the rare _2/_3 retry-suffix case (used only when the first save attempt fails
+    # because the file is open elsewhere) - an acceptable gap for a convenience link.
+    $docxFileName = "$($SiteLabel -replace '[\\/\?\*\[\]:<>\|]', '_')_VMware_HealthCheck_$RunDate.docx"
+
     [pscustomobject]@{
         Site          = $SiteLabel
         OverallHealth = $OverallHealth
@@ -1390,6 +1438,19 @@ function Get-SiteDashboardSummary {
         EsxiVersion   = $(if ($EsxiVersionDisplay) { $EsxiVersionDisplay } else { 'n/a' })
         DrsOn         = $drsOn
         HaOn          = $haOn
+        CpuPct        = $cpuUsagePct
+        CpuStatus     = $(if ($cpuUsagePct -ne $null) { Get-PctStatus $cpuUsagePct } else { 'Unable to Check' })
+        MemPct        = $memUsagePct
+        MemStatus     = $(if ($memUsagePct -ne $null) { Get-PctStatus $memUsagePct } else { 'Unable to Check' })
+        StoragePct    = $dsUsagePct
+        StorageStatus = $(if ($dsInaccessible) { 'Critical' } elseif ($dsUsagePct -ne $null) { Get-PctStatus $dsUsagePct } else { 'Unable to Check' })
+        StorageCapGB  = $dsCapTotal
+        VdsCount      = $VdsCountVal
+        VlanCount     = $VlanCountVal
+        ApplianceStatus = $applianceWorst
+        CertificateText = $certText
+        BackupSupplied  = $backupSupplied
+        DocxFileName    = $docxFileName
     }
 }
 
@@ -1421,6 +1482,18 @@ function Write-DashboardHtml {
             'Warning'  { 'Healthy - Minor Issues Detected' }
             'Critical' { 'Attention Required - Critical Issues' }
         }
+        # Neutral gray for anything that isn't a plain Healthy/Warning/Critical percentage status
+        # (Unable to Check) - avoids implying a false Healthy/Critical read on missing data.
+        $pctColor = @{ Healthy = '#2e7d32'; Warning = '#e6a100'; Critical = '#c62828'; 'Unable to Check' = '#888' }
+        $cpuText = if ($s.CpuPct -ne $null) { "{0:N1}%" -f $s.CpuPct } else { 'n/a' }
+        $memText = if ($s.MemPct -ne $null) { "{0:N1}%" -f $s.MemPct } else { 'n/a' }
+        $stgText = if ($s.StoragePct -ne $null) { "{0:N1}% of {1:N0} GB" -f $s.StoragePct, $s.StorageCapGB } else { 'n/a' }
+        $applianceLabel = switch ($s.ApplianceStatus) {
+            'Healthy' { 'Healthy' }
+            'Manual/External Required' { 'Not Connected' }
+            'Unable to Check' { 'Unable to Check' }
+            default { $s.ApplianceStatus }
+        }
 @"
         <div class="card">
           <div class="card-head">
@@ -1440,6 +1513,20 @@ function Write-DashboardHtml {
             <tr><td>vSphere DRS</td><td>$(if ($s.DrsOn) {'ON'} else {'OFF'})</td></tr>
             <tr><td>vSphere HA</td><td>$(if ($s.HaOn) {'ON'} else {'OFF'})</td></tr>
           </table>
+          <div class="section-label">Capacity</div>
+          <table class="metrics">
+            <tr><td>CPU Usage</td><td style="color:$($pctColor[$s.CpuStatus])">$cpuText</td></tr>
+            <tr><td>Memory Usage</td><td style="color:$($pctColor[$s.MemStatus])">$memText</td></tr>
+            <tr><td>Storage Usage</td><td style="color:$($pctColor[$s.StorageStatus])">$(ConvertTo-HtmlSafe $stgText)</td></tr>
+          </table>
+          <div class="section-label">Networking &amp; Appliance</div>
+          <table class="metrics">
+            <tr><td>vDS / VLANs</td><td>$($s.VdsCount) / $($s.VlanCount)</td></tr>
+            <tr><td>Appliance Health</td><td>$(ConvertTo-HtmlSafe $applianceLabel)</td></tr>
+            <tr><td>Certificate</td><td>$(ConvertTo-HtmlSafe $s.CertificateText)</td></tr>
+            <tr><td>Backup Configured</td><td>$(if ($s.BackupSupplied) {'Yes'} else {'Not Supplied'})</td></tr>
+          </table>
+          <a class="report-link" href="$(ConvertTo-HtmlSafe $s.DocxFileName)">View Full Report &rarr;</a>
         </div>
 "@
     }) -join "`n"
@@ -1475,6 +1562,9 @@ function Write-DashboardHtml {
   table.metrics td { padding:4px 0; border-bottom:1px solid #eee; }
   table.metrics td:first-child { color:#666; }
   table.metrics td:last-child { text-align:right; font-weight:600; }
+  .section-label { font-size:11px; text-transform:uppercase; letter-spacing:0.04em; color:#999; margin:14px 0 4px; font-weight:bold; }
+  .report-link { display:inline-block; margin-top:14px; font-size:13px; color:#1E3A5F; font-weight:600; text-decoration:none; }
+  .report-link:hover { text-decoration:underline; }
   footer { margin-top:32px; color:#888; font-size:12px; }
 </style>
 </head>
