@@ -129,7 +129,7 @@ param(
 # Bump this on every change. Printed first thing at startup and written into the log file, so
 # it's always possible to confirm exactly which script version produced a given run/report
 # instead of guessing whether an old cached copy is being executed somewhere.
-$ScriptBuild = '2026-09-27-16-rgl-excluded-by-default'
+$ScriptBuild = '2026-09-27-17-tls-fix-substring-exclude-tabbed-dashboard'
 Write-Host "VMware_Weekly_HealthCheck.ps1 - build $ScriptBuild" -ForegroundColor Magenta
 
 $ErrorActionPreference = 'Stop'
@@ -256,7 +256,14 @@ function Get-RemoteCertificateExpiry {
         if (-not $connectTask.Wait($TimeoutMs)) { throw "Connection to ${TargetHost}:${Port} timed out after ${TimeoutMs}ms." }
         $callback = [System.Net.Security.RemoteCertificateValidationCallback]{ param($s,$c,$ch,$e) $true }
         $sslStream = [System.Net.Security.SslStream]::new($tcpClient.GetStream(), $false, $callback)
-        $sslStream.AuthenticateAsClient($TargetHost)
+        # Explicit TLS 1.2 (+1.3 where the runtime's SslProtocols enum has it) instead of the
+        # single-argument AuthenticateAsClient(hostname) overload, which lets the .NET
+        # Framework/SChannel default negotiation choose. On Windows PowerShell 5.1 that default can
+        # fail a modern TLS-only server with "A call to SSPI failed, see inner exception" - a
+        # well-known legacy-negotiation gap, not a problem with the target server itself.
+        $protocols = [System.Security.Authentication.SslProtocols]::Tls12
+        try { $protocols = $protocols -bor [System.Security.Authentication.SslProtocols]::Tls13 } catch { }
+        $sslStream.AuthenticateAsClient($TargetHost, $null, $protocols, $false)
         $rawCert = $sslStream.RemoteCertificate
         if (-not $rawCert) { throw "No certificate presented by ${TargetHost}:${Port}." }
         return [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($rawCert).NotAfter
@@ -517,7 +524,19 @@ foreach ($VC in $Connections) {
 
     # --- Discover clusters ---------------------------------------------------------------------
     $Clusters = Invoke-SafeCheck -CheckName 'Cluster discovery' -VCenter $VCName -Site $Site -ObjectName $VCName -Script {
-        Get-Cluster -Server $VC | Where-Object { $_.Name -notin $ExcludeClusters }
+        $allClusters = Get-Cluster -Server $VC
+        # Substring match rather than exact equality - a trailing space, prefix, or suffix in the
+        # real cluster name (e.g. "RGL-01" or "AMC_RGL") would silently defeat an exact match, and
+        # exclusion failing SILENTLY is worse than it matching a little too broadly.
+        $kept = $allClusters | Where-Object {
+            $clusterName = $_.Name
+            -not ($ExcludeClusters | Where-Object { $clusterName -like "*$_*" })
+        }
+        $excluded = @($allClusters | Where-Object { $_.Name -notin $kept.Name })
+        if ($excluded.Count -gt 0) {
+            Write-Host "  Excluding cluster(s) for $Site : $($excluded.Name -join ', ')" -ForegroundColor Yellow
+        }
+        $kept
     }
     if (-not $Clusters) { continue }
 
@@ -1433,6 +1452,24 @@ function Get-SiteDashboardSummary {
     # because the file is open elsewhere) - an acceptable gap for a convenience link.
     $docxFileName = "$($SiteLabel -replace '[\\/\?\*\[\]:<>\|]', '_')_VMware_HealthCheck_$RunDate.docx"
 
+    # Per-cluster breakdown (Hosts/VMs/CPU%/Mem%) for the site's own full dashboard page - every
+    # finding used here already carries -Cluster (confirmed against the real New-Finding calls),
+    # so this is a straight per-cluster read rather than a re-derived aggregate.
+    $clusterRows = foreach ($cn in @($Global:SiteClusterMap[$SiteLabel])) {
+        $hf = $AllHostFindings | Where-Object { $_.Cluster -eq $cn } | Select-Object -First 1
+        $clusterHosts = if ($hf) { [int]($hf.Value -split '\|')[0] } else { 0 }
+        $clusterVMs = 0
+        foreach ($g in ($SiteFindings | Where-Object { $_.Area -eq 'VM' -and $_.Item -eq 'Guest OS' -and $_.Cluster -eq $cn })) { $clusterVMs += [int]$g.Value }
+        $cCpuF = $capFindings | Where-Object { $_.Item -eq 'CPU' -and $_.Cluster -eq $cn } | Select-Object -First 1
+        $cMemF = $capFindings | Where-Object { $_.Item -eq 'Memory' -and $_.Cluster -eq $cn } | Select-Object -First 1
+        $cCpuPct = if ($cCpuF) { $p = $cCpuF.Value -split '\|'; if ($p[1] -and $p[1] -ne '') { [double]$p[1] } else { $null } } else { $null }
+        $cMemPct = if ($cMemF) { $p = $cMemF.Value -split '\|'; if ($p[1] -and $p[1] -ne '') { [double]$p[1] } else { $null } } else { $null }
+        [pscustomobject]@{
+            Cluster = $cn; Hosts = $clusterHosts; VMs = $clusterVMs
+            CpuPct = $cCpuPct; MemPct = $cMemPct
+        }
+    }
+
     [pscustomobject]@{
         Site          = $SiteLabel
         OverallHealth = $OverallHealth
@@ -1442,6 +1479,7 @@ function Get-SiteDashboardSummary {
         HostCount     = $HostCountTotal
         VmCount       = $VmCountTotal
         ClusterCount  = $ClusterCount
+        ClusterRows   = @($clusterRows)
         EsxiVersion   = $(if ($EsxiVersionDisplay) { $EsxiVersionDisplay } else { 'n/a' })
         DrsOn         = $drsOn
         HaOn          = $haOn
@@ -1464,13 +1502,24 @@ function Get-SiteDashboardSummary {
 # Writes the combined multi-site overview dashboard - one static, self-contained HTML file with
 # no external dependencies (no CDN/internet access assumed), so it opens correctly straight from
 # disk on an offline/internal machine just like the .docx/.log files do.
+function ConvertTo-Slug {
+    param([string]$Text)
+    $slug = ($Text -replace '[^a-zA-Z0-9]+', '-').Trim('-').ToLower()
+    if (-not $slug) { return 'site' }
+    return $slug
+}
+
 function Write-DashboardHtml {
     param([string[]]$SiteLabels, [string]$OutputPath, [string]$RunDateDisplay, [string]$ScriptBuild)
 
-    $summaries = @($SiteLabels | ForEach-Object { Get-SiteDashboardSummary -SiteLabel $_ } | Where-Object { $_ })
+    $summaries = @($SiteLabels | ForEach-Object { Get-SiteDashboardSummary -SiteLabel $_ } | Where-Object { $_ } | Sort-Object Site)
     if ($summaries.Count -eq 0) { return }
 
     $healthColor = @{ Healthy = '#2e7d32'; Warning = '#e6a100'; Critical = '#c62828' }
+    # Neutral gray for anything that isn't a plain Healthy/Warning/Critical percentage status
+    # (Unable to Check) - avoids implying a false Healthy/Critical read on missing data.
+    $pctColor = @{ Healthy = '#2e7d32'; Warning = '#e6a100'; Critical = '#c62828'; 'Unable to Check' = '#888' }
+    $healthLabelText = @{ Healthy = 'Healthy - No Issues Detected'; Warning = 'Healthy - Minor Issues Detected'; Critical = 'Attention Required - Critical Issues' }
     $healthCounts = @{
         Healthy  = @($summaries | Where-Object { $_.OverallHealth -eq 'Healthy' }).Count
         Warning  = @($summaries | Where-Object { $_.OverallHealth -eq 'Warning' }).Count
@@ -1481,60 +1530,124 @@ function Write-DashboardHtml {
     $totalHosts  = ($summaries | Measure-Object -Property HostCount -Sum).Sum
     $totalVMs    = ($summaries | Measure-Object -Property VmCount -Sum).Sum
 
-    $cards = ($summaries | Sort-Object Site | ForEach-Object {
+    # Small colored horizontal bar used for each percentage metric - width is capped at 100 so a
+    # freak >100% reading (shouldn't happen, but data is data) never breaks the layout.
+    function Get-BarHtml {
+        param([Nullable[double]]$Pct, [string]$Status, [string]$Label, [string]$ValueText)
+        $pctColorLocal = @{ Healthy = '#2e7d32'; Warning = '#e6a100'; Critical = '#c62828'; 'Unable to Check' = '#888' }
+        $color = $pctColorLocal[$Status]
+        $width = if ($Pct -ne $null) { [Math]::Min(100, [Math]::Max(0, $Pct)) } else { 0 }
+@"
+          <div class="bar-row">
+            <div class="bar-label"><span>$(ConvertTo-HtmlSafe $Label)</span><span style="color:$color; font-weight:bold">$(ConvertTo-HtmlSafe $ValueText)</span></div>
+            <div class="bar-track"><div class="bar-fill" style="width:$width%;background:$color"></div></div>
+          </div>
+"@
+    }
+
+    # --- Overview page: a compact comparison table, not full-detail cards - one row per site ---
+    $overviewRows = ($summaries | ForEach-Object {
         $s = $_
-        $color = $healthColor[$s.OverallHealth]
-        $healthLabel = switch ($s.OverallHealth) {
-            'Healthy'  { 'Healthy - No Issues Detected' }
-            'Warning'  { 'Healthy - Minor Issues Detected' }
-            'Critical' { 'Attention Required - Critical Issues' }
-        }
-        # Neutral gray for anything that isn't a plain Healthy/Warning/Critical percentage status
-        # (Unable to Check) - avoids implying a false Healthy/Critical read on missing data.
-        $pctColor = @{ Healthy = '#2e7d32'; Warning = '#e6a100'; Critical = '#c62828'; 'Unable to Check' = '#888' }
+        $slug = ConvertTo-Slug $s.Site
         $cpuText = if ($s.CpuPct -ne $null) { "{0:N1}%" -f $s.CpuPct } else { 'n/a' }
         $memText = if ($s.MemPct -ne $null) { "{0:N1}%" -f $s.MemPct } else { 'n/a' }
-        $stgText = if ($s.StoragePct -ne $null) { "{0:N1}% of {1:N0} GB" -f $s.StoragePct, $s.StorageCapGB } else { 'n/a' }
+        $stgText = if ($s.StoragePct -ne $null) { "{0:N1}%" -f $s.StoragePct } else { 'n/a' }
+@"
+        <tr onclick="showPage('$slug')">
+          <td><a href="#" onclick="showPage('$slug'); return false;" class="site-link">$(ConvertTo-HtmlSafe $s.Site)</a></td>
+          <td><span class="badge" style="background:$($healthColor[$s.OverallHealth])">$(ConvertTo-HtmlSafe $healthLabelText[$s.OverallHealth])</span></td>
+          <td class="num-cell"><span class="risk risk-high">$($s.HighRisk)</span></td>
+          <td class="num-cell"><span class="risk risk-med">$($s.MediumRisk)</span></td>
+          <td class="num-cell"><span class="risk risk-low">$($s.LowRisk)</span></td>
+          <td class="num-cell">$($s.HostCount)</td>
+          <td class="num-cell">$($s.ClusterCount)</td>
+          <td class="num-cell">$($s.VmCount)</td>
+          <td class="num-cell" style="color:$($pctColor[$s.CpuStatus])">$cpuText</td>
+          <td class="num-cell" style="color:$($pctColor[$s.MemStatus])">$memText</td>
+          <td class="num-cell" style="color:$($pctColor[$s.StorageStatus])">$stgText</td>
+        </tr>
+"@
+    }) -join "`n"
+
+    # --- Tab navigation bar ---
+    $tabButtons = (@('<button class="tab active" id="tab-overview" onclick="showPage(''overview'')">Overview</button>') + ($summaries | ForEach-Object {
+        $slug = ConvertTo-Slug $_.Site
+        $dotColor = $healthColor[$_.OverallHealth]
+        "<button class=`"tab`" id=`"tab-$slug`" onclick=`"showPage('$slug')`"><span class=`"tab-dot`" style=`"background:$dotColor`"></span>$(ConvertTo-HtmlSafe $_.Site)</button>"
+    })) -join "`n    "
+
+    # --- One full, spacious page per site ---
+    $sitePages = ($summaries | ForEach-Object {
+        $s = $_
+        $slug = ConvertTo-Slug $s.Site
+        $color = $healthColor[$s.OverallHealth]
         $applianceLabel = switch ($s.ApplianceStatus) {
             'Healthy' { 'Healthy' }
             'Manual/External Required' { 'Not Connected' }
             'Unable to Check' { 'Unable to Check' }
             default { $s.ApplianceStatus }
         }
+        $stgText = if ($s.StoragePct -ne $null) { "{0:N1}% of {1:N0} GB" -f $s.StoragePct, $s.StorageCapGB } else { 'n/a' }
+        $clusterTableRows = if ($s.ClusterRows.Count -gt 0) {
+            ($s.ClusterRows | ForEach-Object {
+                $cr = $_
+                $crCpu = if ($cr.CpuPct -ne $null) { "{0:N1}%" -f $cr.CpuPct } else { 'n/a' }
+                $crMem = if ($cr.MemPct -ne $null) { "{0:N1}%" -f $cr.MemPct } else { 'n/a' }
+                "<tr><td>$(ConvertTo-HtmlSafe $cr.Cluster)</td><td class='num-cell'>$($cr.Hosts)</td><td class='num-cell'>$($cr.VMs)</td><td class='num-cell'>$crCpu</td><td class='num-cell'>$crMem</td></tr>"
+            }) -join "`n"
+        } else { "<tr><td colspan='5' style='color:#999'>No cluster detail available</td></tr>" }
 @"
-        <div class="card">
-          <div class="card-head">
-            <h2>$(ConvertTo-HtmlSafe $s.Site)</h2>
-            <span class="badge" style="background:$color">$(ConvertTo-HtmlSafe $healthLabel)</span>
+      <section class="page" id="page-$slug">
+        <div class="site-hero" style="border-left-color:$color">
+          <div>
+            <h1>$(ConvertTo-HtmlSafe $s.Site)</h1>
+            <span class="badge big" style="background:$color">$(ConvertTo-HtmlSafe $healthLabelText[$s.OverallHealth])</span>
           </div>
-          <div class="risk-row">
-            <span class="risk risk-high">High: $($s.HighRisk)</span>
-            <span class="risk risk-med">Medium: $($s.MediumRisk)</span>
-            <span class="risk risk-low">Low: $($s.LowRisk)</span>
-          </div>
-          <table class="metrics">
-            <tr><td>ESXi Hosts</td><td>$($s.HostCount)</td></tr>
-            <tr><td>Clusters</td><td>$($s.ClusterCount)</td></tr>
-            <tr><td>Virtual Machines</td><td>$($s.VmCount)</td></tr>
-            <tr><td>ESXi Version</td><td>$(ConvertTo-HtmlSafe $s.EsxiVersion)</td></tr>
-            <tr><td>vSphere DRS</td><td>$(if ($s.DrsOn) {'ON'} else {'OFF'})</td></tr>
-            <tr><td>vSphere HA</td><td>$(if ($s.HaOn) {'ON'} else {'OFF'})</td></tr>
-          </table>
-          <div class="section-label">Capacity</div>
-          <table class="metrics">
-            <tr><td>CPU Usage</td><td style="color:$($pctColor[$s.CpuStatus])">$cpuText</td></tr>
-            <tr><td>Memory Usage</td><td style="color:$($pctColor[$s.MemStatus])">$memText</td></tr>
-            <tr><td>Storage Usage</td><td style="color:$($pctColor[$s.StorageStatus])">$(ConvertTo-HtmlSafe $stgText)</td></tr>
-          </table>
-          <div class="section-label">Networking &amp; Appliance</div>
-          <table class="metrics">
-            <tr><td>vDS / VLANs</td><td>$($s.VdsCount) / $($s.VlanCount)</td></tr>
-            <tr><td>Appliance Health</td><td>$(ConvertTo-HtmlSafe $applianceLabel)</td></tr>
-            <tr><td>Certificate</td><td>$(ConvertTo-HtmlSafe $s.CertificateText)</td></tr>
-            <tr><td>Backup Configured</td><td>$(if ($s.BackupSupplied) {'Yes'} else {'Not Supplied'})</td></tr>
-          </table>
-          <a class="report-link" href="$(ConvertTo-HtmlSafe $s.DocxFileName)">View Full Report &rarr;</a>
+          <a class="report-link big" href="$(ConvertTo-HtmlSafe $s.DocxFileName)">View Full Report &rarr;</a>
         </div>
+
+        <div class="risk-row big">
+          <span class="risk risk-high">High Risk: $($s.HighRisk)</span>
+          <span class="risk risk-med">Medium Risk: $($s.MediumRisk)</span>
+          <span class="risk risk-low">Low Risk: $($s.LowRisk)</span>
+        </div>
+
+        <div class="tile-row">
+          <div class="tile"><span class="num">$($s.HostCount)</span><span class="label">ESXi Hosts</span></div>
+          <div class="tile"><span class="num">$($s.ClusterCount)</span><span class="label">Clusters</span></div>
+          <div class="tile"><span class="num">$($s.VmCount)</span><span class="label">Virtual Machines</span></div>
+          <div class="tile"><span class="num" style="font-size:20px">$(ConvertTo-HtmlSafe $s.EsxiVersion)</span><span class="label">ESXi Version</span></div>
+          <div class="tile"><span class="num $(if ($s.DrsOn) {'on'} else {'off'})">$(if ($s.DrsOn) {'ON'} else {'OFF'})</span><span class="label">vSphere DRS</span></div>
+          <div class="tile"><span class="num $(if ($s.HaOn) {'on'} else {'off'})">$(if ($s.HaOn) {'ON'} else {'OFF'})</span><span class="label">vSphere HA</span></div>
+        </div>
+
+        <div class="panel-grid">
+          <div class="panel">
+            <h3>Capacity</h3>
+$(Get-BarHtml -Pct $s.CpuPct -Status $s.CpuStatus -Label 'CPU Usage' -ValueText $(if ($s.CpuPct -ne $null) { "{0:N1}%" -f $s.CpuPct } else { 'n/a' }))
+$(Get-BarHtml -Pct $s.MemPct -Status $s.MemStatus -Label 'Memory Usage' -ValueText $(if ($s.MemPct -ne $null) { "{0:N1}%" -f $s.MemPct } else { 'n/a' }))
+$(Get-BarHtml -Pct $s.StoragePct -Status $s.StorageStatus -Label 'Storage Usage' -ValueText $stgText)
+          </div>
+          <div class="panel">
+            <h3>Networking &amp; Appliance</h3>
+            <table class="metrics">
+              <tr><td>Distributed Switches</td><td>$($s.VdsCount)</td></tr>
+              <tr><td>VLANs Configured</td><td>$($s.VlanCount)</td></tr>
+              <tr><td>Appliance Health</td><td>$(ConvertTo-HtmlSafe $applianceLabel)</td></tr>
+              <tr><td>Certificate</td><td>$(ConvertTo-HtmlSafe $s.CertificateText)</td></tr>
+              <tr><td>Backup Configured</td><td>$(if ($s.BackupSupplied) {'Yes'} else {'Not Supplied'})</td></tr>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h3>Clusters</h3>
+          <table class="metrics wide">
+            <tr><th>Cluster</th><th>Hosts</th><th>VMs</th><th>CPU %</th><th>Memory %</th></tr>
+$clusterTableRows
+          </table>
+        </div>
+      </section>
 "@
     }) -join "`n"
 
@@ -1545,33 +1658,61 @@ function Write-DashboardHtml {
 <meta charset="UTF-8">
 <title>VMware Weekly Health Check - Dashboard</title>
 <style>
-  body { font-family: Calibri, Arial, sans-serif; background:#f4f6f8; color:#1a1a1a; margin:0; padding:24px; }
-  h1 { color:#1E3A5F; margin-bottom:4px; }
-  .subtitle { color:#555; margin-top:0; margin-bottom:24px; }
-  .summary-strip { display:flex; gap:16px; flex-wrap:wrap; margin-bottom:28px; }
+  body { font-family: Calibri, Arial, sans-serif; background:#f4f6f8; color:#1a1a1a; margin:0; padding:0 24px 24px; }
+  h1 { color:#1E3A5F; margin:0; }
+  .subtitle { color:#555; margin:4px 0 16px; }
+  .tabs { display:flex; gap:6px; flex-wrap:wrap; padding:16px 0; position:sticky; top:0; background:#f4f6f8; z-index:10; border-bottom:1px solid #e0e0e0; margin-bottom:24px; }
+  .tab { border:1px solid #d7dce1; background:#fff; color:#333; padding:8px 16px; border-radius:20px; font-size:14px; cursor:pointer; display:flex; align-items:center; gap:6px; }
+  .tab.active { background:#1E3A5F; color:#fff; border-color:#1E3A5F; }
+  .tab-dot { width:9px; height:9px; border-radius:50%; display:inline-block; }
+  .page { display:none; }
+  .page.active { display:block; }
+  .summary-strip { display:flex; gap:16px; flex-wrap:wrap; margin-bottom:24px; }
   .stat { background:#fff; border-radius:8px; padding:16px 20px; box-shadow:0 1px 3px rgba(0,0,0,0.12); min-width:140px; }
   .stat .num { font-size:28px; font-weight:bold; display:block; }
   .stat .label { color:#666; font-size:13px; }
   .stat.healthy .num { color:#2e7d32; }
   .stat.warning .num { color:#e6a100; }
   .stat.critical .num { color:#c62828; }
-  .grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap:20px; }
-  .card { background:#fff; border-radius:8px; padding:18px 20px; box-shadow:0 1px 3px rgba(0,0,0,0.12); }
-  .card-head { display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:10px; }
-  .card-head h2 { margin:0; font-size:19px; color:#1E3A5F; }
+  table.overview { width:100%; border-collapse:collapse; background:#fff; border-radius:8px; overflow:hidden; box-shadow:0 1px 3px rgba(0,0,0,0.12); }
+  table.overview th { background:#1E3A5F; color:#fff; text-align:left; padding:10px 12px; font-size:13px; }
+  table.overview td { padding:10px 12px; border-bottom:1px solid #eee; font-size:14px; }
+  table.overview tr:hover { background:#f8fafc; cursor:pointer; }
+  .num-cell { text-align:center; font-weight:600; }
+  .site-link { color:#1E3A5F; font-weight:bold; text-decoration:none; }
+  .site-link:hover { text-decoration:underline; }
   .badge { color:#fff; padding:4px 10px; border-radius:12px; font-size:12px; font-weight:bold; white-space:nowrap; }
+  .badge.big { font-size:15px; padding:6px 16px; border-radius:16px; }
   .risk-row { display:flex; gap:10px; margin-bottom:12px; flex-wrap:wrap; }
+  .risk-row.big { margin:20px 0; }
+  .risk-row.big .risk { font-size:15px; padding:8px 16px; }
   .risk { font-size:12px; padding:3px 8px; border-radius:4px; font-weight:bold; }
   .risk-high { background:#fdecea; color:#c62828; }
   .risk-med  { background:#fff6e0; color:#8a6100; }
   .risk-low  { background:#eef2f5; color:#555; }
+  .site-hero { display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:16px; border-left:6px solid; padding:10px 0 10px 20px; margin-bottom:8px; }
+  .report-link { display:inline-block; font-size:13px; color:#1E3A5F; font-weight:600; text-decoration:none; }
+  .report-link.big { font-size:15px; background:#1E3A5F; color:#fff; padding:10px 20px; border-radius:6px; }
+  .report-link.big:hover { background:#15304d; }
+  .tile-row { display:grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap:16px; margin-bottom:24px; }
+  .tile { background:#fff; border-radius:8px; padding:16px; text-align:center; box-shadow:0 1px 3px rgba(0,0,0,0.12); }
+  .tile .num { font-size:24px; font-weight:bold; display:block; color:#1E3A5F; }
+  .tile .num.on { color:#2e7d32; }
+  .tile .num.off { color:#c62828; }
+  .tile .label { color:#666; font-size:12px; margin-top:4px; display:block; }
+  .panel-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap:20px; margin-bottom:20px; }
+  .panel { background:#fff; border-radius:8px; padding:18px 20px; box-shadow:0 1px 3px rgba(0,0,0,0.12); }
+  .panel h3 { margin:0 0 14px; color:#1E3A5F; font-size:15px; }
+  .bar-row { margin-bottom:16px; }
+  .bar-label { display:flex; justify-content:space-between; font-size:13px; color:#555; margin-bottom:4px; }
+  .bar-track { background:#eef1f4; border-radius:6px; height:10px; overflow:hidden; }
+  .bar-fill { height:100%; border-radius:6px; }
   table.metrics { width:100%; border-collapse:collapse; font-size:14px; }
-  table.metrics td { padding:4px 0; border-bottom:1px solid #eee; }
+  table.metrics td, table.metrics th { padding:6px 4px; border-bottom:1px solid #eee; }
   table.metrics td:first-child { color:#666; }
-  table.metrics td:last-child { text-align:right; font-weight:600; }
-  .section-label { font-size:11px; text-transform:uppercase; letter-spacing:0.04em; color:#999; margin:14px 0 4px; font-weight:bold; }
-  .report-link { display:inline-block; margin-top:14px; font-size:13px; color:#1E3A5F; font-weight:600; text-decoration:none; }
-  .report-link:hover { text-decoration:underline; }
+  table.metrics td:last-child:not(:first-child) { text-align:right; font-weight:600; }
+  table.metrics.wide th { text-align:left; color:#999; font-size:11px; text-transform:uppercase; }
+  table.metrics.wide td:not(:first-child) { text-align:center; }
   footer { margin-top:32px; color:#888; font-size:12px; }
 </style>
 </head>
@@ -1579,21 +1720,42 @@ function Write-DashboardHtml {
   <h1>VMware Weekly Health Check - Dashboard</h1>
   <p class="subtitle">Generated $(ConvertTo-HtmlSafe $RunDateDisplay) - $($summaries.Count) site(s)</p>
 
-  <div class="summary-strip">
-    <div class="stat healthy"><span class="num">$($healthCounts.Healthy)</span><span class="label">Healthy Sites</span></div>
-    <div class="stat warning"><span class="num">$($healthCounts.Warning)</span><span class="label">Sites with Warnings</span></div>
-    <div class="stat critical"><span class="num">$($healthCounts.Critical)</span><span class="label">Sites Critical</span></div>
-    <div class="stat"><span class="num">$totalHigh</span><span class="label">Total High Risk Issues</span></div>
-    <div class="stat"><span class="num">$totalMedium</span><span class="label">Total Medium Risk Issues</span></div>
-    <div class="stat"><span class="num">$totalHosts</span><span class="label">Total ESXi Hosts</span></div>
-    <div class="stat"><span class="num">$totalVMs</span><span class="label">Total VMs</span></div>
-  </div>
+  <nav class="tabs">
+    $tabButtons
+  </nav>
 
-  <div class="grid">
-$cards
-  </div>
+  <section class="page active" id="page-overview">
+    <div class="summary-strip">
+      <div class="stat healthy"><span class="num">$($healthCounts.Healthy)</span><span class="label">Healthy Sites</span></div>
+      <div class="stat warning"><span class="num">$($healthCounts.Warning)</span><span class="label">Sites with Warnings</span></div>
+      <div class="stat critical"><span class="num">$($healthCounts.Critical)</span><span class="label">Sites Critical</span></div>
+      <div class="stat"><span class="num">$totalHigh</span><span class="label">Total High Risk Issues</span></div>
+      <div class="stat"><span class="num">$totalMedium</span><span class="label">Total Medium Risk Issues</span></div>
+      <div class="stat"><span class="num">$totalHosts</span><span class="label">Total ESXi Hosts</span></div>
+      <div class="stat"><span class="num">$totalVMs</span><span class="label">Total VMs</span></div>
+    </div>
+
+    <table class="overview">
+      <tr><th>Site</th><th>Health</th><th>High</th><th>Med</th><th>Low</th><th>Hosts</th><th>Clusters</th><th>VMs</th><th>CPU</th><th>Mem</th><th>Storage</th></tr>
+$overviewRows
+    </table>
+  </section>
+
+$sitePages
 
   <footer>VMware_Weekly_HealthCheck.ps1 - build $(ConvertTo-HtmlSafe $ScriptBuild)</footer>
+
+<script>
+function showPage(slug) {
+  document.querySelectorAll('.page').forEach(function(el){ el.classList.remove('active'); });
+  document.querySelectorAll('.tab').forEach(function(el){ el.classList.remove('active'); });
+  var page = document.getElementById('page-' + slug);
+  var tab = document.getElementById('tab-' + slug);
+  if (page) { page.classList.add('active'); }
+  if (tab) { tab.classList.add('active'); }
+  window.scrollTo(0, 0);
+}
+</script>
 </body>
 </html>
 "@
