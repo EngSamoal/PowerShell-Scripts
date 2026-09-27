@@ -122,7 +122,7 @@ param(
 # Bump this on every change. Printed first thing at startup and written into the log file, so
 # it's always possible to confirm exactly which script version produced a given run/report
 # instead of guessing whether an old cached copy is being executed somewhere.
-$ScriptBuild = '2026-08-09-11-vami-reason-and-logging'
+$ScriptBuild = '2026-09-27-12-direct-cert-vlan0-vm-proxy'
 Write-Host "VMware_Weekly_HealthCheck.ps1 - build $ScriptBuild" -ForegroundColor Magenta
 
 $ErrorActionPreference = 'Stop'
@@ -237,6 +237,46 @@ function Get-VamiFailureReason {
     else { return 'Unable to Check' }
 }
 
+# Reads vCenter's own HTTPS certificate directly over a raw TLS handshake to port 443 - this is
+# the exact same certificate the VAMI certificate_management API reports on, but needs NO vCenter
+# permission of any kind, only the same network reachability PowerCLI itself already relies on.
+# Used as the primary source for the Certificates row so it doesn't depend on VAMI/CIS access.
+function Get-RemoteCertificateExpiry {
+    param([string]$TargetHost, [int]$Port = 443, [int]$TimeoutMs = 5000)
+    $tcpClient = [System.Net.Sockets.TcpClient]::new()
+    try {
+        $connectTask = $tcpClient.ConnectAsync($TargetHost, $Port)
+        if (-not $connectTask.Wait($TimeoutMs)) { throw "Connection to ${TargetHost}:${Port} timed out after ${TimeoutMs}ms." }
+        $callback = [System.Net.Security.RemoteCertificateValidationCallback]{ param($s,$c,$ch,$e) $true }
+        $sslStream = [System.Net.Security.SslStream]::new($tcpClient.GetStream(), $false, $callback)
+        $sslStream.AuthenticateAsClient($TargetHost)
+        $rawCert = $sslStream.RemoteCertificate
+        if (-not $rawCert) { throw "No certificate presented by ${TargetHost}:${Port}." }
+        return [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($rawCert).NotAfter
+    } finally {
+        $tcpClient.Dispose()
+    }
+}
+
+# Best-effort lookup of the vCenter appliance's OWN VM in its managed inventory, used only as a
+# fallback when the VAMI CPU/Memory health call fails. Deliberately conservative: only returns a
+# match when exactly one VM is found by exact short-hostname or guest-IP match, since a wrong
+# guess here would be worse than admitting the data isn't available. This gives a VM-level
+# resource-utilization PROXY (the vSphere hypervisor's view), which is a genuinely different
+# metric from VAMI's internal appliance health (e.g. internal filesystem/partition pressure) -
+# never present it as equivalent, always label it as a proxy.
+function Find-ApplianceVM {
+    param($VC, [string]$VCName)
+    try {
+        $shortName = ($VCName -split '\.')[0]
+        $candidates = @(Get-VM -Server $VC -ErrorAction SilentlyContinue | Where-Object {
+            $_.Name -eq $shortName -or (@($_.Guest.IPAddress) -contains $VCName)
+        })
+        if ($candidates.Count -eq 1) { return $candidates[0] }
+        return $null
+    } catch { return $null }
+}
+
 # ============================================================================
 # 1. PREREQUISITES / CONNECTED SESSION DISCOVERY
 # ============================================================================
@@ -339,8 +379,26 @@ foreach ($VC in $Connections) {
                         -Item $label -Value $(if ($val -eq 'green') { 'Normal' } else { $val }) -Status $(if ($val -eq 'green') {'Healthy'} else {'Warning'})
                 } catch {
                     Write-CheckLog -VCenter $VCName -Site $Site -Object $VCName -CheckName "Appliance $label (VAMI)" -ErrorMessage $_.Exception.Message
-                    New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item $label `
-                        -Value (Get-VamiFailureReason $_.Exception.Message) -Status 'Unable to Check' -Notes "VAMI call failed: $($_.Exception.Message)"
+                    # Fallback: a VM-level resource-utilization PROXY from vSphere itself (only for
+                    # CPU/Memory - there's no meaningful vSphere-only equivalent for internal
+                    # appliance disk/partition usage). Only used when exactly one candidate VM is
+                    # found with high confidence - see Find-ApplianceVM. Clearly labeled as a proxy,
+                    # never presented as equivalent to the real internal appliance health check.
+                    $applianceVM = if ($comp -in 'cpu','mem') { Find-ApplianceVM -VC $VC -VCName $VCName } else { $null }
+                    if ($applianceVM) {
+                        $qs = $applianceVM.ExtensionData.Summary.QuickStats
+                        $proxyValue = if ($comp -eq 'cpu') {
+                            "$($qs.OverallCpuUsage) MHz used across $($applianceVM.NumCpu) vCPU(s) (VM-level, vSphere view)"
+                        } else {
+                            "$($qs.GuestMemoryUsage) MB used of $($applianceVM.MemoryMB) MB allocated (VM-level, vSphere view)"
+                        }
+                        New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item $label `
+                            -Value $proxyValue -Status 'Information' `
+                            -Notes "VAMI call failed ($($_.Exception.Message)) - showing VM resource utilization from vSphere instead, which is NOT the same as the appliance's internal health check."
+                    } else {
+                        New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item $label `
+                            -Value (Get-VamiFailureReason $_.Exception.Message) -Status 'Unable to Check' -Notes "VAMI call failed: $($_.Exception.Message)"
+                    }
                 }
             }
         }
@@ -394,26 +452,46 @@ foreach ($VC in $Connections) {
                     -Value (Get-VamiFailureReason $_.Exception.Message) -Status 'Unable to Check' -Notes "VAMI call failed: $($_.Exception.Message)"
             }
         }
-        Invoke-SafeCheck -CheckName 'Appliance certificate (VAMI)' -VCenter $VCName -Site $Site -ObjectName $VCName -Script {
-            try {
-                $certSvc = Get-CisService -Name 'com.vmware.appliance.certificate_management.vcenter.tls' -Server $CisSession
-                $cert = $certSvc.get()
-                $expDate = [datetime]$cert.valid_to
-                $daysLeft = ($expDate - (Get-Date)).Days
-                $status = if ($daysLeft -le 0) { 'Critical' } elseif ($daysLeft -le $CertExpiryWarningDays) { 'Warning' } else { 'Healthy' }
-                New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item 'Certificates' `
-                    -Value "Valid - until ($($expDate.ToString('MMM d, yyyy')))" -Status $status
-            } catch {
-                Write-CheckLog -VCenter $VCName -Site $Site -Object $VCName -CheckName 'Appliance Certificates (VAMI)' -ErrorMessage $_.Exception.Message
-                New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item 'Certificates' `
-                    -Value (Get-VamiFailureReason $_.Exception.Message) -Status 'Unable to Check' -Notes "VAMI call failed: $($_.Exception.Message)"
-            }
-        }
     } else {
-        foreach ($item in 'CPU','Memory','Disk Usage','Services','NTP','Certificates') {
+        foreach ($item in 'CPU','Memory','Disk Usage','Services','NTP') {
             New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item $item `
                 -Value 'Not Connected (no CIS session)' -Status 'Manual/External Required' `
                 -Notes 'Requires a VAMI/CIS session (Connect-CisServer <vcenter>) in addition to the vSphere API session. Not connected in this run.'
+        }
+    }
+
+    # --- Certificate: ALWAYS attempted, independent of any CIS/VAMI session - this is vCenter's
+    # own HTTPS certificate, read directly over a raw TLS handshake to port 443 (see
+    # Get-RemoteCertificateExpiry). Needs no vCenter permission at all, only the same network
+    # reachability PowerCLI itself already relies on. Falls back to VAMI only if the direct read
+    # fails and a CIS session happens to be available.
+    Invoke-SafeCheck -CheckName 'Appliance certificate' -VCenter $VCName -Site $Site -ObjectName $VCName -Script {
+        $expDate = $null
+        $source = 'direct TLS read (port 443)'
+        try {
+            $expDate = Get-RemoteCertificateExpiry -TargetHost $VCName
+        } catch {
+            $directError = $_.Exception.Message
+            if ($CisSession) {
+                try {
+                    $certSvc = Get-CisService -Name 'com.vmware.appliance.certificate_management.vcenter.tls' -Server $CisSession
+                    $expDate = [datetime]($certSvc.get()).valid_to
+                    $source = 'VAMI (direct TLS read failed)'
+                } catch {
+                    Write-CheckLog -VCenter $VCName -Site $Site -Object $VCName -CheckName 'Appliance Certificates' -ErrorMessage "Direct TLS: $directError | VAMI: $($_.Exception.Message)"
+                }
+            } else {
+                Write-CheckLog -VCenter $VCName -Site $Site -Object $VCName -CheckName 'Appliance Certificates' -ErrorMessage "Direct TLS: $directError"
+            }
+        }
+        if ($expDate) {
+            $daysLeft = ($expDate - (Get-Date)).Days
+            $status = if ($daysLeft -le 0) { 'Critical' } elseif ($daysLeft -le $CertExpiryWarningDays) { 'Warning' } else { 'Healthy' }
+            New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item 'Certificates' `
+                -Value "Valid - until ($($expDate.ToString('MMM d, yyyy')))" -Status $status -Notes "Source: $source"
+        } else {
+            New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item 'Certificates' `
+                -Value 'Unable to Check' -Status 'Unable to Check' -Notes 'Both the direct TLS certificate read and the VAMI fallback (if attempted) failed - see log for details.'
         }
     }
 
@@ -924,8 +1002,14 @@ function Write-SiteReportDocx {
     $PgFindings  = $SiteFindings | Where-Object { $_.Item -eq 'Port Group' }
     $VdsCount = @($VdsFindings | Select-Object -ExpandProperty Object -Unique).Count
     # Only port groups flagged as a genuine single VLAN (3rd field = 'True') count toward the VLAN
-    # total - trunk/PVLAN port groups are shown in the per-port-group detail but aren't one countable VLAN.
-    $VlanCount = @($PgFindings | Where-Object { ($_.Value -split '\|')[2] -eq 'True' } | ForEach-Object { ($_.Value -split '\|')[0] } | Select-Object -Unique).Count
+    # total - trunk/PVLAN port groups are shown in the per-port-group detail but aren't one countable
+    # VLAN. VLAN ID 0 is also excluded here - in vSphere, VlanId=0 means "untagged/native network",
+    # not a real segmented VLAN, so a default/untagged port group alongside real VLANs was inflating
+    # the count by one versus a manual count of actual configured VLANs.
+    $VlanCount = @($PgFindings | Where-Object {
+        $parts = $_.Value -split '\|'
+        $parts[2] -eq 'True' -and $parts[0] -ne '0'
+    } | ForEach-Object { ($_.Value -split '\|')[0] } | Select-Object -Unique).Count
 
     $doc = $Word.Documents.Add()
     $sel = $Word.Selection
