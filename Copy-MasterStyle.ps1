@@ -129,6 +129,10 @@ try {
         $hdr = $ws.Range($ws.Cells.Item($h, 1), $ws.Cells.Item($h, $lastCol))
         Set-RangeStyle $hdr $st.Header -Fill -Align
         Invoke-Safe 'header wrap' { $hdr.WrapText = $false }
+        # No title row above the header: the header row takes the tab colour (like the Master title banner)
+        if (-not ($h -ge 2 -and $st.Title) -and ($st.TabColor -is [int] -or $st.TabColor -is [double])) {
+            Invoke-Safe 'header tab colour' { $hdr.Interior.Color = [double]$st.TabColor; $hdr.Font.Color = 16777215 }
+        }
 
         # Data rows: remove old colours / highlight rules, then Master banding
         if ($lastRow -gt $h) {
@@ -160,6 +164,8 @@ try {
         Invoke-Safe 'freeze header / gridlines' {
             $ws.Activate()
             $excel.ActiveWindow.FreezePanes = $false
+            $excel.ActiveWindow.ScrollRow = 1                  # freeze counts from the top row on screen
+            $excel.ActiveWindow.ScrollColumn = 1
             $excel.ActiveWindow.SplitColumn = 0
             $excel.ActiveWindow.SplitRow = $h
             $excel.ActiveWindow.FreezePanes = $true
