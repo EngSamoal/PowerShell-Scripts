@@ -134,7 +134,7 @@ param(
 # Bump this on every change. Printed first thing at startup and written into the log file, so
 # it's always possible to confirm exactly which script version produced a given run/report
 # instead of guessing whether an old cached copy is being executed somewhere.
-$ScriptBuild = '2026-09-27-20-colored-tabs-and-tiles'
+$ScriptBuild = '2026-09-27-21-colored-overview-stats'
 Write-Host "VMware_Weekly_HealthCheck.ps1 - build $ScriptBuild" -ForegroundColor Magenta
 
 $ErrorActionPreference = 'Stop'
@@ -1702,11 +1702,12 @@ $clusterTableRows
   .page.active { display:block; }
   .summary-strip { display:flex; gap:20px; flex-wrap:wrap; margin-bottom:28px; }
   .stat { background:#fff; border-radius:10px; padding:20px 26px; box-shadow:0 1px 4px rgba(0,0,0,0.14); min-width:170px; }
-  .stat .num { font-size:36px; font-weight:bold; display:block; }
-  .stat .label { color:#666; font-size:15px; }
-  .stat.healthy .num { color:#2e7d32; }
-  .stat.warning .num { color:#e6a100; }
-  .stat.critical .num { color:#c62828; }
+  .stat .num { font-size:36px; font-weight:bold; display:block; color:#1E3A5F; }
+  .stat .label { color:#555; font-size:15px; }
+  .stat-risk-high { background:#fdecea; }
+  .stat-risk-high .num { color:#c62828; }
+  .stat-risk-med { background:#fff6e0; }
+  .stat-risk-med .num { color:#8a6100; }
   table.overview { width:100%; border-collapse:collapse; background:#fff; border-radius:10px; overflow:hidden; box-shadow:0 1px 4px rgba(0,0,0,0.14); }
   table.overview th { background:#1E3A5F; color:#fff; text-align:left; padding:14px 18px; font-size:15px; }
   table.overview td { padding:14px 18px; border-bottom:1px solid #eee; font-size:16px; }
@@ -1766,13 +1767,13 @@ $clusterTableRows
 
   <section class="page active" id="page-overview">
     <div class="summary-strip">
-      <div class="stat healthy"><span class="num">$($healthCounts.Healthy)</span><span class="label">Healthy Sites</span></div>
-      <div class="stat warning"><span class="num">$($healthCounts.Warning)</span><span class="label">Sites with Warnings</span></div>
-      <div class="stat critical"><span class="num">$($healthCounts.Critical)</span><span class="label">Sites Critical</span></div>
-      <div class="stat"><span class="num">$totalHigh</span><span class="label">Total High Risk Issues</span></div>
-      <div class="stat"><span class="num">$totalMedium</span><span class="label">Total Medium Risk Issues</span></div>
-      <div class="stat"><span class="num">$totalHosts</span><span class="label">Total ESXi Hosts</span></div>
-      <div class="stat"><span class="num">$totalVMs</span><span class="label">Total VMs</span></div>
+      <div class="stat" style="background:#2e7d32"><span class="num" style="color:#fff">$($healthCounts.Healthy)</span><span class="label" style="color:#fff">Healthy Sites</span></div>
+      <div class="stat" style="background:#e6a100"><span class="num" style="color:#fff">$($healthCounts.Warning)</span><span class="label" style="color:#fff">Sites with Warnings</span></div>
+      <div class="stat" style="background:#c62828"><span class="num" style="color:#fff">$($healthCounts.Critical)</span><span class="label" style="color:#fff">Sites Critical</span></div>
+      <div class="stat stat-risk-high"><span class="num">$totalHigh</span><span class="label">Total High Risk Issues</span></div>
+      <div class="stat stat-risk-med"><span class="num">$totalMedium</span><span class="label">Total Medium Risk Issues</span></div>
+      <div class="stat tile-blue"><span class="num">$totalHosts</span><span class="label">Total ESXi Hosts</span></div>
+      <div class="stat tile-teal"><span class="num">$totalVMs</span><span class="label">Total VMs</span></div>
     </div>
 
     <table class="overview">
