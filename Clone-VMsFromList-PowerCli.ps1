@@ -13,9 +13,12 @@
       unless -PowerOnClone is used.
     - A CSV results log is written next to the VM list (C:\temp\VMClone_Results_<timestamp>.csv).
     - Use -WhatIf for a dry run that only shows what would be cloned.
+    - If you are already connected to vCenter (Connect-VIServer), that session is reused and
+      left connected. Otherwise the script connects to -vCenterServer and disconnects at the end.
 
 .EXAMPLE
-    .\Clone-VMsFromList-PowerCli.ps1 -vCenterServer 10.50.10.10
+    .\Clone-VMsFromList-PowerCli.ps1
+    (Uses your existing Connect-VIServer session if you are already connected.)
 
 .EXAMPLE
     .\Clone-VMsFromList-PowerCli.ps1 -vCenterServer 10.50.10.10 -CloneSuffix '_bak_2026' -Datastore 'DS-Backup01' -DiskStorageFormat Thin
@@ -66,7 +69,14 @@ Write-Host "Found $($vmNames.Count) VM name(s) in $VMListPath" -ForegroundColor 
 # ---------------------------------------------------------------------------
 # Connect to vCenter
 # ---------------------------------------------------------------------------
-$viConnection = Connect-VIServer -Server $vCenterServer
+$connectedHere = $false
+if ($global:DefaultVIServer -and $global:DefaultVIServer.IsConnected) {
+    $viConnection = $global:DefaultVIServer
+    Write-Host "Using existing vCenter connection: $($viConnection.Name)" -ForegroundColor Cyan
+} else {
+    $viConnection  = Connect-VIServer -Server $vCenterServer
+    $connectedHere = $true
+}
 
 $timestamp  = Get-Date -Format 'yyyyMMdd_HHmmss'
 $resultPath = Join-Path -Path (Split-Path -Path $VMListPath -Parent) -ChildPath "VMClone_Results_$timestamp.csv"
@@ -186,5 +196,8 @@ try {
         Write-Host ("{0,-8}: {1}" -f $_.Name, $_.Count)
     }
 
-    Disconnect-VIServer -Server $viConnection -Confirm:$false
+    # Only disconnect if this script opened the connection
+    if ($connectedHere) {
+        Disconnect-VIServer -Server $viConnection -Confirm:$false
+    }
 }
