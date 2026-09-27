@@ -134,7 +134,7 @@ param(
 # Bump this on every change. Printed first thing at startup and written into the log file, so
 # it's always possible to confirm exactly which script version produced a given run/report
 # instead of guessing whether an old cached copy is being executed somewhere.
-$ScriptBuild = '2026-09-27-19-appliance-proxy-links-sizing-order'
+$ScriptBuild = '2026-09-27-20-colored-tabs-and-tiles'
 Write-Host "VMware_Weekly_HealthCheck.ps1 - build $ScriptBuild" -ForegroundColor Magenta
 
 $ErrorActionPreference = 'Stop'
@@ -1603,10 +1603,10 @@ function Write-DashboardHtml {
     }) -join "`n"
 
     # --- Tab navigation bar ---
-    $tabButtons = (@('<button class="tab active" id="tab-overview" onclick="showPage(''overview'')">Overview</button>') + ($summaries | ForEach-Object {
+    $tabButtons = (@('<button class="tab overview-tab active" id="tab-overview" onclick="showPage(''overview'')">Overview</button>') + ($summaries | ForEach-Object {
         $slug = ConvertTo-Slug $_.Site
-        $dotColor = $healthColor[$_.OverallHealth]
-        "<button class=`"tab`" id=`"tab-$slug`" onclick=`"showPage('$slug')`"><span class=`"tab-dot`" style=`"background:$dotColor`"></span>$(ConvertTo-HtmlSafe $_.Site)</button>"
+        $color = $healthColor[$_.OverallHealth]
+        "<button class=`"tab`" id=`"tab-$slug`" style=`"background:$color`" onclick=`"showPage('$slug')`">$(ConvertTo-HtmlSafe $_.Site)</button>"
     })) -join "`n    "
 
     # --- One full, spacious page per site ---
@@ -1646,12 +1646,12 @@ function Write-DashboardHtml {
         </div>
 
         <div class="tile-row">
-          <div class="tile"><span class="num">$($s.HostCount)</span><span class="label">ESXi Hosts</span></div>
-          <div class="tile"><span class="num">$($s.ClusterCount)</span><span class="label">Clusters</span></div>
-          <div class="tile"><span class="num">$($s.VmCount)</span><span class="label">Virtual Machines</span></div>
-          <div class="tile"><span class="num" style="font-size:20px">$(ConvertTo-HtmlSafe $s.EsxiVersion)</span><span class="label">ESXi Version</span></div>
-          <div class="tile"><span class="num $(if ($s.DrsOn) {'on'} else {'off'})">$(if ($s.DrsOn) {'ON'} else {'OFF'})</span><span class="label">vSphere DRS</span></div>
-          <div class="tile"><span class="num $(if ($s.HaOn) {'on'} else {'off'})">$(if ($s.HaOn) {'ON'} else {'OFF'})</span><span class="label">vSphere HA</span></div>
+          <div class="tile tile-blue"><span class="num">$($s.HostCount)</span><span class="label">ESXi Hosts</span></div>
+          <div class="tile tile-purple"><span class="num">$($s.ClusterCount)</span><span class="label">Clusters</span></div>
+          <div class="tile tile-teal"><span class="num">$($s.VmCount)</span><span class="label">Virtual Machines</span></div>
+          <div class="tile tile-gray"><span class="num" style="font-size:20px">$(ConvertTo-HtmlSafe $s.EsxiVersion)</span><span class="label">ESXi Version</span></div>
+          <div class="tile $(if ($s.DrsOn) {'tile-on'} else {'tile-off'})"><span class="num">$(if ($s.DrsOn) {'ON'} else {'OFF'})</span><span class="label">vSphere DRS</span></div>
+          <div class="tile $(if ($s.HaOn) {'tile-on'} else {'tile-off'})"><span class="num">$(if ($s.HaOn) {'ON'} else {'OFF'})</span><span class="label">vSphere HA</span></div>
         </div>
 
         <div class="panel-grid">
@@ -1695,9 +1695,9 @@ $clusterTableRows
   h1 { color:#1E3A5F; margin:0; font-size:36px; }
   .subtitle { color:#555; margin:6px 0 20px; font-size:16px; }
   .tabs { display:flex; gap:8px; flex-wrap:wrap; padding:20px 0; position:sticky; top:0; background:#f4f6f8; z-index:10; border-bottom:1px solid #e0e0e0; margin-bottom:28px; }
-  .tab { border:1px solid #d7dce1; background:#fff; color:#333; padding:11px 22px; border-radius:24px; font-size:16px; cursor:pointer; display:flex; align-items:center; gap:8px; }
-  .tab.active { background:#1E3A5F; color:#fff; border-color:#1E3A5F; }
-  .tab-dot { width:11px; height:11px; border-radius:50%; display:inline-block; }
+  .tab { border:3px solid transparent; color:#fff; font-weight:bold; padding:11px 22px; border-radius:24px; font-size:16px; cursor:pointer; box-shadow:0 1px 4px rgba(0,0,0,0.18); }
+  .tab.overview-tab { background:#1E3A5F; }
+  .tab.active { border-color:#1a1a1a; box-shadow:0 0 0 3px rgba(0,0,0,0.25); }
   .page { display:none; }
   .page.active { display:block; }
   .summary-strip { display:flex; gap:20px; flex-wrap:wrap; margin-bottom:28px; }
@@ -1729,11 +1729,17 @@ $clusterTableRows
   .report-link.big { font-size:18px; background:#1E3A5F; color:#fff; padding:14px 28px; border-radius:8px; }
   .report-link.big:hover { background:#15304d; }
   .tile-row { display:grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap:20px; margin-bottom:28px; }
-  .tile { background:#fff; border-radius:10px; padding:22px; text-align:center; box-shadow:0 1px 4px rgba(0,0,0,0.14); }
+  .tile { border-radius:10px; padding:22px; text-align:center; box-shadow:0 1px 4px rgba(0,0,0,0.14); }
   .tile .num { font-size:30px; font-weight:bold; display:block; color:#1E3A5F; }
-  .tile .num.on { color:#2e7d32; }
-  .tile .num.off { color:#c62828; }
-  .tile .label { color:#666; font-size:14px; margin-top:6px; display:block; }
+  .tile .label { color:#555; font-size:14px; margin-top:6px; display:block; }
+  .tile-blue   { background:#dceafc; }
+  .tile-purple { background:#ead9f7; }
+  .tile-teal   { background:#d3f3ee; }
+  .tile-gray   { background:#e3e7ec; }
+  .tile-on  { background:#2e7d32; }
+  .tile-on  .num, .tile-on  .label { color:#fff; }
+  .tile-off { background:#c62828; }
+  .tile-off .num, .tile-off .label { color:#fff; }
   .panel-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap:24px; margin-bottom:24px; }
   .panel { background:#fff; border-radius:10px; padding:26px 28px; box-shadow:0 1px 4px rgba(0,0,0,0.14); }
   .panel h3 { margin:0 0 18px; color:#1E3A5F; font-size:19px; }
