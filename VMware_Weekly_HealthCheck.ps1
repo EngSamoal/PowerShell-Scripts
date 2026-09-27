@@ -134,7 +134,7 @@ param(
 # Bump this on every change. Printed first thing at startup and written into the log file, so
 # it's always possible to confirm exactly which script version produced a given run/report
 # instead of guessing whether an old cached copy is being executed somewhere.
-$ScriptBuild = '2026-09-27-21-colored-overview-stats'
+$ScriptBuild = '2026-09-27-22-distinct-site-tab-colors'
 Write-Host "VMware_Weekly_HealthCheck.ps1 - build $ScriptBuild" -ForegroundColor Magenta
 
 $ErrorActionPreference = 'Stop'
@@ -1603,10 +1603,18 @@ function Write-DashboardHtml {
     }) -join "`n"
 
     # --- Tab navigation bar ---
+    # Each site gets its own distinct identity color (cycling through this palette by position),
+    # deliberately NOT the green/yellow/red health colors - those already mean something specific
+    # elsewhere (risk badges, Overview stat boxes) and reusing them here would make every healthy
+    # site's tab identical, which is exactly what looked wrong. Health status still shows via the
+    # small dot inside each tab.
+    $sitePalette = @('#1565C0','#6A1B9A','#00897B','#AD1457','#4E342E','#283593','#37474F','#6D4C41')
     $tabButtons = (@('<button class="tab overview-tab active" id="tab-overview" onclick="showPage(''overview'')">Overview</button>') + ($summaries | ForEach-Object {
+        $i = $summaries.IndexOf($_)
         $slug = ConvertTo-Slug $_.Site
-        $color = $healthColor[$_.OverallHealth]
-        "<button class=`"tab`" id=`"tab-$slug`" style=`"background:$color`" onclick=`"showPage('$slug')`">$(ConvertTo-HtmlSafe $_.Site)</button>"
+        $siteColor = $sitePalette[$i % $sitePalette.Count]
+        $dotColor = $healthColor[$_.OverallHealth]
+        "<button class=`"tab`" id=`"tab-$slug`" style=`"background:$siteColor`" onclick=`"showPage('$slug')`"><span class=`"tab-dot`" style=`"background:$dotColor`"></span>$(ConvertTo-HtmlSafe $_.Site)</button>"
     })) -join "`n    "
 
     # --- One full, spacious page per site ---
@@ -1695,9 +1703,10 @@ $clusterTableRows
   h1 { color:#1E3A5F; margin:0; font-size:36px; }
   .subtitle { color:#555; margin:6px 0 20px; font-size:16px; }
   .tabs { display:flex; gap:8px; flex-wrap:wrap; padding:20px 0; position:sticky; top:0; background:#f4f6f8; z-index:10; border-bottom:1px solid #e0e0e0; margin-bottom:28px; }
-  .tab { border:3px solid transparent; color:#fff; font-weight:bold; padding:11px 22px; border-radius:24px; font-size:16px; cursor:pointer; box-shadow:0 1px 4px rgba(0,0,0,0.18); }
+  .tab { border:3px solid transparent; color:#fff; font-weight:bold; padding:11px 22px; border-radius:24px; font-size:16px; cursor:pointer; box-shadow:0 1px 4px rgba(0,0,0,0.18); display:inline-flex; align-items:center; gap:8px; }
   .tab.overview-tab { background:#1E3A5F; }
   .tab.active { border-color:#1a1a1a; box-shadow:0 0 0 3px rgba(0,0,0,0.25); }
+  .tab-dot { width:11px; height:11px; border-radius:50%; display:inline-block; border:2px solid rgba(255,255,255,0.85); }
   .page { display:none; }
   .page.active { display:block; }
   .summary-strip { display:flex; gap:20px; flex-wrap:wrap; margin-bottom:28px; }
