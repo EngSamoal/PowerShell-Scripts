@@ -43,16 +43,26 @@ function Get-CellStyle($cell) {
     }
 }
 
+function Test-Value($v) { ($null -ne $v) -and ($v -isnot [DBNull]) }
+
+function Invoke-Safe([string]$What, [scriptblock]$Do) {
+    # One style step that cannot be applied is skipped (and reported) instead of stopping the script
+    try { & $Do } catch { Write-Host ("   skipped: {0} ({1})" -f $What, $_.Exception.Message) -ForegroundColor Yellow }
+}
+
 function Set-RangeStyle($rng, $st, [switch]$Fill, [switch]$Align) {
-    if ($Fill) { if ($st.NoFill) { $rng.Interior.Pattern = -4142 } else { $rng.Interior.Color = $st.Fill } }
-    $rng.Font.Name = $st.FontName
-    $rng.Font.Size = $st.FontSize
-    $rng.Font.Color = $st.FontColor
-    $rng.Font.Bold = $st.Bold
-    $rng.Font.Italic = $st.Italic
-    if ($Align) { $rng.HorizontalAlignment = $st.HAlign }
-    $rng.VerticalAlignment = $st.VAlign
-    $rng.RowHeight = $st.RowHeight
+    if ($Fill) {
+        if ($st.NoFill) { Invoke-Safe 'fill' { $rng.Interior.Pattern = -4142 } }
+        elseif (Test-Value $st.Fill) { Invoke-Safe 'fill' { $rng.Interior.Color = [double]$st.Fill } }
+    }
+    if (Test-Value $st.FontName)  { Invoke-Safe 'font name'  { $rng.Font.Name = [string]$st.FontName } }
+    if (Test-Value $st.FontSize)  { Invoke-Safe 'font size'  { $rng.Font.Size = [double]$st.FontSize } }
+    if (Test-Value $st.FontColor) { Invoke-Safe 'font color' { $rng.Font.Color = [double]$st.FontColor } }
+    if (Test-Value $st.Bold)      { Invoke-Safe 'bold'       { $rng.Font.Bold = [bool]$st.Bold } }
+    if (Test-Value $st.Italic)    { Invoke-Safe 'italic'     { $rng.Font.Italic = [bool]$st.Italic } }
+    if ($Align -and (Test-Value $st.HAlign)) { Invoke-Safe 'alignment' { $rng.HorizontalAlignment = [int]$st.HAlign } }
+    if (Test-Value $st.VAlign)    { Invoke-Safe 'vertical alignment' { $rng.VerticalAlignment = [int]$st.VAlign } }
+    if (Test-Value $st.RowHeight) { Invoke-Safe 'row height' { $rng.RowHeight = [double]$st.RowHeight } }
 }
 
 foreach ($p in $Master, $Patching) { if (-not (Test-Path $p)) { Write-Host "Not found: $p" -ForegroundColor Red; return } }
@@ -104,50 +114,57 @@ try {
         $lastCol = $used.Column + $used.Columns.Count - 1
         if ($h -lt 1 -or $lastCol -lt 1) { Write-Host ("{0,-24} empty - skipped" -f $ws.Name) -ForegroundColor Yellow; continue }
 
-        if ($st.TabColor -is [int] -or $st.TabColor -is [double]) { $ws.Tab.Color = $st.TabColor } else { $ws.Tab.ColorIndex = -4142 }
-        $ws.Cells.Font.Name = $st.Header.FontName
+        Invoke-Safe 'tab colour' { if ($st.TabColor -is [int] -or $st.TabColor -is [double]) { $ws.Tab.Color = [double]$st.TabColor } else { $ws.Tab.ColorIndex = -4142 } }
+        if (Test-Value $st.Header.FontName) { Invoke-Safe 'sheet font' { $ws.Cells.Font.Name = [string]$st.Header.FontName } }
 
         # Rows above the header: first one like the Master title, second like the Master info line
         if ($h -ge 2 -and $st.Title) {
             $t = $ws.Range($ws.Cells.Item(1, 1), $ws.Cells.Item(1, $lastCol))
             Set-RangeStyle $t $st.Title -Fill
-            if ($excel.WorksheetFunction.CountA($t) -eq 1 -and $ws.Cells.Item(1, 1).Value2) { $t.HorizontalAlignment = 7 }   # centre across, like Master
+            Invoke-Safe 'title alignment' { if ($excel.WorksheetFunction.CountA($t) -eq 1 -and $ws.Cells.Item(1, 1).Value2) { $t.HorizontalAlignment = 7 } }   # centre across, like Master
         }
         if ($h -ge 3 -and $st.Info) { Set-RangeStyle ($ws.Range($ws.Cells.Item(2, 1), $ws.Cells.Item(2, $lastCol))) $st.Info -Fill }
 
         # Header row
         $hdr = $ws.Range($ws.Cells.Item($h, 1), $ws.Cells.Item($h, $lastCol))
         Set-RangeStyle $hdr $st.Header -Fill -Align
-        $hdr.WrapText = $false
+        Invoke-Safe 'header wrap' { $hdr.WrapText = $false }
 
         # Data rows: remove old colours / highlight rules, then Master banding
         if ($lastRow -gt $h) {
             $data = $ws.Range($ws.Cells.Item($h + 1, 1), $ws.Cells.Item($lastRow, $lastCol))
-            $data.FormatConditions.Delete()
-            if ($ws.ListObjects.Count -gt 0) { $ws.ListObjects.Item(1).TableStyle = ''; $ws.ListObjects.Item(1).ShowTableStyleRowStripes = $false }
+            Invoke-Safe 'remove old highlight rules' { $data.FormatConditions.Delete() }
+            if ($ws.ListObjects.Count -gt 0) { Invoke-Safe 'table style' { $ws.ListObjects.Item(1).TableStyle = ''; $ws.ListObjects.Item(1).ShowTableStyleRowStripes = $false } }
             Set-RangeStyle $data $st.Even -Fill
-            $band = $data.FormatConditions.Add(2, 0, "=MOD(ROW()-$h,2)=1")      # odd data rows
-            if ($st.Odd.NoFill) { $band.Interior.Pattern = -4142 } else { $band.Interior.Color = $st.Odd.Fill }
-            $band.StopIfTrue = $false
+            Invoke-Safe 'row banding' {
+                $band = $data.FormatConditions.Add(2, 0, "=MOD(ROW()-$h,2)=1")      # odd data rows
+                if ($st.Odd.NoFill) { $band.Interior.Pattern = -4142 } elseif (Test-Value $st.Odd.Fill) { $band.Interior.Color = [double]$st.Odd.Fill }
+                $band.StopIfTrue = $false
+            }
         }
 
         # Borders, filter, widths, frozen header, no gridlines
         $all = $ws.Range($ws.Cells.Item($h, 1), $ws.Cells.Item([Math]::Max($lastRow, $h), $lastCol))
-        if ($st.Odd.BorderLine -ne -4142) { $all.Borders.LineStyle = 1; $all.Borders.Weight = 2; $all.Borders.Color = $st.Odd.Border }
-        if ($ws.ListObjects.Count -eq 0 -and -not $ws.AutoFilterMode) { [void]$all.AutoFilter() }
-        [void]$all.Columns.AutoFit()
-        for ($c = 1; $c -le $lastCol; $c++) {
-            $col = $ws.Columns.Item($c)
-            if ($col.ColumnWidth -lt 8) { $col.ColumnWidth = 8 }
-            if ($col.ColumnWidth -gt 60) { $col.ColumnWidth = 60 }
-            $col.ColumnWidth = $col.ColumnWidth + 2                             # room for the filter button
+        if ($st.Odd.BorderLine -ne -4142 -and (Test-Value $st.Odd.Border)) { Invoke-Safe 'borders' { $all.Borders.LineStyle = 1; $all.Borders.Weight = 2; $all.Borders.Color = [double]$st.Odd.Border } }
+        if ($ws.ListObjects.Count -eq 0 -and -not $ws.AutoFilterMode) { Invoke-Safe 'filter' { [void]$all.AutoFilter() } }
+        Invoke-Safe 'column widths' {
+            [void]$all.Columns.AutoFit()
+            for ($c = 1; $c -le $lastCol; $c++) {
+                $col = $ws.Columns.Item($c)
+                $w = [double]$col.ColumnWidth
+                if ($w -lt 8) { $w = 8 }
+                if ($w -gt 60) { $w = 60 }
+                $col.ColumnWidth = $w + 2                                       # room for the filter button
+            }
         }
-        $ws.Activate()
-        $excel.ActiveWindow.FreezePanes = $false
-        $excel.ActiveWindow.SplitColumn = 0
-        $excel.ActiveWindow.SplitRow = $h
-        $excel.ActiveWindow.FreezePanes = $true
-        $excel.ActiveWindow.DisplayGridlines = $false
+        Invoke-Safe 'freeze header / gridlines' {
+            $ws.Activate()
+            $excel.ActiveWindow.FreezePanes = $false
+            $excel.ActiveWindow.SplitColumn = 0
+            $excel.ActiveWindow.SplitRow = $h
+            $excel.ActiveWindow.FreezePanes = $true
+            $excel.ActiveWindow.DisplayGridlines = $false
+        }
         Write-Host ("{0,-24} styled like Master tab '{1}' (header row {2}, {3} data rows)" -f $ws.Name, $st.Tab, $h, [Math]::Max(0, $lastRow - $h)) -ForegroundColor Green
     }
     $wbP.Worksheets.Item(1).Activate()
@@ -156,7 +173,7 @@ try {
     $wbP.SaveAs($out, 51)
     Write-Host "`nSaved: $out" -ForegroundColor Green
 }
-catch { Write-Host "FAILED: $($_.Exception.Message)  (input files not changed)" -ForegroundColor Red }
+catch { Write-Host "FAILED: $($_.Exception.Message) (line $($_.InvocationInfo.ScriptLineNumber))  (input files not changed)" -ForegroundColor Red }
 finally {
     foreach ($w in @($wbM, $wbP)) { if ($w) { try { $w.Close($false) } catch { } } }
     if ($excel) { $excel.Quit() }
