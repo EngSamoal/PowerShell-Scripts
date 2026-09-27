@@ -114,6 +114,11 @@ param(
     # -ExcludeClusters @() to include it again, or add more names as needed.
     [string[]]$ExcludeClusters = @('RGL'),
 
+    # Display order for site tabs/rows in the HTML dashboard (Overview always comes first,
+    # regardless of this list). Any connected site NOT in this list is appended afterward,
+    # alphabetically, so a new/unlisted site still appears rather than being dropped.
+    [string[]]$DashboardSiteOrder = @('SF-AQ','SEVEN Tabuk','SEVEN ABHA','SEVEN ALhamra','AMC'),
+
     # Configurable thresholds - NOT vendor/company-defined standards. Raw values are always
     # shown regardless of these; these only drive the Warning/Critical flag shown alongside them.
     [double]$CapacityWarningPct    = 80,
@@ -129,7 +134,7 @@ param(
 # Bump this on every change. Printed first thing at startup and written into the log file, so
 # it's always possible to confirm exactly which script version produced a given run/report
 # instead of guessing whether an old cached copy is being executed somewhere.
-$ScriptBuild = '2026-09-27-18-pdf-output'
+$ScriptBuild = '2026-09-27-19-appliance-proxy-links-sizing-order'
 Write-Host "VMware_Weekly_HealthCheck.ps1 - build $ScriptBuild" -ForegroundColor Magenta
 
 $ErrorActionPreference = 'Stop'
@@ -375,47 +380,61 @@ foreach ($VC in $Connections) {
 
     # --- vCenter appliance CPU/Mem/Disk/Services/NTP/Certificate (VAMI/CIS) ------------------
     $CisSession = $global:DefaultCisServers | Where-Object { $_.Name -eq $VCName -and $_.IsConnected }
-    if ($CisSession) {
-        # Each item below has its OWN try/catch that always produces a finding, even on failure -
-        # rather than one failed VAMI call silently dropping that item (or, worse, all of them)
-        # from section 3.1 entirely. VAMI/appliance-level APIs commonly need broader permissions
-        # than the regular vSphere inventory API the rest of this report runs on (e.g. a plain
-        # vCenter admin account can be "unauthorized" here even though it can read every host/VM
-        # fine) - a real permission gap shows up as 'Unable to Check' with the actual server error
-        # message, not as a blank/missing row.
-        Invoke-SafeCheck -CheckName 'Appliance health (VAMI)' -VCenter $VCName -Site $Site -ObjectName $VCName -Script {
-            foreach ($comp in 'cpu','mem','storage') {
-                $label = @{ cpu = 'CPU'; mem = 'Memory'; storage = 'Disk Usage' }[$comp]
+
+    # CPU/Memory/Disk Usage: always attempted regardless of whether a CIS session exists, because
+    # CPU/Memory has a vSphere-only fallback (VM-level proxy, see Find-ApplianceVM) worth trying
+    # even with zero CIS sessions connected - not just when VAMI is connected but the call fails.
+    # Disk Usage has no non-VAMI equivalent and falls through to Not Connected/Unable to Check.
+    Invoke-SafeCheck -CheckName 'Appliance health (VAMI)' -VCenter $VCName -Site $Site -ObjectName $VCName -Script {
+        foreach ($comp in 'cpu','mem','storage') {
+            $label = @{ cpu = 'CPU'; mem = 'Memory'; storage = 'Disk Usage' }[$comp]
+            $vamiError = $null
+            if ($CisSession) {
                 try {
                     $svc = Get-CisService -Name "com.vmware.appliance.health.$comp" -Server $CisSession
                     $val = $svc.get()
                     New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName `
                         -Item $label -Value $(if ($val -eq 'green') { 'Normal' } else { $val }) -Status $(if ($val -eq 'green') {'Healthy'} else {'Warning'})
+                    continue
                 } catch {
-                    Write-CheckLog -VCenter $VCName -Site $Site -Object $VCName -CheckName "Appliance $label (VAMI)" -ErrorMessage $_.Exception.Message
-                    # Fallback: a VM-level resource-utilization PROXY from vSphere itself (only for
-                    # CPU/Memory - there's no meaningful vSphere-only equivalent for internal
-                    # appliance disk/partition usage). Only used when exactly one candidate VM is
-                    # found with high confidence - see Find-ApplianceVM. Clearly labeled as a proxy,
-                    # never presented as equivalent to the real internal appliance health check.
-                    $applianceVM = if ($comp -in 'cpu','mem') { Find-ApplianceVM -VC $VC -VCName $VCName } else { $null }
-                    if ($applianceVM) {
-                        $qs = $applianceVM.ExtensionData.Summary.QuickStats
-                        $proxyValue = if ($comp -eq 'cpu') {
-                            "$($qs.OverallCpuUsage) MHz used across $($applianceVM.NumCpu) vCPU(s) (VM-level, vSphere view)"
-                        } else {
-                            "$($qs.GuestMemoryUsage) MB used of $($applianceVM.MemoryMB) MB allocated (VM-level, vSphere view)"
-                        }
-                        New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item $label `
-                            -Value $proxyValue -Status 'Information' `
-                            -Notes "VAMI call failed ($($_.Exception.Message)) - showing VM resource utilization from vSphere instead, which is NOT the same as the appliance's internal health check."
-                    } else {
-                        New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item $label `
-                            -Value (Get-VamiFailureReason $_.Exception.Message) -Status 'Unable to Check' -Notes "VAMI call failed: $($_.Exception.Message)"
-                    }
+                    $vamiError = $_.Exception.Message
+                    Write-CheckLog -VCenter $VCName -Site $Site -Object $VCName -CheckName "Appliance $label (VAMI)" -ErrorMessage $vamiError
                 }
             }
+            # Fallback: a VM-level resource-utilization PROXY from vSphere itself (only for
+            # CPU/Memory - there's no meaningful vSphere-only equivalent for internal appliance
+            # disk/partition usage). Tried both when VAMI failed AND when there's no CIS session at
+            # all, since this only needs the regular vSphere inventory API, not VAMI/CIS access.
+            # Only used when exactly one candidate VM is found with high confidence - see
+            # Find-ApplianceVM. Clearly labeled as a proxy, never presented as equivalent to the
+            # real internal appliance health check.
+            $applianceVM = if ($comp -in 'cpu','mem') { Find-ApplianceVM -VC $VC -VCName $VCName } else { $null }
+            if ($applianceVM) {
+                $qs = $applianceVM.ExtensionData.Summary.QuickStats
+                $proxyValue = if ($comp -eq 'cpu') {
+                    "$($qs.OverallCpuUsage) MHz used across $($applianceVM.NumCpu) vCPU(s) (VM-level, vSphere view)"
+                } else {
+                    "$($qs.GuestMemoryUsage) MB used of $($applianceVM.MemoryMB) MB allocated (VM-level, vSphere view)"
+                }
+                $note = if ($vamiError) { "VAMI call failed ($vamiError) - showing VM resource utilization from vSphere instead, which is NOT the same as the appliance's internal health check." }
+                        else { "No VAMI/CIS session - showing VM resource utilization from vSphere instead, which is NOT the same as the appliance's internal health check." }
+                New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item $label `
+                    -Value $proxyValue -Status 'Information' -Notes $note
+            } elseif ($vamiError) {
+                New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item $label `
+                    -Value (Get-VamiFailureReason $vamiError) -Status 'Unable to Check' -Notes "VAMI call failed: $vamiError"
+            } else {
+                New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item $label `
+                    -Value 'Not Connected (no CIS session)' -Status 'Manual/External Required' `
+                    -Notes 'Requires a VAMI/CIS session (Connect-CisServer <vcenter>) for a real reading, or the appliance''s own VM in managed inventory for the vSphere-level proxy - neither available this run.'
+            }
         }
+    }
+
+    if ($CisSession) {
+        # Services and NTP have no non-VAMI equivalent at all (this data only exists inside the
+        # appliance's guest OS) - each still has its own try/catch that always produces a finding,
+        # rather than one failed call silently dropping the item from section 3.1 entirely.
         Invoke-SafeCheck -CheckName 'Appliance services (VAMI)' -VCenter $VCName -Site $Site -ObjectName $VCName -Script {
             try {
                 $svcListSvc = Get-CisService -Name 'com.vmware.appliance.services' -Server $CisSession
@@ -467,7 +486,10 @@ foreach ($VC in $Connections) {
             }
         }
     } else {
-        foreach ($item in 'CPU','Memory','Disk Usage','Services','NTP') {
+        # CPU/Memory/Disk Usage were already fully handled above (VAMI, else VM-proxy for
+        # CPU/Memory, else Not Connected) regardless of CIS session state - only Services/NTP
+        # (no non-VAMI equivalent) need the plain "Not Connected" fallback here.
+        foreach ($item in 'Services','NTP') {
             New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item $item `
                 -Value 'Not Connected (no CIS session)' -Status 'Manual/External Required' `
                 -Notes 'Requires a VAMI/CIS session (Connect-CisServer <vcenter>) in addition to the vSphere API session. Not connected in this run.'
@@ -1517,7 +1539,13 @@ function ConvertTo-Slug {
 function Write-DashboardHtml {
     param([string[]]$SiteLabels, [string]$OutputPath, [string]$RunDateDisplay, [string]$ScriptBuild)
 
-    $summaries = @($SiteLabels | ForEach-Object { Get-SiteDashboardSummary -SiteLabel $_ } | Where-Object { $_ } | Sort-Object Site)
+    # Sites listed in -DashboardSiteOrder appear in that exact order; any connected site NOT in
+    # the list is appended afterward, alphabetically, so a new/unlisted site still shows up rather
+    # than being silently dropped from the dashboard.
+    $orderIndex = @{}
+    for ($i = 0; $i -lt $DashboardSiteOrder.Count; $i++) { $orderIndex[$DashboardSiteOrder[$i]] = $i }
+    $summaries = @($SiteLabels | ForEach-Object { Get-SiteDashboardSummary -SiteLabel $_ } | Where-Object { $_ } |
+        Sort-Object @{Expression = { if ($orderIndex.ContainsKey($_.Site)) { $orderIndex[$_.Site] } else { 9999 } }}, Site)
     if ($summaries.Count -eq 0) { return }
 
     $healthColor = @{ Healthy = '#2e7d32'; Warning = '#e6a100'; Critical = '#c62828' }
@@ -1608,7 +1636,7 @@ function Write-DashboardHtml {
             <h1>$(ConvertTo-HtmlSafe $s.Site)</h1>
             <span class="badge big" style="background:$color">$(ConvertTo-HtmlSafe $healthLabelText[$s.OverallHealth])</span>
           </div>
-          <a class="report-link big" href="$(ConvertTo-HtmlSafe $s.PdfFileName)">View Full Report &rarr;</a>
+          <a class="report-link big" href="$([System.Uri]::EscapeDataString($s.PdfFileName))">View Full Report &rarr;</a>
         </div>
 
         <div class="risk-row big">
@@ -1663,62 +1691,63 @@ $clusterTableRows
 <meta charset="UTF-8">
 <title>VMware Weekly Health Check - Dashboard</title>
 <style>
-  body { font-family: Calibri, Arial, sans-serif; background:#f4f6f8; color:#1a1a1a; margin:0; padding:0 24px 24px; }
-  h1 { color:#1E3A5F; margin:0; }
-  .subtitle { color:#555; margin:4px 0 16px; }
-  .tabs { display:flex; gap:6px; flex-wrap:wrap; padding:16px 0; position:sticky; top:0; background:#f4f6f8; z-index:10; border-bottom:1px solid #e0e0e0; margin-bottom:24px; }
-  .tab { border:1px solid #d7dce1; background:#fff; color:#333; padding:8px 16px; border-radius:20px; font-size:14px; cursor:pointer; display:flex; align-items:center; gap:6px; }
+  body { font-family: Calibri, Arial, sans-serif; background:#f4f6f8; color:#1a1a1a; margin:0; padding:0 32px 32px; font-size:16px; line-height:1.4; }
+  h1 { color:#1E3A5F; margin:0; font-size:36px; }
+  .subtitle { color:#555; margin:6px 0 20px; font-size:16px; }
+  .tabs { display:flex; gap:8px; flex-wrap:wrap; padding:20px 0; position:sticky; top:0; background:#f4f6f8; z-index:10; border-bottom:1px solid #e0e0e0; margin-bottom:28px; }
+  .tab { border:1px solid #d7dce1; background:#fff; color:#333; padding:11px 22px; border-radius:24px; font-size:16px; cursor:pointer; display:flex; align-items:center; gap:8px; }
   .tab.active { background:#1E3A5F; color:#fff; border-color:#1E3A5F; }
-  .tab-dot { width:9px; height:9px; border-radius:50%; display:inline-block; }
+  .tab-dot { width:11px; height:11px; border-radius:50%; display:inline-block; }
   .page { display:none; }
   .page.active { display:block; }
-  .summary-strip { display:flex; gap:16px; flex-wrap:wrap; margin-bottom:24px; }
-  .stat { background:#fff; border-radius:8px; padding:16px 20px; box-shadow:0 1px 3px rgba(0,0,0,0.12); min-width:140px; }
-  .stat .num { font-size:28px; font-weight:bold; display:block; }
-  .stat .label { color:#666; font-size:13px; }
+  .summary-strip { display:flex; gap:20px; flex-wrap:wrap; margin-bottom:28px; }
+  .stat { background:#fff; border-radius:10px; padding:20px 26px; box-shadow:0 1px 4px rgba(0,0,0,0.14); min-width:170px; }
+  .stat .num { font-size:36px; font-weight:bold; display:block; }
+  .stat .label { color:#666; font-size:15px; }
   .stat.healthy .num { color:#2e7d32; }
   .stat.warning .num { color:#e6a100; }
   .stat.critical .num { color:#c62828; }
-  table.overview { width:100%; border-collapse:collapse; background:#fff; border-radius:8px; overflow:hidden; box-shadow:0 1px 3px rgba(0,0,0,0.12); }
-  table.overview th { background:#1E3A5F; color:#fff; text-align:left; padding:10px 12px; font-size:13px; }
-  table.overview td { padding:10px 12px; border-bottom:1px solid #eee; font-size:14px; }
+  table.overview { width:100%; border-collapse:collapse; background:#fff; border-radius:10px; overflow:hidden; box-shadow:0 1px 4px rgba(0,0,0,0.14); }
+  table.overview th { background:#1E3A5F; color:#fff; text-align:left; padding:14px 18px; font-size:15px; }
+  table.overview td { padding:14px 18px; border-bottom:1px solid #eee; font-size:16px; }
   table.overview tr:hover { background:#f8fafc; cursor:pointer; }
   .num-cell { text-align:center; font-weight:600; }
   .site-link { color:#1E3A5F; font-weight:bold; text-decoration:none; }
   .site-link:hover { text-decoration:underline; }
-  .badge { color:#fff; padding:4px 10px; border-radius:12px; font-size:12px; font-weight:bold; white-space:nowrap; }
-  .badge.big { font-size:15px; padding:6px 16px; border-radius:16px; }
-  .risk-row { display:flex; gap:10px; margin-bottom:12px; flex-wrap:wrap; }
-  .risk-row.big { margin:20px 0; }
-  .risk-row.big .risk { font-size:15px; padding:8px 16px; }
-  .risk { font-size:12px; padding:3px 8px; border-radius:4px; font-weight:bold; }
+  .badge { color:#fff; padding:6px 14px; border-radius:14px; font-size:14px; font-weight:bold; white-space:nowrap; }
+  .badge.big { font-size:20px; padding:10px 22px; border-radius:20px; }
+  .risk-row { display:flex; gap:12px; margin-bottom:16px; flex-wrap:wrap; }
+  .risk-row.big { margin:24px 0; }
+  .risk-row.big .risk { font-size:18px; padding:10px 20px; }
+  .risk { font-size:14px; padding:5px 12px; border-radius:6px; font-weight:bold; }
   .risk-high { background:#fdecea; color:#c62828; }
   .risk-med  { background:#fff6e0; color:#8a6100; }
   .risk-low  { background:#eef2f5; color:#555; }
-  .site-hero { display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:16px; border-left:6px solid; padding:10px 0 10px 20px; margin-bottom:8px; }
-  .report-link { display:inline-block; font-size:13px; color:#1E3A5F; font-weight:600; text-decoration:none; }
-  .report-link.big { font-size:15px; background:#1E3A5F; color:#fff; padding:10px 20px; border-radius:6px; }
+  .site-hero { display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:20px; border-left:8px solid; padding:14px 0 14px 26px; margin-bottom:12px; }
+  .site-hero h1 { font-size:40px; }
+  .report-link { display:inline-block; font-size:15px; color:#1E3A5F; font-weight:600; text-decoration:none; }
+  .report-link.big { font-size:18px; background:#1E3A5F; color:#fff; padding:14px 28px; border-radius:8px; }
   .report-link.big:hover { background:#15304d; }
-  .tile-row { display:grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap:16px; margin-bottom:24px; }
-  .tile { background:#fff; border-radius:8px; padding:16px; text-align:center; box-shadow:0 1px 3px rgba(0,0,0,0.12); }
-  .tile .num { font-size:24px; font-weight:bold; display:block; color:#1E3A5F; }
+  .tile-row { display:grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap:20px; margin-bottom:28px; }
+  .tile { background:#fff; border-radius:10px; padding:22px; text-align:center; box-shadow:0 1px 4px rgba(0,0,0,0.14); }
+  .tile .num { font-size:30px; font-weight:bold; display:block; color:#1E3A5F; }
   .tile .num.on { color:#2e7d32; }
   .tile .num.off { color:#c62828; }
-  .tile .label { color:#666; font-size:12px; margin-top:4px; display:block; }
-  .panel-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap:20px; margin-bottom:20px; }
-  .panel { background:#fff; border-radius:8px; padding:18px 20px; box-shadow:0 1px 3px rgba(0,0,0,0.12); }
-  .panel h3 { margin:0 0 14px; color:#1E3A5F; font-size:15px; }
-  .bar-row { margin-bottom:16px; }
-  .bar-label { display:flex; justify-content:space-between; font-size:13px; color:#555; margin-bottom:4px; }
-  .bar-track { background:#eef1f4; border-radius:6px; height:10px; overflow:hidden; }
-  .bar-fill { height:100%; border-radius:6px; }
-  table.metrics { width:100%; border-collapse:collapse; font-size:14px; }
-  table.metrics td, table.metrics th { padding:6px 4px; border-bottom:1px solid #eee; }
+  .tile .label { color:#666; font-size:14px; margin-top:6px; display:block; }
+  .panel-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap:24px; margin-bottom:24px; }
+  .panel { background:#fff; border-radius:10px; padding:26px 28px; box-shadow:0 1px 4px rgba(0,0,0,0.14); }
+  .panel h3 { margin:0 0 18px; color:#1E3A5F; font-size:19px; }
+  .bar-row { margin-bottom:20px; }
+  .bar-label { display:flex; justify-content:space-between; font-size:15px; color:#555; margin-bottom:6px; }
+  .bar-track { background:#eef1f4; border-radius:7px; height:14px; overflow:hidden; }
+  .bar-fill { height:100%; border-radius:7px; }
+  table.metrics { width:100%; border-collapse:collapse; font-size:16px; }
+  table.metrics td, table.metrics th { padding:9px 6px; border-bottom:1px solid #eee; }
   table.metrics td:first-child { color:#666; }
   table.metrics td:last-child:not(:first-child) { text-align:right; font-weight:600; }
-  table.metrics.wide th { text-align:left; color:#999; font-size:11px; text-transform:uppercase; }
+  table.metrics.wide th { text-align:left; color:#999; font-size:13px; text-transform:uppercase; }
   table.metrics.wide td:not(:first-child) { text-align:center; }
-  footer { margin-top:32px; color:#888; font-size:12px; }
+  footer { margin-top:36px; color:#888; font-size:14px; }
 </style>
 </head>
 <body>
