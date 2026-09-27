@@ -122,7 +122,7 @@ param(
 # Bump this on every change. Printed first thing at startup and written into the log file, so
 # it's always possible to confirm exactly which script version produced a given run/report
 # instead of guessing whether an old cached copy is being executed somewhere.
-$ScriptBuild = '2026-09-27-12-direct-cert-vlan0-vm-proxy'
+$ScriptBuild = '2026-09-27-13-html-dashboard'
 Write-Host "VMware_Weekly_HealthCheck.ps1 - build $ScriptBuild" -ForegroundColor Magenta
 
 $ErrorActionPreference = 'Stop'
@@ -1330,6 +1330,182 @@ function Write-SiteReportDocx {
     [System.Runtime.Interopservices.Marshal]::ReleaseComObject($doc) | Out-Null
 }
 
+# Escapes text for safe inclusion in the HTML dashboard - avoids any dependency on
+# System.Web (not guaranteed loaded) for a handful of characters that matter here.
+function ConvertTo-HtmlSafe {
+    param([string]$Text)
+    if (-not $Text) { return '' }
+    return $Text -replace '&','&amp;' -replace '<','&lt;' -replace '>','&gt;' -replace '"','&quot;'
+}
+
+# Computes the same per-site aggregate numbers Write-SiteReportDocx shows (health status, risk
+# counts, host/VM/cluster counts, DRS/HA, ESXi version), independently from $Global:AllResults,
+# for the combined HTML dashboard. Deliberately a separate, self-contained function rather than
+# refactoring Write-SiteReportDocx to share it - that function has been hardened through a lot of
+# real-world bug fixes already, and duplicating this small piece of aggregation logic is a safer
+# tradeoff than risking a regression there for the dashboard's sake.
+function Get-SiteDashboardSummary {
+    param([string]$SiteLabel)
+    $SiteFindings = $Global:AllResults | Where-Object { $_.Site -eq $SiteLabel }
+    if (-not $SiteFindings) { return $null }
+
+    $CritCount   = @($SiteFindings | Where-Object { $_.Status -eq 'Critical' }).Count
+    $WarnCount   = @($SiteFindings | Where-Object { $_.Status -eq 'Warning' }).Count
+    $UnableCount = @($SiteFindings | Where-Object { $_.Status -in 'Unable to Check','Manual/External Required' }).Count
+    $OverallHealth = if ($CritCount -gt 0) { 'Critical' } elseif ($WarnCount -gt 0) { 'Warning' } else { 'Healthy' }
+
+    $AllHostFindings = $SiteFindings | Where-Object { $_.Area -eq 'Host' -and $_.Item -eq 'Host Configuration Summary' }
+    $HostCountTotal = 0
+    $HostVersionsAll = @()
+    foreach ($hf in $AllHostFindings) {
+        $parts = $hf.Value -split '\|'
+        $HostCountTotal += [int]$parts[0]
+        $HostVersionsAll += "$($parts[1])"
+    }
+    $EsxiVersionDisplay = ($HostVersionsAll | Select-Object -Unique) -join ', '
+
+    $VmCountTotal = 0
+    foreach ($g in ($SiteFindings | Where-Object { $_.Area -eq 'VM' -and $_.Item -eq 'Guest OS' })) {
+        $VmCountTotal += [int]$g.Value
+    }
+
+    $ClusterCount = @(if ($Global:SiteClusterMap.ContainsKey($SiteLabel)) { $Global:SiteClusterMap[$SiteLabel] } else { @() }).Count
+
+    # Same "ON unless any cluster explicitly reports False" logic as the docx (line ~1043) -
+    # matched deliberately so the two outputs never disagree about DRS/HA status.
+    $drsAll = ($SiteFindings | Where-Object { $_.Item -eq 'vSphere DRS' })
+    $haAll  = ($SiteFindings | Where-Object { $_.Item -eq 'vSphere HA' })
+    $drsOn = [bool]($drsAll) -and -not ($drsAll | Where-Object { $_.Value -eq 'False' })
+    $haOn  = [bool]($haAll)  -and -not ($haAll  | Where-Object { $_.Value -eq 'False' })
+
+    [pscustomobject]@{
+        Site          = $SiteLabel
+        OverallHealth = $OverallHealth
+        HighRisk      = $CritCount
+        MediumRisk    = $WarnCount
+        LowRisk       = $UnableCount
+        HostCount     = $HostCountTotal
+        VmCount       = $VmCountTotal
+        ClusterCount  = $ClusterCount
+        EsxiVersion   = $(if ($EsxiVersionDisplay) { $EsxiVersionDisplay } else { 'n/a' })
+        DrsOn         = $drsOn
+        HaOn          = $haOn
+    }
+}
+
+# Writes the combined multi-site overview dashboard - one static, self-contained HTML file with
+# no external dependencies (no CDN/internet access assumed), so it opens correctly straight from
+# disk on an offline/internal machine just like the .docx/.log files do.
+function Write-DashboardHtml {
+    param([string[]]$SiteLabels, [string]$OutputPath, [string]$RunDateDisplay, [string]$ScriptBuild)
+
+    $summaries = @($SiteLabels | ForEach-Object { Get-SiteDashboardSummary -SiteLabel $_ } | Where-Object { $_ })
+    if ($summaries.Count -eq 0) { return }
+
+    $healthColor = @{ Healthy = '#2e7d32'; Warning = '#e6a100'; Critical = '#c62828' }
+    $healthCounts = @{
+        Healthy  = @($summaries | Where-Object { $_.OverallHealth -eq 'Healthy' }).Count
+        Warning  = @($summaries | Where-Object { $_.OverallHealth -eq 'Warning' }).Count
+        Critical = @($summaries | Where-Object { $_.OverallHealth -eq 'Critical' }).Count
+    }
+    $totalHigh   = ($summaries | Measure-Object -Property HighRisk -Sum).Sum
+    $totalMedium = ($summaries | Measure-Object -Property MediumRisk -Sum).Sum
+    $totalHosts  = ($summaries | Measure-Object -Property HostCount -Sum).Sum
+    $totalVMs    = ($summaries | Measure-Object -Property VmCount -Sum).Sum
+
+    $cards = ($summaries | Sort-Object Site | ForEach-Object {
+        $s = $_
+        $color = $healthColor[$s.OverallHealth]
+        $healthLabel = switch ($s.OverallHealth) {
+            'Healthy'  { 'Healthy - No Issues Detected' }
+            'Warning'  { 'Healthy - Minor Issues Detected' }
+            'Critical' { 'Attention Required - Critical Issues' }
+        }
+@"
+        <div class="card">
+          <div class="card-head">
+            <h2>$(ConvertTo-HtmlSafe $s.Site)</h2>
+            <span class="badge" style="background:$color">$(ConvertTo-HtmlSafe $healthLabel)</span>
+          </div>
+          <div class="risk-row">
+            <span class="risk risk-high">High: $($s.HighRisk)</span>
+            <span class="risk risk-med">Medium: $($s.MediumRisk)</span>
+            <span class="risk risk-low">Low: $($s.LowRisk)</span>
+          </div>
+          <table class="metrics">
+            <tr><td>ESXi Hosts</td><td>$($s.HostCount)</td></tr>
+            <tr><td>Clusters</td><td>$($s.ClusterCount)</td></tr>
+            <tr><td>Virtual Machines</td><td>$($s.VmCount)</td></tr>
+            <tr><td>ESXi Version</td><td>$(ConvertTo-HtmlSafe $s.EsxiVersion)</td></tr>
+            <tr><td>vSphere DRS</td><td>$(if ($s.DrsOn) {'ON'} else {'OFF'})</td></tr>
+            <tr><td>vSphere HA</td><td>$(if ($s.HaOn) {'ON'} else {'OFF'})</td></tr>
+          </table>
+        </div>
+"@
+    }) -join "`n"
+
+    $html = @"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>VMware Weekly Health Check - Dashboard</title>
+<style>
+  body { font-family: Calibri, Arial, sans-serif; background:#f4f6f8; color:#1a1a1a; margin:0; padding:24px; }
+  h1 { color:#1E3A5F; margin-bottom:4px; }
+  .subtitle { color:#555; margin-top:0; margin-bottom:24px; }
+  .summary-strip { display:flex; gap:16px; flex-wrap:wrap; margin-bottom:28px; }
+  .stat { background:#fff; border-radius:8px; padding:16px 20px; box-shadow:0 1px 3px rgba(0,0,0,0.12); min-width:140px; }
+  .stat .num { font-size:28px; font-weight:bold; display:block; }
+  .stat .label { color:#666; font-size:13px; }
+  .stat.healthy .num { color:#2e7d32; }
+  .stat.warning .num { color:#e6a100; }
+  .stat.critical .num { color:#c62828; }
+  .grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap:20px; }
+  .card { background:#fff; border-radius:8px; padding:18px 20px; box-shadow:0 1px 3px rgba(0,0,0,0.12); }
+  .card-head { display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:10px; }
+  .card-head h2 { margin:0; font-size:19px; color:#1E3A5F; }
+  .badge { color:#fff; padding:4px 10px; border-radius:12px; font-size:12px; font-weight:bold; white-space:nowrap; }
+  .risk-row { display:flex; gap:10px; margin-bottom:12px; flex-wrap:wrap; }
+  .risk { font-size:12px; padding:3px 8px; border-radius:4px; font-weight:bold; }
+  .risk-high { background:#fdecea; color:#c62828; }
+  .risk-med  { background:#fff6e0; color:#8a6100; }
+  .risk-low  { background:#eef2f5; color:#555; }
+  table.metrics { width:100%; border-collapse:collapse; font-size:14px; }
+  table.metrics td { padding:4px 0; border-bottom:1px solid #eee; }
+  table.metrics td:first-child { color:#666; }
+  table.metrics td:last-child { text-align:right; font-weight:600; }
+  footer { margin-top:32px; color:#888; font-size:12px; }
+</style>
+</head>
+<body>
+  <h1>VMware Weekly Health Check - Dashboard</h1>
+  <p class="subtitle">Generated $(ConvertTo-HtmlSafe $RunDateDisplay) - $($summaries.Count) site(s)</p>
+
+  <div class="summary-strip">
+    <div class="stat healthy"><span class="num">$($healthCounts.Healthy)</span><span class="label">Healthy Sites</span></div>
+    <div class="stat warning"><span class="num">$($healthCounts.Warning)</span><span class="label">Sites with Warnings</span></div>
+    <div class="stat critical"><span class="num">$($healthCounts.Critical)</span><span class="label">Sites Critical</span></div>
+    <div class="stat"><span class="num">$totalHigh</span><span class="label">Total High Risk Issues</span></div>
+    <div class="stat"><span class="num">$totalMedium</span><span class="label">Total Medium Risk Issues</span></div>
+    <div class="stat"><span class="num">$totalHosts</span><span class="label">Total ESXi Hosts</span></div>
+    <div class="stat"><span class="num">$totalVMs</span><span class="label">Total VMs</span></div>
+  </div>
+
+  <div class="grid">
+$cards
+  </div>
+
+  <footer>VMware_Weekly_HealthCheck.ps1 - build $(ConvertTo-HtmlSafe $ScriptBuild)</footer>
+</body>
+</html>
+"@
+
+    $dashboardPath = Join-Path $OutputPath "VMware_HealthCheck_Dashboard_$RunDate.html"
+    $html | Out-File -FilePath $dashboardPath -Encoding UTF8
+    Write-Host "Dashboard written: $dashboardPath" -ForegroundColor Cyan
+}
+
 # ============================================================================
 # 4. OUTPUT: ONE DOCX PER SITE
 # ============================================================================
@@ -1350,6 +1526,13 @@ if ($WordAvailable) {
     }
     $Word.Quit()
     [System.Runtime.Interopservices.Marshal]::ReleaseComObject($Word) | Out-Null
+}
+
+# ============================================================================
+# 4b. OUTPUT: COMBINED HTML DASHBOARD (no Word dependency - always attempted)
+# ============================================================================
+Invoke-SafeCheck -CheckName 'Dashboard generation' -VCenter 'n/a' -Site 'n/a' -ObjectName 'Dashboard' -Script {
+    Write-DashboardHtml -SiteLabels $SiteLabels -OutputPath $OutputPath -RunDateDisplay $RunDateDisplay -ScriptBuild $ScriptBuild
 }
 
 # ============================================================================
