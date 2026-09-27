@@ -107,6 +107,11 @@ param(
     # Local ESXi accounts considered normal/expected; anything extra found on a host is flagged.
     [string[]]$ExpectedLocalAccounts = @('root','dcui','vpxuser'),
 
+    # Cluster names to skip entirely (e.g. one that's been migrated to another platform but is
+    # still visible in vCenter inventory) - excluded from every section of every site's report and
+    # the dashboard, as if it didn't exist. Matched by exact cluster name, case-insensitive.
+    [string[]]$ExcludeClusters = @(),
+
     # Configurable thresholds - NOT vendor/company-defined standards. Raw values are always
     # shown regardless of these; these only drive the Warning/Critical flag shown alongside them.
     [double]$CapacityWarningPct    = 80,
@@ -122,7 +127,7 @@ param(
 # Bump this on every change. Printed first thing at startup and written into the log file, so
 # it's always possible to confirm exactly which script version produced a given run/report
 # instead of guessing whether an old cached copy is being executed somewhere.
-$ScriptBuild = '2026-09-27-14-dashboard-capacity-storage-appliance'
+$ScriptBuild = '2026-09-27-15-exclude-clusters'
 Write-Host "VMware_Weekly_HealthCheck.ps1 - build $ScriptBuild" -ForegroundColor Magenta
 
 $ErrorActionPreference = 'Stop'
@@ -510,7 +515,7 @@ foreach ($VC in $Connections) {
 
     # --- Discover clusters ---------------------------------------------------------------------
     $Clusters = Invoke-SafeCheck -CheckName 'Cluster discovery' -VCenter $VCName -Site $Site -ObjectName $VCName -Script {
-        Get-Cluster -Server $VC
+        Get-Cluster -Server $VC | Where-Object { $_.Name -notin $ExcludeClusters }
     }
     if (-not $Clusters) { continue }
 
