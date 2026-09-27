@@ -1,12 +1,12 @@
 # Clones every VM listed in C:\temp\vmlist.txt, one after another.
 # Run it in a PowerShell window that is already connected to vCenter (Connect-VIServer).
-# Each clone is named <VMName>_clone and created on the same host, datastore and folder as the original.
+# Each clone is named <VMName>_Pre-Win-Server2025Upgrade-Clone and created on the same host, datastore and folder as the original.
 
 $vmNames = Get-Content -Path 'C:\temp\vmlist.txt' | Where-Object { $_.Trim() -ne '' }
 
 foreach ($vmName in $vmNames) {
     $vmName    = $vmName.Trim()
-    $cloneName = "${vmName}_clone"
+    $cloneName = "${vmName}_Pre-Win-Server2025Upgrade-Clone"
     Write-Host "Cloning $vmName -> $cloneName ..." -ForegroundColor Cyan
     try {
         $vm        = Get-VM -Name $vmName -ErrorAction Stop
