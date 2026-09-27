@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    VMware Weekly Health Check - Read-only automated collection and DOCX report generation,
+    VMware Weekly Health Check - Read-only automated collection and PDF report generation,
     matching the "<Site> vCenter & ESXi Health Check Report" template (SAMI/Qiddiya format).
 
 .DESCRIPTION
@@ -11,7 +11,7 @@
     - Uses whatever vCenter sessions are already connected (Connect-VIServer done beforehand).
     - Auto-discovers clusters, hosts, datastores, vSAN, vDS/port groups and VMs per vCenter -
       nothing about the infrastructure is hard-coded.
-    - Produces ONE .docx per connected vCenter ("site"), matching the exact section layout,
+    - Produces ONE .pdf per connected vCenter ("site"), matching the exact section layout,
       wording and table structure of the reference report:
         1.  Executive Summary
         2.  Environment Overview
@@ -129,7 +129,7 @@ param(
 # Bump this on every change. Printed first thing at startup and written into the log file, so
 # it's always possible to confirm exactly which script version produced a given run/report
 # instead of guessing whether an old cached copy is being executed somewhere.
-$ScriptBuild = '2026-09-27-17-tls-fix-substring-exclude-tabbed-dashboard'
+$ScriptBuild = '2026-09-27-18-pdf-output'
 Write-Host "VMware_Weekly_HealthCheck.ps1 - build $ScriptBuild" -ForegroundColor Magenta
 
 $ErrorActionPreference = 'Stop'
@@ -793,7 +793,7 @@ foreach ($VC in $Connections) {
 # ============================================================================
 # ============================================================================
 # 3. REPORT GENERATION HELPERS
-#    Each site's .docx is built DIRECTLY in Word via COM automation - typing text, applying
+#    Each site's report is built DIRECTLY in Word via COM automation - typing text, applying
 #    styles/colors, inserting native Word tables, and using real Word Section headers/footers
 #    (logos + date repeat at the top of every page, classification text at the bottom of every
 #    page) rather than typing them once into the body. There is no HTML step anywhere in this
@@ -988,7 +988,7 @@ function Add-HeaderFooter {
     $footer.Range.InsertAfter($FooterText)
 }
 
-function Write-SiteReportDocx {
+function Write-SiteReportPdf {
     param($Word, [string]$SiteLabel, [string]$OutputPath, [string]$RunDate)
 
     $SiteFindings = $Global:AllResults | Where-Object { $_.Site -eq $SiteLabel }
@@ -1333,24 +1333,29 @@ function Write-SiteReportDocx {
 
     $safeLabel = ($SiteLabel -replace '[\\/\?\*\[\]:<>\|]', '_')
     $baseName = "$safeLabel`_VMware_HealthCheck_$RunDate"
-    # If today's report file is still open in another Word window (e.g. someone reviewing the
-    # last run while this one executes), SaveAs fails outright with a locked-file error. Rather
-    # than lose the run, fall back to an incrementing suffix (_2, _3, ...) until one saves.
+    # If today's report file is still open elsewhere (e.g. someone reviewing the last run's PDF
+    # while this one executes), the export fails outright with a locked-file error. Rather than
+    # lose the run, fall back to an incrementing suffix (_2, _3, ...) until one saves. Retries on
+    # any error here (not just a specific message match) - PDF export can fail locked-file checks
+    # with different wording than Word's own docx SaveAs did, and a genuinely unrecoverable error
+    # (e.g. disk full) will simply keep failing every attempt and correctly fall through below.
     $saved = $false
     for ($attempt = 1; $attempt -le 20 -and -not $saved; $attempt++) {
-        $DocxPath = if ($attempt -eq 1) { Join-Path $OutputPath "$baseName.docx" } else { Join-Path $OutputPath "$baseName`_$attempt.docx" }
+        $PdfPath = if ($attempt -eq 1) { Join-Path $OutputPath "$baseName.pdf" } else { Join-Path $OutputPath "$baseName`_$attempt.pdf" }
         try {
-            $null = $doc.GetType().InvokeMember('SaveAs', [System.Reflection.BindingFlags]::InvokeMethod, $null, $doc, @([string]$DocxPath, 16))
-            Write-Host "Report written: $DocxPath" -ForegroundColor Cyan
+            # ExportAsFixedFormat(OutputFileName, ExportFormat) - ExportFormat 17 = wdExportFormatPDF.
+            # Word's dedicated PDF export API (rather than SaveAs2 with FileFormat 17), preferred
+            # for fidelity/embedded-font handling.
+            $null = $doc.GetType().InvokeMember('ExportAsFixedFormat', [System.Reflection.BindingFlags]::InvokeMethod, $null, $doc, @([string]$PdfPath, 17))
+            Write-Host "Report written: $PdfPath" -ForegroundColor Cyan
             $saved = $true
         } catch {
             $lastError = $_.Exception.Message
-            if ($lastError -notmatch 'already open elsewhere') { break }
         }
     }
     if (-not $saved) {
-        Write-CheckLog -VCenter 'n/a' -Site $SiteLabel -Object 'DOCX export' -CheckName 'Word COM automation' -ErrorMessage $lastError
-        Write-Warning "Could not save .docx for $SiteLabel : $lastError"
+        Write-CheckLog -VCenter 'n/a' -Site $SiteLabel -Object 'PDF export' -CheckName 'Word COM automation' -ErrorMessage $lastError
+        Write-Warning "Could not save .pdf for $SiteLabel : $lastError"
     }
     $null = $doc.GetType().InvokeMember('Close', [System.Reflection.BindingFlags]::InvokeMethod, $null, $doc, @(0))
     [System.Runtime.Interopservices.Marshal]::ReleaseComObject($doc) | Out-Null
@@ -1364,10 +1369,10 @@ function ConvertTo-HtmlSafe {
     return $Text -replace '&','&amp;' -replace '<','&lt;' -replace '>','&gt;' -replace '"','&quot;'
 }
 
-# Computes the same per-site aggregate numbers Write-SiteReportDocx shows (health status, risk
+# Computes the same per-site aggregate numbers Write-SiteReportPdf shows (health status, risk
 # counts, host/VM/cluster counts, DRS/HA, ESXi version), independently from $Global:AllResults,
 # for the combined HTML dashboard. Deliberately a separate, self-contained function rather than
-# refactoring Write-SiteReportDocx to share it - that function has been hardened through a lot of
+# refactoring Write-SiteReportPdf to share it - that function has been hardened through a lot of
 # real-world bug fixes already, and duplicating this small piece of aggregation logic is a safer
 # tradeoff than risking a regression there for the dashboard's sake.
 function Get-SiteDashboardSummary {
@@ -1450,7 +1455,7 @@ function Get-SiteDashboardSummary {
     # Matches the docx's own filename pattern (line ~1308) for a "view full report" link. Doesn't
     # account for the rare _2/_3 retry-suffix case (used only when the first save attempt fails
     # because the file is open elsewhere) - an acceptable gap for a convenience link.
-    $docxFileName = "$($SiteLabel -replace '[\\/\?\*\[\]:<>\|]', '_')_VMware_HealthCheck_$RunDate.docx"
+    $pdfFileName = "$($SiteLabel -replace '[\\/\?\*\[\]:<>\|]', '_')_VMware_HealthCheck_$RunDate.pdf"
 
     # Per-cluster breakdown (Hosts/VMs/CPU%/Mem%) for the site's own full dashboard page - every
     # finding used here already carries -Cluster (confirmed against the real New-Finding calls),
@@ -1495,13 +1500,13 @@ function Get-SiteDashboardSummary {
         ApplianceStatus = $applianceWorst
         CertificateText = $certText
         BackupSupplied  = $backupSupplied
-        DocxFileName    = $docxFileName
+        PdfFileName     = $pdfFileName
     }
 }
 
 # Writes the combined multi-site overview dashboard - one static, self-contained HTML file with
 # no external dependencies (no CDN/internet access assumed), so it opens correctly straight from
-# disk on an offline/internal machine just like the .docx/.log files do.
+# disk on an offline/internal machine just like the .pdf/.log files do.
 function ConvertTo-Slug {
     param([string]$Text)
     $slug = ($Text -replace '[^a-zA-Z0-9]+', '-').Trim('-').ToLower()
@@ -1603,7 +1608,7 @@ function Write-DashboardHtml {
             <h1>$(ConvertTo-HtmlSafe $s.Site)</h1>
             <span class="badge big" style="background:$color">$(ConvertTo-HtmlSafe $healthLabelText[$s.OverallHealth])</span>
           </div>
-          <a class="report-link big" href="$(ConvertTo-HtmlSafe $s.DocxFileName)">View Full Report &rarr;</a>
+          <a class="report-link big" href="$(ConvertTo-HtmlSafe $s.PdfFileName)">View Full Report &rarr;</a>
         </div>
 
         <div class="risk-row big">
@@ -1766,7 +1771,7 @@ function showPage(slug) {
 }
 
 # ============================================================================
-# 4. OUTPUT: ONE DOCX PER SITE
+# 4. OUTPUT: ONE PDF PER SITE
 # ============================================================================
 $SiteLabels = $Global:AllResults | Select-Object -ExpandProperty Site -Unique
 $WordAvailable = $true
@@ -1775,13 +1780,13 @@ try {
     $Word.Visible = $false
 } catch {
     $WordAvailable = $false
-    Write-CheckLog -VCenter 'n/a' -Site 'n/a' -Object 'DOCX export' -CheckName 'Word COM automation' -ErrorMessage $_.Exception.Message
-    Write-Warning "Microsoft Word is not available on this machine - cannot generate .docx reports."
+    Write-CheckLog -VCenter 'n/a' -Site 'n/a' -Object 'PDF export' -CheckName 'Word COM automation' -ErrorMessage $_.Exception.Message
+    Write-Warning "Microsoft Word is not available on this machine - cannot generate .pdf reports (still built via Word automation, then exported to PDF)."
 }
 
 if ($WordAvailable) {
     foreach ($SiteLabel in $SiteLabels) {
-        Write-SiteReportDocx -Word $Word -SiteLabel $SiteLabel -OutputPath $OutputPath -RunDate $RunDate
+        Write-SiteReportPdf -Word $Word -SiteLabel $SiteLabel -OutputPath $OutputPath -RunDate $RunDate
     }
     $Word.Quit()
     [System.Runtime.Interopservices.Marshal]::ReleaseComObject($Word) | Out-Null
@@ -1795,7 +1800,7 @@ Invoke-SafeCheck -CheckName 'Dashboard generation' -VCenter 'n/a' -Site 'n/a' -O
 }
 
 # ============================================================================
-# 5. OUTPUT: LOG FILE (written last so it also captures any DOCX export failures)
+# 5. OUTPUT: LOG FILE (written last so it also captures any PDF export failures)
 # ============================================================================
 $LogPath = Join-Path $OutputPath "VMware_Weekly_HealthCheck_$RunDate.log"
 $LogLines = @()
