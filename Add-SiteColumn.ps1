@@ -22,6 +22,7 @@ $Title = 'All Sites  -  VM Inventory'      # new text for the title row (row abo
 #endregion ==================================================================
 
 $ErrorActionPreference = 'Stop'
+function Test-JunkHeader($s) { ([string]$s).Trim() -match '^(Column\s*)?\d*$' }   # blank, "2", "Column8" = auto-named empty column
 function Norm($s) { (([string]$s) -replace '[\s\u00A0]+', ' ').Trim().ToLower() }
 
 if (-not (Test-Path $InputFile)) { Write-Host "Not found: $InputFile" -ForegroundColor Red; return }
@@ -45,9 +46,10 @@ try {
         if ($hit) { $ws = $s; $hdr = $hit.Row; $nameCol = $hit.Column; break }
     }
     if (-not $ws) { throw "No 'VM NAME' header found in $InputFile" }
-    $lastCol = $ws.Cells.Item($hdr, $ws.Columns.Count).End(-4159).Column     # last filled header cell ...
-    $hv = $ws.Range($ws.Cells.Item($hdr, 1), $ws.Cells.Item($hdr, $lastCol)).Value2
-    while ($lastCol -gt $nameCol -and ([string]$hv[1, $lastCol]).Trim() -eq '') { $lastCol-- }   # ... ignoring cells with only spaces
+    # last real header (ignores blank / spaces / auto-named "Column8" headers)
+    $hv = $ws.Range($ws.Cells.Item($hdr, 1), $ws.Cells.Item($hdr, $ws.Columns.Count)).Value2
+    $lastCol = $nameCol
+    for ($c = $hv.GetUpperBound(1); $c -gt $nameCol; $c--) { if (-not (Test-JunkHeader $hv[1, $c])) { $lastCol = $c; break } }
     Write-Host "Sheet '$($ws.Name)', header row $hdr, VM NAME in column $nameCol"
 
     # ---------- Site column: reuse if it exists, otherwise add it just before "Business Owner" ----------
@@ -60,43 +62,37 @@ try {
     if (-not $pos) { $pos = 2; Write-Host "No 'Business Owner' header found - Site goes in column 2" -ForegroundColor Yellow }
     if ($siteCol) { Write-Host "A 'Site' column already exists (column $siteCol) - it will be filled" -ForegroundColor Yellow }
     else {
-        # Move the block from "Business Owner" to the last column one column to the right (only these cells move)
+        # Move the columns from "Business Owner" up to the last real column one step to the right.
+        # The receiving column is the first column after the data that is empty - cells with only spaces and
+        # auto-named table headers ("Column8", "Column9" ...) count as empty. Nothing else is touched.
         $lo = $null
         foreach ($t in $ws.ListObjects) { if ($t.Range.Row -le $hdr -and ($t.Range.Row + $t.Range.Rows.Count - 1) -ge $hdr) { $lo = $t } }
         $blockLastRow = $ws.Cells.Item($ws.Rows.Count, $nameCol).End(-4162).Row
-        $blockLastCol = $lastCol
-        if ($lo) {
-            $blockLastRow = [Math]::Max($blockLastRow, $lo.Range.Row + $lo.Range.Rows.Count - 1)
-            $blockLastCol = $lo.Range.Column + $lo.Range.Columns.Count - 1
-        }
-        # Extend the block to the right up to the first completely empty column (that column receives the shift).
-        # One bulk read of the area; looks at most 200 columns to the right.
-        for ($c = $pos; $c -le $blockLastCol; $c++) { $blockLastRow = [Math]::Max($blockLastRow, $ws.Cells.Item($ws.Rows.Count, $c).End(-4162).Row) }
-        $startCol = $blockLastCol
-        for ($pass = 1; $pass -le 3; $pass++) {
-            $scanTo = [Math]::Min($ws.Columns.Count - 1, $startCol + 200)
-            $grid = $ws.Range($ws.Cells.Item(1, $startCol + 1), $ws.Cells.Item($blockLastRow, $scanTo)).Value2
-            $found = $false
-            for ($k = 1; $k -le $grid.GetUpperBound(1); $k++) {
-                $empty = $true
-                for ($r = 1; $r -le $grid.GetUpperBound(0); $r++) { if (([string]$grid[$r, $k]).Trim() -ne '') { $empty = $false; break } }
-                if ($empty) { $blockLastCol = $startCol + $k - 1; $found = $true; break }
-            }
-            if (-not $found) { throw "No empty column found within 200 columns to the right of the data (rows 1-$blockLastRow). Clear some cells there and run again." }
-            # Columns added to the block may go further down - include those rows and check again
-            $grow = $blockLastRow
-            for ($c = $startCol + 1; $c -le $blockLastCol; $c++) { $grow = [Math]::Max($grow, $ws.Cells.Item($ws.Rows.Count, $c).End(-4162).Row) }
-            if ($grow -eq $blockLastRow) { break }
-            $blockLastRow = $grow
-        }
-        if ($lo) {   # remember the table size before the move
-            $loRow = $lo.Range.Row; $loCol = $lo.Range.Column
-            $loLastRow = $loRow + $lo.Range.Rows.Count - 1; $loLastCol = $loCol + $lo.Range.Columns.Count - 1
-        }
-        [void]$ws.Range($ws.Cells.Item(1, $pos), $ws.Cells.Item($blockLastRow, $blockLastCol)).Cut($ws.Cells.Item(1, $pos + 1))
-        # the table grows by exactly one column (the new Site column) - nothing else is added to it
-        if ($lo) { $lo.Resize($ws.Range($ws.Cells.Item($loRow, $loCol), $ws.Cells.Item($loLastRow, $loLastCol + 1))) }
+        if ($lo) { $blockLastRow = [Math]::Max($blockLastRow, $lo.Range.Row + $lo.Range.Rows.Count - 1) }
+        for ($c = $pos; $c -le $lastCol; $c++) { $blockLastRow = [Math]::Max($blockLastRow, $ws.Cells.Item($ws.Rows.Count, $c).End(-4162).Row) }
 
+        $scanTo = [Math]::Min($ws.Columns.Count, $lastCol + 400)
+        $grid = $ws.Range($ws.Cells.Item(1, $lastCol + 1), $ws.Cells.Item($blockLastRow, $scanTo)).Value2
+        $recv = 0
+        for ($k = 1; $k -le $grid.GetUpperBound(1) -and -not $recv; $k++) {
+            $empty = $true
+            for ($r = 1; $r -le $grid.GetUpperBound(0); $r++) {
+                $v = ([string]$grid[$r, $k]).Trim()
+                if ($v -eq '') { continue }
+                if ($r -eq $hdr -and (Test-JunkHeader $v)) { continue }         # auto-named empty table column
+                $empty = $false; break
+            }
+            if ($empty) { $recv = $lastCol + $k }
+        }
+        if (-not $recv) { throw "No free column found to the right of the data (checked up to column $scanTo)." }
+        if ($recv -gt $lastCol + 1) { Write-Host "Columns between the data and column $recv hold values - they move one step right too" -ForegroundColor Yellow }
+
+        $tblLast = $(if ($lo) { $lo.Range.Column + $lo.Range.Columns.Count - 1 } else { 0 })
+        if ($lo) { $loRow = $lo.Range.Row; $loCol = $lo.Range.Column; $loLastRow = $loRow + $lo.Range.Rows.Count - 1 }
+        [void]$ws.Range($ws.Cells.Item(1, $pos), $ws.Cells.Item($blockLastRow, $recv - 1)).Cut($ws.Cells.Item(1, $pos + 1))
+        # table: keep its size, or grow it just enough to still hold all moved columns
+        if ($lo -and $recv -gt $tblLast) { $lo.Resize($ws.Range($ws.Cells.Item($loRow, $loCol), $ws.Cells.Item($loLastRow, $recv))) }
+        $blockLastCol = $recv - 1
         # New column gets the same look as the "Business Owner" column next to it
         [void]$ws.Range($ws.Cells.Item(1, $pos + 1), $ws.Cells.Item($blockLastRow, $pos + 1)).Copy()
         [void]$ws.Range($ws.Cells.Item(1, $pos), $ws.Cells.Item($blockLastRow, $pos)).PasteSpecial(-4122)   # formats only
