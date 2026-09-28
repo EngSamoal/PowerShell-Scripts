@@ -75,6 +75,12 @@ try {
     $VL = ColLetter $nameCol
     Write-Host "Sheet '$($ws.Name)': header row $hdr, rows to $lastRow, Site = column $(ColLetter $siteCol), VM NAME = column $VL"
 
+    # ---------- Clear active filters (the file may have been saved filtered; nothing is deleted) ----------
+    foreach ($t in @($ws.ListObjects)) {
+        try { if ($t.ShowAutoFilter -and $t.AutoFilter.FilterMode) { $t.AutoFilter.ShowAllData(); Write-Host "Cleared the filter on table '$($t.Name)'" } } catch { }
+    }
+    try { if ($ws.FilterMode) { $ws.ShowAllData(); Write-Host 'Cleared the sheet filter' } } catch { }
+
     # ---------- Find the banners (first filled cell of the row starts with OT / Test / Template) ----------
     $grid = $ws.Range($ws.Cells.Item(1, 1), $ws.Cells.Item($lastRow, $lastCol)).Value2
     $banners = New-Object System.Collections.Generic.List[object]
