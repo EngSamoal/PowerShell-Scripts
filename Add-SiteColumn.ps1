@@ -54,9 +54,21 @@ try {
     for ($c = 1; $c -le $lastCol; $c++) { if ((Norm $hdrVals[1, $c]) -eq 'site') { $siteCol = $c; break } }
     if ($siteCol) { Write-Host "A 'Site' column already exists (column $siteCol) - it will be filled" -ForegroundColor Yellow }
     else {
-        # The sheet's very last column (XFD) must be empty for Excel to insert a column; if it holds only
-        # formatting (no values), that empty column is removed first.
+        # Excel can only insert a column if the sheet's very last column (XFD) has no values.
+        # Blank-looking values there (spaces, empty text - usually left by copy/paste of whole rows) are cleared;
+        # real data there stops the script.
         $edge = $ws.Columns.Item($ws.Columns.Count)
+        if ($excel.WorksheetFunction.CountA($edge) -gt 0) {
+            $cells = @()
+            foreach ($type in 2, -4123) {                                  # constants, formulas
+                try { foreach ($a in $edge.SpecialCells($type).Areas) { foreach ($c in $a.Cells) { $cells += $c } } } catch { }
+            }
+            $real = @($cells | Where-Object { ([string]$_.Text).Trim() -ne '' })
+            if ($real.Count -gt 0) { throw "Cell $($real[0].Address($false, $false)) (last column of the sheet) has data '$($real[0].Text)'. Move or delete it, then run again." }
+            foreach ($c in $cells) { [void]$c.ClearContents() }
+            Write-Host "Cleared $($cells.Count) blank-looking cell(s) in the sheet's last column (XFD)" -ForegroundColor Yellow
+        }
+        # Now empty: remove the column so its formatting (fills, borders) cannot block the insert either
         if ($excel.WorksheetFunction.CountA($edge) -eq 0) { [void]$edge.Delete() }
         [void]$ws.Columns.Item(2).Insert(-4161, 1)            # shift right, format taken from the column on the right
         $siteCol = 2
