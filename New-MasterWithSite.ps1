@@ -54,11 +54,10 @@ try {
     foreach ($t in $src.ListObjects) { if ($t.Range.Row -le $hdr -and ($t.Range.Row + $t.Range.Rows.Count - 1) -ge $hdr) { $lo = $t } }
     Write-Host "Sheet '$($src.Name)': header row $hdr, columns 1-$lastCol, rows 1-$lastRow, Site before column $pos"
 
-    # ---------- New workbook: copy columns 1..pos-1, then pos..lastCol one step right ----------
-    $wbN = $excel.Workbooks.Add()
-    while ($wbN.Worksheets.Count -gt 1) { $wbN.Worksheets.Item($wbN.Worksheets.Count).Delete() }
-    $dst = $wbN.Worksheets.Item(1)
-    $dst.Name = $src.Name
+    # ---------- New sheet (inside the opened copy, so the file keeps its sensitivity label) ----------
+    # copy columns 1..pos-1, then pos..lastCol one step right
+    $srcName = $src.Name
+    $dst = $wbS.Worksheets.Add([Type]::Missing, $wbS.Worksheets.Item($wbS.Worksheets.Count))
     $dst.Cells.Font.Name = $src.Cells.Item($hdr + 1, $nameCol).Font.Name
     for ($c = 1; $c -le $lastCol; $c++) {
         $to = $(if ($c -lt $pos) { $c } else { $c + 1 })
@@ -103,8 +102,11 @@ try {
         }
     }
 
-    # ---------- View: tab colour, frozen header, gridlines ----------
-    $dst.Tab.Color = $src.Tab.Color
+    # ---------- Keep only the new sheet, with the original name ----------
+    $tabColor = $src.Tab.Color
+    foreach ($w in @($wbS.Worksheets | Where-Object { $_.Name -ne $dst.Name })) { $w.Delete() }
+    $dst.Name = $srcName
+    $dst.Tab.Color = $tabColor
     $excel.ScreenUpdating = $true
     $dst.Activate()
     $excel.ActiveWindow.ScrollRow = 1; $excel.ActiveWindow.ScrollColumn = 1
@@ -113,7 +115,8 @@ try {
     $excel.ActiveWindow.DisplayGridlines = $false
 
     if (Test-Path $out) { Remove-Item $out -Force }
-    $wbN.SaveAs($out, 51)
+    $wbS.SaveAs($out, 51)
+    if (-not (Test-Path $out)) { throw "Excel did not write $out (a save prompt, e.g. a sensitivity-label prompt, may have been blocked)." }
     Write-Host ''
     foreach ($k in $count.Keys) { Write-Host ("{0,-16} {1}" -f $k, $count[$k]) }
     Write-Host ("{0,-16} {1}" -f 'No site (blank)', $noMatch.Count) -ForegroundColor $(if ($noMatch.Count) { 'Yellow' } else { 'Gray' })
