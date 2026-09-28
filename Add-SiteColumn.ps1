@@ -67,9 +67,15 @@ try {
             $blockLastRow = [Math]::Max($blockLastRow, $lo.Range.Row + $lo.Range.Rows.Count - 1)
             $blockLastCol = [Math]::Max($blockLastCol, $lo.Range.Column + $lo.Range.Columns.Count - 1)
         }
-        $right = $ws.Range($ws.Cells.Item(1, $blockLastCol + 1), $ws.Cells.Item($blockLastRow, $blockLastCol + 1))
-        if ($excel.WorksheetFunction.CountA($right) -gt 0) {
-            throw "Column $($right.Address($false, $false)) (right next to the table) is not empty - it would be overwritten. Clear it and run again."
+        # Extend the block to the right until a completely empty column is found (that column receives the shift)
+        for ($c = $blockLastCol; $c -ge $pos; $c--) {
+            $blockLastRow = [Math]::Max($blockLastRow, $ws.Cells.Item($ws.Rows.Count, $c).End(-4162).Row)
+        }
+        while ($blockLastCol -lt $ws.Columns.Count - 1) {
+            $next = $ws.Range($ws.Cells.Item(1, $blockLastCol + 1), $ws.Cells.Item($blockLastRow, $blockLastCol + 1))
+            if ($excel.WorksheetFunction.CountA($next) -eq 0) { break }
+            $blockLastCol++
+            $blockLastRow = [Math]::Max($blockLastRow, $ws.Cells.Item($ws.Rows.Count, $blockLastCol).End(-4162).Row)
         }
         [void]$ws.Range($ws.Cells.Item(1, $pos), $ws.Cells.Item($blockLastRow, $blockLastCol)).Cut($ws.Cells.Item(1, $pos + 1))
         if ($lo) { $lo.Resize($ws.Range($lo.Range.Cells.Item(1, 1), $ws.Cells.Item($lo.Range.Row + $lo.Range.Rows.Count - 1, $blockLastCol + 1))) }
