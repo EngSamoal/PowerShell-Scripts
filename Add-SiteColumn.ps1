@@ -36,26 +36,28 @@ try {
     $wb = $excel.Workbooks.Open($in)
 
     # ---------- Find the sheet + header row that has "VM NAME" ----------
+    $excel.ScreenUpdating = $false
+    $excel.Calculation = -4135                                   # manual while working
     $ws = $null; $hdr = 0; $nameCol = 0
     foreach ($s in $wb.Worksheets) {
-        $used = $s.UsedRange
-        $maxCol = $used.Column + $used.Columns.Count - 1
-        for ($r = 1; $r -le 20 -and -not $hdr; $r++) {
-            for ($c = 1; $c -le $maxCol; $c++) {
-                if ((Norm $s.Cells.Item($r, $c).Value2) -eq 'vm name') { $ws = $s; $hdr = $r; $nameCol = $c; break }
-            }
-        }
-        if ($ws) { break }
+        # Excel's own search (fast) - exact "VM NAME" in the top 20 rows
+        $hit = $s.Range('A1:ZZ20').Find('VM NAME', [Type]::Missing, -4163, 1)   # values, whole cell
+        if ($hit) { $ws = $s; $hdr = $hit.Row; $nameCol = $hit.Column; break }
     }
     if (-not $ws) { throw "No 'VM NAME' header found in $InputFile" }
-    $lastCol = $ws.UsedRange.Column + $ws.UsedRange.Columns.Count - 1
+    $lastCol = $ws.Cells.Item($hdr, $ws.Columns.Count).End(-4159).Column     # last filled header cell
     Write-Host "Sheet '$($ws.Name)', header row $hdr, VM NAME in column $nameCol"
 
     # ---------- Site column: reuse if it exists, otherwise insert as column 2 ----------
     $siteCol = 0
-    for ($c = 1; $c -le $lastCol; $c++) { if ((Norm $ws.Cells.Item($hdr, $c).Value2) -eq 'site') { $siteCol = $c; break } }
+    $hdrVals = $ws.Range($ws.Cells.Item($hdr, 1), $ws.Cells.Item($hdr, $lastCol)).Value2
+    for ($c = 1; $c -le $lastCol; $c++) { if ((Norm $hdrVals[1, $c]) -eq 'site') { $siteCol = $c; break } }
     if ($siteCol) { Write-Host "A 'Site' column already exists (column $siteCol) - it will be filled" -ForegroundColor Yellow }
     else {
+        # The sheet's very last column (XFD) must be empty for Excel to insert a column; if it holds only
+        # formatting (no values), that empty column is removed first.
+        $edge = $ws.Columns.Item($ws.Columns.Count)
+        if ($excel.WorksheetFunction.CountA($edge) -eq 0) { [void]$edge.Delete() }
         [void]$ws.Columns.Item(2).Insert(-4161, 1)            # shift right, format taken from the column on the right
         $siteCol = 2
         if ($nameCol -ge 2) { $nameCol++ }
@@ -65,11 +67,13 @@ try {
     }
 
     # ---------- Fill Site from the VM name ----------
-    $lastRow = $ws.UsedRange.Row + $ws.UsedRange.Rows.Count - 1
+    $lastRow = $ws.Cells.Item($ws.Rows.Count, $nameCol).End(-4162).Row       # last filled VM NAME cell
+    $names = $ws.Range($ws.Cells.Item($hdr, $nameCol), $ws.Cells.Item([Math]::Max($lastRow, $hdr + 1), $nameCol)).Value2   # read all names at once
+    Write-Host "Rows to check: $($lastRow - $hdr)"
     $count = [ordered]@{}; foreach ($v in $SiteByPrefix.Values) { $count[$v] = 0 }
     $noMatch = New-Object System.Collections.Generic.List[string]
     for ($r = $hdr + 1; $r -le $lastRow; $r++) {
-        $vm = ([string]$ws.Cells.Item($r, $nameCol).Value2).Trim()
+        $vm = ([string]$names[($r - $hdr + 1), 1]).Trim()
         if (-not $vm -or (Norm $vm) -eq 'vm name') { continue }          # empty row or a repeated header
         $site = $null
         foreach ($p in $SiteByPrefix.Keys) { if ($vm.StartsWith($p, [StringComparison]::OrdinalIgnoreCase)) { $site = $SiteByPrefix[$p]; break } }
@@ -87,6 +91,8 @@ try {
         }
     }
 
+    $excel.Calculation = -4105                                   # automatic again
+    $excel.ScreenUpdating = $true
     if (Test-Path $out) { Remove-Item $out -Force }
     $wb.SaveAs($out, 51)
     Write-Host ''
