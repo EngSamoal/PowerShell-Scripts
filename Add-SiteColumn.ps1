@@ -1,5 +1,5 @@
 # Add-SiteColumn.ps1
-# Adds a "Site" column as the 2nd column of the consolidated master sheet and fills it from the
+# Adds a "Site" column just before "Business Owner" in the consolidated master sheet and fills it from the
 # VM name prefix (SF -> SixFlags, AQ -> AquaArabia ...). The title row becomes "All Sites".
 # Other contents and colours are not changed.
 # Safe: the input file is only read; the result is saved as a NEW file. Needs Microsoft Excel.
@@ -48,36 +48,41 @@ try {
     $lastCol = $ws.Cells.Item($hdr, $ws.Columns.Count).End(-4159).Column     # last filled header cell
     Write-Host "Sheet '$($ws.Name)', header row $hdr, VM NAME in column $nameCol"
 
-    # ---------- Site column: reuse if it exists, otherwise insert as column 2 ----------
-    $siteCol = 0
+    # ---------- Site column: reuse if it exists, otherwise add it just before "Business Owner" ----------
+    $siteCol = 0; $pos = 0
     $hdrVals = $ws.Range($ws.Cells.Item($hdr, 1), $ws.Cells.Item($hdr, $lastCol)).Value2
-    for ($c = 1; $c -le $lastCol; $c++) { if ((Norm $hdrVals[1, $c]) -eq 'site') { $siteCol = $c; break } }
+    for ($c = 1; $c -le $lastCol; $c++) {
+        if (-not $siteCol -and (Norm $hdrVals[1, $c]) -eq 'site') { $siteCol = $c }
+        if (-not $pos -and (Norm $hdrVals[1, $c]) -eq 'business owner') { $pos = $c }
+    }
+    if (-not $pos) { $pos = 2; Write-Host "No 'Business Owner' header found - Site goes in column 2" -ForegroundColor Yellow }
     if ($siteCol) { Write-Host "A 'Site' column already exists (column $siteCol) - it will be filled" -ForegroundColor Yellow }
     else {
-        # Excel can only insert a column if the sheet's very last column (XFD) has no values.
-        # Blank-looking values there (spaces, empty text - usually left by copy/paste of whole rows) are cleared;
-        # real data there stops the script.
-        $edge = $ws.Columns.Item($ws.Columns.Count)
-        if ($excel.WorksheetFunction.CountA($edge) -gt 0) {
-            $cells = @()
-            foreach ($type in 2, -4123) {                                  # constants, formulas
-                try { foreach ($a in $edge.SpecialCells($type).Areas) { foreach ($c in $a.Cells) { $cells += $c } } } catch { }
-            }
-            $real = @($cells | Where-Object { ([string]$_.Text).Trim() -ne '' })
-            if ($real.Count -gt 0) { throw "Cell $($real[0].Address($false, $false)) (last column of the sheet) has data '$($real[0].Text)'. Move or delete it, then run again." }
-            foreach ($c in $cells) { [void]$c.ClearContents() }
-            Write-Host "Cleared $($cells.Count) blank-looking cell(s) in the sheet's last column (XFD)" -ForegroundColor Yellow
+        # Move the block from "Business Owner" to the last column one column to the right (only these cells move)
+        $lo = $null
+        foreach ($t in $ws.ListObjects) { if ($t.Range.Row -le $hdr -and ($t.Range.Row + $t.Range.Rows.Count - 1) -ge $hdr) { $lo = $t } }
+        $blockLastRow = $ws.Cells.Item($ws.Rows.Count, $nameCol).End(-4162).Row
+        $blockLastCol = $lastCol
+        if ($lo) {
+            $blockLastRow = [Math]::Max($blockLastRow, $lo.Range.Row + $lo.Range.Rows.Count - 1)
+            $blockLastCol = [Math]::Max($blockLastCol, $lo.Range.Column + $lo.Range.Columns.Count - 1)
         }
-        # Now empty: remove the column so its formatting (fills, borders) cannot block the insert either
-        if ($excel.WorksheetFunction.CountA($edge) -eq 0) { [void]$edge.Delete() }
-        [void]$ws.Columns.Item(2).Insert(-4161, 1)            # shift right, format taken from the column on the right
-        $siteCol = 2
-        if ($nameCol -ge 2) { $nameCol++ }
-        $ws.Cells.Item($hdr, 2).Value2 = 'Site'
-        $ws.Columns.Item(2).ColumnWidth = 18
+        $right = $ws.Range($ws.Cells.Item(1, $blockLastCol + 1), $ws.Cells.Item($blockLastRow, $blockLastCol + 1))
+        if ($excel.WorksheetFunction.CountA($right) -gt 0) {
+            throw "Column $($right.Address($false, $false)) (right next to the table) is not empty - it would be overwritten. Clear it and run again."
+        }
+        [void]$ws.Range($ws.Cells.Item(1, $pos), $ws.Cells.Item($blockLastRow, $blockLastCol)).Cut($ws.Cells.Item(1, $pos + 1))
+        if ($lo) { $lo.Resize($ws.Range($lo.Range.Cells.Item(1, 1), $ws.Cells.Item($lo.Range.Row + $lo.Range.Rows.Count - 1, $blockLastCol + 1))) }
+
+        # New column gets the same look as the "Business Owner" column next to it
+        [void]$ws.Range($ws.Cells.Item(1, $pos + 1), $ws.Cells.Item($blockLastRow, $pos + 1)).Copy()
+        [void]$ws.Range($ws.Cells.Item(1, $pos), $ws.Cells.Item($blockLastRow, $pos)).PasteSpecial(-4122)   # formats only
+        $ws.Cells.Item($hdr, $pos).Value2 = 'Site'
+        $ws.Columns.Item($pos).ColumnWidth = 18
+        $siteCol = $pos
+        if ($nameCol -ge $pos) { $nameCol++ }
         $lastCol++
     }
-
     # ---------- Fill Site from the VM name ----------
     $lastRow = $ws.Cells.Item($ws.Rows.Count, $nameCol).End(-4162).Row       # last filled VM NAME cell
     $names = $ws.Range($ws.Cells.Item($hdr, $nameCol), $ws.Cells.Item([Math]::Max($lastRow, $hdr + 1), $nameCol)).Value2   # read all names at once
