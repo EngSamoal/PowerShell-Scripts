@@ -45,7 +45,9 @@ try {
         if ($hit) { $ws = $s; $hdr = $hit.Row; $nameCol = $hit.Column; break }
     }
     if (-not $ws) { throw "No 'VM NAME' header found in $InputFile" }
-    $lastCol = $ws.Cells.Item($hdr, $ws.Columns.Count).End(-4159).Column     # last filled header cell
+    $lastCol = $ws.Cells.Item($hdr, $ws.Columns.Count).End(-4159).Column     # last filled header cell ...
+    $hv = $ws.Range($ws.Cells.Item($hdr, 1), $ws.Cells.Item($hdr, $lastCol)).Value2
+    while ($lastCol -gt $nameCol -and ([string]$hv[1, $lastCol]).Trim() -eq '') { $lastCol-- }   # ... ignoring cells with only spaces
     Write-Host "Sheet '$($ws.Name)', header row $hdr, VM NAME in column $nameCol"
 
     # ---------- Site column: reuse if it exists, otherwise add it just before "Business Owner" ----------
@@ -65,7 +67,7 @@ try {
         $blockLastCol = $lastCol
         if ($lo) {
             $blockLastRow = [Math]::Max($blockLastRow, $lo.Range.Row + $lo.Range.Rows.Count - 1)
-            $blockLastCol = [Math]::Max($blockLastCol, $lo.Range.Column + $lo.Range.Columns.Count - 1)
+            $blockLastCol = $lo.Range.Column + $lo.Range.Columns.Count - 1
         }
         # Extend the block to the right up to the first completely empty column (that column receives the shift).
         # One bulk read of the area; looks at most 200 columns to the right.
@@ -77,7 +79,7 @@ try {
             $found = $false
             for ($k = 1; $k -le $grid.GetUpperBound(1); $k++) {
                 $empty = $true
-                for ($r = 1; $r -le $grid.GetUpperBound(0); $r++) { if ([string]$grid[$r, $k] -ne '') { $empty = $false; break } }
+                for ($r = 1; $r -le $grid.GetUpperBound(0); $r++) { if (([string]$grid[$r, $k]).Trim() -ne '') { $empty = $false; break } }
                 if ($empty) { $blockLastCol = $startCol + $k - 1; $found = $true; break }
             }
             if (-not $found) { throw "No empty column found within 200 columns to the right of the data (rows 1-$blockLastRow). Clear some cells there and run again." }
