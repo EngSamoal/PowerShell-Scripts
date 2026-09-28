@@ -70,16 +70,19 @@ try {
     if (-not $siteCol) { throw "No 'Site' column found in the header row" }
     $lo = $null
     foreach ($t in $ws.ListObjects) { if ($t.Range.Row -eq $hdr) { $lo = $t } }
-    $lastRow = $hdr + 1
-    for ($c = 1; $c -le $lastCol; $c++) { $lastRow = [Math]::Max($lastRow, $ws.Cells.Item($ws.Rows.Count, $c).End(-4162).Row) }
-    $VL = ColLetter $nameCol
-    Write-Host "Sheet '$($ws.Name)': header row $hdr, rows to $lastRow, Site = column $(ColLetter $siteCol), VM NAME = column $VL"
-
     # ---------- Clear active filters (the file may have been saved filtered; nothing is deleted) ----------
     foreach ($t in @($ws.ListObjects)) {
         try { if ($t.ShowAutoFilter -and $t.AutoFilter.FilterMode) { $t.AutoFilter.ShowAllData(); Write-Host "Cleared the filter on table '$($t.Name)'" } } catch { }
     }
     try { if ($ws.FilterMode) { $ws.ShowAllData(); Write-Host 'Cleared the sheet filter' } } catch { }
+    # sheet-level filter buttons (not part of a table, e.g. on a section header row) block the table
+    # from growing - remove them; the single table filter replaces them
+    try { if ($ws.AutoFilterMode) { $ws.AutoFilterMode = $false; Write-Host 'Removed the sheet-level filter buttons (replaced by the table filter)' } } catch { }
+
+    $lastRow = $hdr + 1
+    for ($c = 1; $c -le $lastCol; $c++) { $lastRow = [Math]::Max($lastRow, $ws.Cells.Item($ws.Rows.Count, $c).End(-4162).Row) }
+    $VL = ColLetter $nameCol
+    Write-Host "Sheet '$($ws.Name)': header row $hdr, rows to $lastRow, Site = column $(ColLetter $siteCol), VM NAME = column $VL"
 
     # ---------- Find the banners (first filled cell of the row starts with OT / Test / Template) ----------
     $grid = $ws.Range($ws.Cells.Item(1, 1), $ws.Cells.Item($lastRow, $lastCol)).Value2
