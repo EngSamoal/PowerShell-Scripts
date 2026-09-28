@@ -67,18 +67,33 @@ try {
             $blockLastRow = [Math]::Max($blockLastRow, $lo.Range.Row + $lo.Range.Rows.Count - 1)
             $blockLastCol = [Math]::Max($blockLastCol, $lo.Range.Column + $lo.Range.Columns.Count - 1)
         }
-        # Extend the block to the right until a completely empty column is found (that column receives the shift)
-        for ($c = $blockLastCol; $c -ge $pos; $c--) {
-            $blockLastRow = [Math]::Max($blockLastRow, $ws.Cells.Item($ws.Rows.Count, $c).End(-4162).Row)
+        # Extend the block to the right up to the first completely empty column (that column receives the shift).
+        # One bulk read of the area; looks at most 200 columns to the right.
+        for ($c = $pos; $c -le $blockLastCol; $c++) { $blockLastRow = [Math]::Max($blockLastRow, $ws.Cells.Item($ws.Rows.Count, $c).End(-4162).Row) }
+        $startCol = $blockLastCol
+        for ($pass = 1; $pass -le 3; $pass++) {
+            $scanTo = [Math]::Min($ws.Columns.Count - 1, $startCol + 200)
+            $grid = $ws.Range($ws.Cells.Item(1, $startCol + 1), $ws.Cells.Item($blockLastRow, $scanTo)).Value2
+            $found = $false
+            for ($k = 1; $k -le $grid.GetUpperBound(1); $k++) {
+                $empty = $true
+                for ($r = 1; $r -le $grid.GetUpperBound(0); $r++) { if ([string]$grid[$r, $k] -ne '') { $empty = $false; break } }
+                if ($empty) { $blockLastCol = $startCol + $k - 1; $found = $true; break }
+            }
+            if (-not $found) { throw "No empty column found within 200 columns to the right of the data (rows 1-$blockLastRow). Clear some cells there and run again." }
+            # Columns added to the block may go further down - include those rows and check again
+            $grow = $blockLastRow
+            for ($c = $startCol + 1; $c -le $blockLastCol; $c++) { $grow = [Math]::Max($grow, $ws.Cells.Item($ws.Rows.Count, $c).End(-4162).Row) }
+            if ($grow -eq $blockLastRow) { break }
+            $blockLastRow = $grow
         }
-        while ($blockLastCol -lt $ws.Columns.Count - 1) {
-            $next = $ws.Range($ws.Cells.Item(1, $blockLastCol + 1), $ws.Cells.Item($blockLastRow, $blockLastCol + 1))
-            if ($excel.WorksheetFunction.CountA($next) -eq 0) { break }
-            $blockLastCol++
-            $blockLastRow = [Math]::Max($blockLastRow, $ws.Cells.Item($ws.Rows.Count, $blockLastCol).End(-4162).Row)
+        if ($lo) {   # remember the table size before the move
+            $loRow = $lo.Range.Row; $loCol = $lo.Range.Column
+            $loLastRow = $loRow + $lo.Range.Rows.Count - 1; $loLastCol = $loCol + $lo.Range.Columns.Count - 1
         }
         [void]$ws.Range($ws.Cells.Item(1, $pos), $ws.Cells.Item($blockLastRow, $blockLastCol)).Cut($ws.Cells.Item(1, $pos + 1))
-        if ($lo) { $lo.Resize($ws.Range($lo.Range.Cells.Item(1, 1), $ws.Cells.Item($lo.Range.Row + $lo.Range.Rows.Count - 1, $blockLastCol + 1))) }
+        # the table grows by exactly one column (the new Site column) - nothing else is added to it
+        if ($lo) { $lo.Resize($ws.Range($ws.Cells.Item($loRow, $loCol), $ws.Cells.Item($loLastRow, $loLastCol + 1))) }
 
         # New column gets the same look as the "Business Owner" column next to it
         [void]$ws.Range($ws.Cells.Item(1, $pos + 1), $ws.Cells.Item($blockLastRow, $pos + 1)).Copy()
