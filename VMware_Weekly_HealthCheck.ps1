@@ -1067,7 +1067,7 @@ function Write-DashboardHtml {
       <table class="metrics">
         <tr><td>Appliance</td><td>$(ConvertTo-HtmlSafe $bi.Appliance)</td></tr>
         <tr><td>Schedule</td><td>$(ConvertTo-HtmlSafe $bi.Schedule)</td></tr>
-        <tr><td>Retention</td><td>$(ConvertTo-HtmlSafe $bi.Retention)</td></tr>
+        <tr><td>Retention</td><td style="white-space:nowrap">$(ConvertTo-HtmlSafe $bi.Retention)</td></tr>
         <tr><td>Status</td><td>$(Get-StatusPillHtml -Status $biStatus -Text $biStatus)</td></tr>
       </table>
       $notesRow
