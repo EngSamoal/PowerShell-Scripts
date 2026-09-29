@@ -753,8 +753,6 @@ function Get-SiteDashboardSummary {
     $syslogBad   = @($syslogRows | Where-Object { $_.Status -ne 'Healthy' }).Count
     $syslogText  = if ($syslogRows.Count -eq 0) { 'n/a' } elseif ($syslogWorst -eq 'Healthy') { 'Configured on all hosts' } else { "Not configured on $syslogBad host(s)" }
 
-    $SecurityStatus = Get-WorstStatus @($lockdownWorst, $sbWorst, $acctWorst, $syslogWorst)
-
     # Backup & DR - whether -BackupInfo was supplied for this site; the detail itself (appliance,
     # schedule, retention, status) comes straight from that parameter, never fabricated. A
     # Warning/Critical backup status counts toward this site's risk totals and Action Plan just
@@ -868,7 +866,6 @@ function Get-SiteDashboardSummary {
         LocalAcctText     = $acctText
         SyslogStatus      = $syslogWorst
         SyslogText        = $syslogText
-        SecurityStatus    = $SecurityStatus
         BackupSupplied    = $backupSupplied
         BackupDetail      = $backupDetail
         ActionItems       = $ActionItems
@@ -980,8 +977,6 @@ function Write-DashboardHtml {
         $memText = if ($s.MemPct -ne $null) { "{0:N1}%" -f $s.MemPct } else { 'n/a' }
         $stgText = if ($s.StoragePct -ne $null) { "{0:N1}%" -f $s.StoragePct } else { 'n/a' }
         $color = $healthColor[$s.OverallHealth]
-        $complianceText = if ($s.SecurityStatus -eq 'Healthy') { 'Compliant' } elseif ($s.SecurityStatus -in 'Unable to Check','Manual/External Required') { 'n/a' } else { 'Non-Compliant' }
-        $complianceColor = if ($s.SecurityStatus -eq 'Healthy') { '#2e7d32' } elseif ($s.SecurityStatus -in 'Unable to Check','Manual/External Required') { '#888' } else { '#c62828' }
 @"
       <div class="ov-card" onclick="showPage('$slug')" style="border-top-color:$color">
         <div class="ov-head"><h2>$(ConvertTo-HtmlSafe $s.Site)</h2><span class="badge" style="background:$color">$(ConvertTo-HtmlSafe $healthLabelText[$s.OverallHealth])</span></div>
@@ -993,7 +988,6 @@ function Write-DashboardHtml {
           <tr><td>vSphere DRS / HA</td><td>$(if ($s.DrsOn) {'ON'} else {'<span style="color:#c62828">OFF</span>'}) / $(if ($s.HaOn) {'ON'} else {'<span style="color:#c62828">OFF</span>'})</td></tr>
           <tr><td>CPU / Mem / Storage</td><td>$cpuText / $memText / $stgText</td></tr>
           <tr><td>Backup Configured</td><td>$(if ($s.BackupSupplied) {'Yes'} else {'No'})</td></tr>
-          <tr><td>Compliance</td><td style="color:$complianceColor">$complianceText</td></tr>
         </table>
         <span class="ov-link">View Full Details &rarr;</span>
       </div>
