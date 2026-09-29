@@ -78,12 +78,15 @@ param(
     # Appliance/Schedule/Retention/Status per site, plus an optional Notes reason shown when
     # Status is Warning/Critical (e.g. an expired license) - defaults reflect the current real
     # backup setup: Cohesity nightly at 2:00 AM for every site except AMC, which runs Veeam at
-    # 5:00 AM and is flagged Critical because its license has expired.
+    # 5:00 AM and is flagged Critical because its license has expired. SEVEN ALhamra is a newly
+    # handed-over site whose backup management hasn't been handed over to this team yet - Status
+    # 'Manual/External Required' (with a Notes reason) renders it as a distinct "not yet ours"
+    # state rather than either a health status or the generic "no data supplied" panel.
     [hashtable]$BackupInfo = @{
         'SF-AQ'         = @{ Appliance = 'Cohesity'; Schedule = '2:00 AM'; Retention = '15 Day - 4 Weeks - 1 Month'; Status = 'Healthy' }
         'SEVEN Tabuk'   = @{ Appliance = 'Cohesity'; Schedule = '2:00 AM'; Retention = '15 Day - 4 Weeks - 1 Month'; Status = 'Healthy' }
         'SEVEN ABHA'    = @{ Appliance = 'Cohesity'; Schedule = '2:00 AM'; Retention = '15 Day - 4 Weeks - 1 Month'; Status = 'Healthy' }
-        'SEVEN ALhamra' = @{ Appliance = 'Cohesity'; Schedule = '2:00 AM'; Retention = '15 Day - 4 Weeks - 1 Month'; Status = 'Healthy' }
+        'SEVEN ALhamra' = @{ Status = 'Manual/External Required'; Notes = 'Site recently handed over - backup management not yet handed over to this team.' }
         'AMC'           = @{ Appliance = 'Veeam'; Schedule = '5:00 AM'; Retention = '15 Day - 4 Weeks - 1 Month'; Status = 'Critical'; Notes = 'Veeam license expired' }
     },
 
@@ -1059,14 +1062,13 @@ function Write-DashboardHtml {
 "@
         }
 
-        $backupBody = if ($s.BackupSupplied) {
+        $backupBody = if ($s.BackupSupplied -and $s.BackupDetail.Status -in 'Healthy','Warning','Critical') {
             $bi = $s.BackupDetail
-            $biStatus = if ($bi.Status) { $bi.Status } else { 'Healthy' }
+            $biStatus = $bi.Status
             $statusText = switch ($biStatus) {
                 'Healthy'  { 'Successfully Completed' }
                 'Critical' { if ($bi.Notes) { $bi.Notes } else { 'Failed' } }
                 'Warning'  { if ($bi.Notes) { $bi.Notes } else { 'Attention Required' } }
-                default    { $biStatus }
             }
             $flagClass = switch ($biStatus) { 'Critical' { 'critical' }; 'Warning' { 'warn' }; default { 'healthy' } }
 @"
@@ -1077,6 +1079,19 @@ function Write-DashboardHtml {
         <tr><td>Status</td><td>$(ConvertTo-HtmlSafe $statusText)</td></tr>
       </table>
       <div class="backup-flag $flagClass">$(ConvertTo-HtmlSafe $biStatus)</div>
+"@
+        } elseif ($s.BackupSupplied) {
+            # Explicitly supplied but with a known reason it's not yet tracked as Healthy/Warning/
+            # Critical (e.g. a newly handed-over site whose backup management isn't ours yet) -
+            # distinct from "no data supplied at all" below, since there IS a specific reason to show.
+            $bi = $s.BackupDetail
+            $reasonText = if ($bi.Notes) { $bi.Notes } else { 'Manual/External Required' }
+@"
+      <div class="center-callout">
+        $(Get-StatusPillHtml -Status 'Manual/External Required' -Text 'Manual/External Required')
+        <p style="color:#999;font-size:13px;margin:12px 0 0">$(ConvertTo-HtmlSafe $reasonText)</p>
+      </div>
+      <div class="backup-flag warn">Pending</div>
 "@
         } else {
 @"
