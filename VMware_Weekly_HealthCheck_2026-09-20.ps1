@@ -1332,7 +1332,6 @@ $clusterTableRows
   .backup-flag.healthy { background:#2e7d32; }
   .backup-flag.critical { background:#c62828; }
   .backup-flag.warn { background:#e6a100; }
-  footer { margin-top:36px; color:#888; font-size:14px; }
 </style>
 </head>
 <body>
@@ -1361,8 +1360,6 @@ $overviewCards
 
 $sitePages
 
-  <footer>VMware_Weekly_HealthCheck.ps1 - build $(ConvertTo-HtmlSafe $ScriptBuild)</footer>
-
 <script>
 function showPage(slug) {
   document.querySelectorAll('.page').forEach(function(el){ el.classList.remove('active'); });
@@ -1377,6 +1374,18 @@ function showPage(slug) {
 </body>
 </html>
 "@
+
+    # Site rebranding: every occurrence of "AMC" -> "SceneCinema" and "ALhamra" -> "Al Hamra"
+    # across the WHOLE rendered page - not just the site's own tab/header, but every cluster,
+    # datastore, host and Action Plan line that carries the old name, since those are built from
+    # the real vCenter object names collected above (all of which still use the old naming) and
+    # this dashboard is meant to read consistently with the new name throughout. Case-sensitive
+    # (-creplace) is deliberate: the real object names/site labels use "AMC"/"ALhamra" in that
+    # exact casing, while every internal id="..."/onclick="showPage('...')" slug this same page
+    # relies on for tab navigation is lowercase ("amc", "seven-alhamra") - a case-INsensitive
+    # replace would corrupt those slugs (and even inject a literal space into "Al Hamra" ids),
+    # breaking every tab's click handler.
+    $html = $html -creplace 'AMC', 'SceneCinema' -creplace 'ALhamra', 'Al Hamra'
 
     $dashboardPath = Join-Path $OutputPath "VMware_HealthCheck_Dashboard_$RunDate.html"
     $html | Out-File -FilePath $dashboardPath -Encoding UTF8
