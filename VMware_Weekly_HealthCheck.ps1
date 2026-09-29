@@ -891,8 +891,13 @@ function Write-DashboardHtml {
 
     $healthColor = @{ Healthy = '#2e7d32'; Warning = '#e6a100'; Critical = '#c62828' }
     $healthLabelText = @{ Healthy = 'Healthy - No Issues Detected'; Warning = 'Healthy - Minor Issues Detected'; Critical = 'Attention Required - Critical Issues' }
+    # "Healthy Sites" counts every site that isn't Critical - a site with only Warning-level
+    # findings still shows its own badge as "Healthy - Minor Issues Detected", so it belongs here
+    # too, not just the (in practice almost never reached) zero-findings case. "Sites with
+    # Warnings" is a narrower, informational subset of that same count - how many of the healthy
+    # sites still have at least one Warning worth a look.
     $healthCounts = @{
-        Healthy  = @($summaries | Where-Object { $_.OverallHealth -eq 'Healthy' }).Count
+        Healthy  = @($summaries | Where-Object { $_.OverallHealth -ne 'Critical' }).Count
         Warning  = @($summaries | Where-Object { $_.OverallHealth -eq 'Warning' }).Count
         Critical = @($summaries | Where-Object { $_.OverallHealth -eq 'Critical' }).Count
     }
