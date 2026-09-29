@@ -990,12 +990,12 @@ function Write-DashboardHtml {
 "@
     }) -join "`n"
 
-    # --- Tab navigation bar ---
-    $tabButtons = (@('<button class="tab overview-tab active" id="tab-overview" onclick="showPage(''overview'')">Overview</button>') + ($summaries | ForEach-Object {
+    # --- Tab navigation bar (circular, full site name inside each circle) ---
+    $tabButtons = (@('<button class="tab overview-tab active" id="tab-overview" onclick="showPage(''overview'')"><span class="tab-circle">Overview</span></button>') + ($summaries | ForEach-Object {
         $i = $summaries.IndexOf($_)
         $slug = ConvertTo-Slug $_.Site
         $tabColor = $tabPalette[$i % $tabPalette.Count]
-        "<button class=`"tab`" id=`"tab-$slug`" style=`"background:$tabColor`" onclick=`"showPage('$slug')`">$(ConvertTo-HtmlSafe $_.Site)</button>"
+        "<button class=`"tab`" id=`"tab-$slug`" onclick=`"showPage('$slug')`"><span class=`"tab-circle`" style=`"background:$tabColor`">$(ConvertTo-HtmlSafe $_.Site)</span></button>"
     })) -join "`n    "
 
     # --- One full, panel-rich page per site ---
@@ -1062,15 +1062,21 @@ function Write-DashboardHtml {
         $backupBody = if ($s.BackupSupplied) {
             $bi = $s.BackupDetail
             $biStatus = if ($bi.Status) { $bi.Status } else { 'Healthy' }
-            $notesRow = if ($bi.Notes) { "<p style=`"color:#c62828;font-size:13px;font-weight:bold;margin:10px 0 0`">$(ConvertTo-HtmlSafe $bi.Notes)</p>" } else { '' }
+            $statusText = switch ($biStatus) {
+                'Healthy'  { 'Successfully Completed' }
+                'Critical' { if ($bi.Notes) { $bi.Notes } else { 'Failed' } }
+                'Warning'  { if ($bi.Notes) { $bi.Notes } else { 'Attention Required' } }
+                default    { $biStatus }
+            }
+            $flagClass = switch ($biStatus) { 'Critical' { 'critical' }; 'Warning' { 'warn' }; default { 'healthy' } }
 @"
       <table class="metrics">
-        <tr><td>Appliance</td><td>$(ConvertTo-HtmlSafe $bi.Appliance)</td></tr>
+        <tr><td>Appliance</td><td>$(ConvertTo-HtmlSafe $bi.Appliance) ($(ConvertTo-HtmlSafe $biStatus))</td></tr>
         <tr><td>Schedule</td><td>$(ConvertTo-HtmlSafe $bi.Schedule)</td></tr>
         <tr><td>Retention</td><td style="white-space:nowrap">$(ConvertTo-HtmlSafe $bi.Retention)</td></tr>
-        <tr><td>Status</td><td>$(Get-StatusPillHtml -Status $biStatus -Text $biStatus)</td></tr>
+        <tr><td>Status</td><td>$(ConvertTo-HtmlSafe $statusText)</td></tr>
       </table>
-      $notesRow
+      <div class="backup-flag $flagClass">$(ConvertTo-HtmlSafe $biStatus)</div>
 "@
         } else {
 @"
@@ -1208,10 +1214,11 @@ $clusterTableRows
   body { font-family: Calibri, Arial, sans-serif; background:#eef1f5; color:#1a1a1a; margin:0; padding:0 32px 32px; font-size:16px; line-height:1.4; }
   h1 { color:#1E3A5F; margin:0; font-size:36px; }
   .subtitle { color:#555; margin:6px 0 20px; font-size:16px; }
-  .tabs { display:flex; gap:6px; flex-wrap:wrap; padding:20px 0; position:sticky; top:0; background:#eef1f5; z-index:10; border-bottom:1px solid #dfe3e8; margin-bottom:32px; }
-  .tab { border:2px solid transparent; font-weight:bold; padding:13px 10px; border-radius:6px; font-size:16px; cursor:pointer; box-shadow:0 1px 3px rgba(0,0,0,0.10); color:#fff; width:170px; text-align:center; }
-  .tab.overview-tab { background:#1E3A5F; }
-  .tab.active { border-color:#fff; box-shadow:0 0 0 2px rgba(0,0,0,0.35), 0 2px 6px rgba(0,0,0,0.25); }
+  .tabs { display:grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap:20px; padding:24px 0 20px; position:sticky; top:0; background:#eef1f5; z-index:10; border-bottom:1px solid #dfe3e8; margin-bottom:32px; }
+  .tab { display:flex; flex-direction:column; align-items:center; cursor:pointer; background:none; border:none; padding:0; font-family:inherit; }
+  .tab .tab-circle { width:150px; height:150px; border-radius:50%; display:flex; align-items:center; justify-content:center; color:#fff; font-weight:bold; font-size:17px; text-align:center; line-height:1.25; padding:10px; box-sizing:border-box; box-shadow:0 1px 4px rgba(0,0,0,0.2); border:3px solid transparent; }
+  .tab.overview-tab .tab-circle { background:#1E3A5F; }
+  .tab.active .tab-circle { border-color:#1a1a1a; box-shadow:0 0 0 3px rgba(0,0,0,0.15), 0 1px 4px rgba(0,0,0,0.2); }
   .page { display:none; }
   .page.active { display:block; }
 
@@ -1305,6 +1312,10 @@ $clusterTableRows
   .standard-notes li { margin-bottom:6px; }
   .summary-text { color:#444; font-size:15px; line-height:1.6; }
   .center-callout { text-align:center; padding:8px 0 18px; }
+  .backup-flag { margin:18px -28px -26px -28px; padding:10px 0; text-align:center; font-weight:bold; color:#fff; border-radius:0 0 10px 10px; font-size:14px; letter-spacing:0.5px; }
+  .backup-flag.healthy { background:#2e7d32; }
+  .backup-flag.critical { background:#c62828; }
+  .backup-flag.warn { background:#e6a100; }
   footer { margin-top:36px; color:#888; font-size:14px; }
 </style>
 </head>
