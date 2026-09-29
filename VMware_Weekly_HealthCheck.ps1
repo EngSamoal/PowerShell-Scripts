@@ -35,9 +35,10 @@
     Every threshold below (capacity %, license expiry windows) is a CONFIGURABLE PARAMETER, not
     an assumed company standard - raw values/status are always shown alongside any computed flag.
 
-    Backup & Disaster Recovery status comes from the backup product's own console (e.g. Cohesity),
-    not vCenter - supply it via -BackupInfo. If not supplied for a given site, that panel is
-    rendered as "Manual/External Required" rather than fabricated.
+    Backup & Disaster Recovery status comes from the backup product's own console (e.g. Cohesity,
+    Veeam), not vCenter - supply/override it via -BackupInfo (defaults are pre-filled for the
+    current real sites). If a site isn't in -BackupInfo at all, that panel is rendered as
+    "Manual/External Required" rather than fabricated.
 
     -SiteMapPath (default C:\temp\VMware_Weekly_Health_Check_SiteMap.xml) is loaded automatically if the file exists, so you
     don't have to retype -SiteMap on every run. Expected shape - one <Site> element per vCenter:
@@ -51,10 +52,11 @@
     not an error - the script just falls back to -SiteMap / the automatic name detection below.
 
 .EXAMPLE
-    # Already connected: Connect-VIServer tb-vc.aq.local
-    .\VMware_Weekly_HealthCheck.ps1 -SiteMap @{'tb-vc.aq.local'='Tabuk'} `
-        -BackupInfo @{ 'Tabuk' = @{ DeviceLabel='Cohesity Backup Device';
-            SolutionName='Cohesity Backup Solution'; Status='Healthy' } }
+    # Already connected: Connect-VIServer tb-vc.aq.local - overrides the built-in -BackupInfo
+    # default for this one site, e.g. once its Cohesity job history for the week is checked.
+    .\VMware_Weekly_HealthCheck.ps1 -SiteMap @{'tb-vc.aq.local'='SEVEN Tabuk'} `
+        -BackupInfo @{ 'SEVEN Tabuk' = @{ Appliance='Cohesity'; Schedule='2:00 AM';
+            Retention='15 Day - 4 Weeks - 1 Month'; Status='Healthy' } }
 #>
 
 [CmdletBinding()]
@@ -73,9 +75,17 @@ param(
     [string]$OutputPath = (Join-Path $PSScriptRoot "VMware_HealthCheck_Reports"),
 
     # ---- Data NOT available from vCenter - keyed by Site label (see .NOTES) ---------------
-    # Example: @{ 'Tabuk' = @{ DeviceLabel='Cohesity Backup Device';
-    #   SolutionName='Cohesity Backup Solution'; Status='Healthy' } }
-    [hashtable]$BackupInfo = @{},
+    # Appliance/Schedule/Retention/Status per site, plus an optional Notes reason shown when
+    # Status is Warning/Critical (e.g. an expired license) - defaults reflect the current real
+    # backup setup: Cohesity nightly at 2:00 AM for every site except AMC, which runs Veeam at
+    # 5:00 AM and is flagged Critical because its license has expired.
+    [hashtable]$BackupInfo = @{
+        'SF-AQ'         = @{ Appliance = 'Cohesity'; Schedule = '2:00 AM'; Retention = '15 Day - 4 Weeks - 1 Month'; Status = 'Healthy' }
+        'SEVEN Tabuk'   = @{ Appliance = 'Cohesity'; Schedule = '2:00 AM'; Retention = '15 Day - 4 Weeks - 1 Month'; Status = 'Healthy' }
+        'SEVEN ABHA'    = @{ Appliance = 'Cohesity'; Schedule = '2:00 AM'; Retention = '15 Day - 4 Weeks - 1 Month'; Status = 'Healthy' }
+        'SEVEN ALhamra' = @{ Appliance = 'Cohesity'; Schedule = '2:00 AM'; Retention = '15 Day - 4 Weeks - 1 Month'; Status = 'Healthy' }
+        'AMC'           = @{ Appliance = 'Veeam'; Schedule = '5:00 AM'; Retention = '15 Day - 4 Weeks - 1 Month'; Status = 'Critical'; Notes = 'Veeam license expired' }
+    },
 
     # Local ESXi accounts considered normal/expected; anything extra found on a host is flagged.
     [string[]]$ExpectedLocalAccounts = @('root','dcui','vpxuser'),
@@ -735,13 +745,26 @@ function Get-SiteDashboardSummary {
 
     $SecurityStatus = Get-WorstStatus @($lockdownWorst, $sbWorst, $acctWorst, $syslogWorst)
 
-    # Backup & DR - whether -BackupInfo was supplied for this site; the detail itself (device,
-    # solution, status) comes straight from that parameter, never fabricated.
+    # Backup & DR - whether -BackupInfo was supplied for this site; the detail itself (appliance,
+    # schedule, retention, status) comes straight from that parameter, never fabricated. A
+    # Warning/Critical backup status counts toward this site's risk totals and Action Plan just
+    # like any other finding - a failed/expired backup solution is exactly the kind of thing that
+    # belongs in "risk issues", not a fact hidden away in its own panel.
     $backupSupplied = $BackupInfo.ContainsKey($SiteLabel)
     $backupDetail = if ($backupSupplied) { $BackupInfo[$SiteLabel] } else { $null }
+    $backupStatus = if ($backupDetail -and $backupDetail.Status) { $backupDetail.Status } else { 'Manual/External Required' }
+    if ($backupStatus -eq 'Critical') {
+        $CritCount++
+        $OverallHealth = 'Critical'
+    } elseif ($backupStatus -eq 'Warning' -and $OverallHealth -ne 'Critical') {
+        $WarnCount++
+        $OverallHealth = 'Warning'
+    }
 
-    # Action plan - every Warning/Critical finding for this site, Critical first. Appliance and
-    # Hardware findings can never appear here since those checks are no longer collected at all.
+    # Action plan - every Warning/Critical finding for this site, Critical first, with the backup
+    # issue (if any) surfaced first since it's typically the most business-impacting item.
+    # Appliance and Hardware findings can never appear here since those checks are no longer
+    # collected at all.
     $ActionItems = @($SiteFindings | Where-Object { $_.Status -in 'Critical','Warning' } |
         Sort-Object @{Expression = { if ($_.Status -eq 'Critical') { 0 } else { 1 } }} |
         ForEach-Object {
@@ -753,6 +776,15 @@ function Get-SiteDashboardSummary {
                 Notes    = $_.Notes
             }
         })
+    if ($backupStatus -in 'Critical','Warning') {
+        $ActionItems = @([pscustomobject]@{
+            Severity = if ($backupStatus -eq 'Critical') { 'High' } else { 'Medium' }
+            Object   = $SiteLabel
+            Item     = 'Backup & Disaster Recovery'
+            Value    = "$($backupDetail.Appliance) - Status: $backupStatus"
+            Notes    = $backupDetail.Notes
+        }) + $ActionItems
+    }
 
     # Per-cluster breakdown for this site's own dashboard page.
     $clusterRows = @(foreach ($cn in $ClusterNames) {
@@ -1024,11 +1056,16 @@ function Write-DashboardHtml {
 
         $backupBody = if ($s.BackupSupplied) {
             $bi = $s.BackupDetail
+            $biStatus = if ($bi.Status) { $bi.Status } else { 'Healthy' }
+            $notesRow = if ($bi.Notes) { "<p style=`"color:#c62828;font-size:13px;font-weight:bold;margin:10px 0 0`">$(ConvertTo-HtmlSafe $bi.Notes)</p>" } else { '' }
 @"
       <table class="metrics">
-        <tr><td>$(ConvertTo-HtmlSafe $bi.DeviceLabel)</td><td>$(Get-StatusPillHtml -Status $bi.Status -Text $bi.Status)</td></tr>
+        <tr><td>Appliance</td><td>$(ConvertTo-HtmlSafe $bi.Appliance)</td></tr>
+        <tr><td>Schedule</td><td>$(ConvertTo-HtmlSafe $bi.Schedule)</td></tr>
+        <tr><td>Retention</td><td>$(ConvertTo-HtmlSafe $bi.Retention)</td></tr>
+        <tr><td>Status</td><td>$(Get-StatusPillHtml -Status $biStatus -Text $biStatus)</td></tr>
       </table>
-      <p style="color:#999;font-size:13px;margin:10px 0 0">$(ConvertTo-HtmlSafe $bi.SolutionName)</p>
+      $notesRow
 "@
         } else {
 @"
