@@ -156,6 +156,20 @@ param(
     [switch]  $SkipBaselineGpoApply,
     [switch]  $SkipExtendedBaseline,       # skip the whole "7. Extended Baseline (Cybersecurity Review)" category
     [switch]  $SkipExtendedManualItems,    # in category 7, do not emit the secedit / patch "Manual/External Required" rows
+    # --- ISO / Qualys Policy Compliance (iso.xlsx) coverage - category 8 -----------------
+    [switch]  $SkipIsoPolicy,                # skip the whole category 8 (Qualys PC control-ID coverage)
+    [switch]  $SkipIeHardening,              # within category 8, skip the ~89 Internet Explorer zone/feature registry values
+    [switch]  $EnableFirewallProfiles,       # opt-in: turn the Windows Firewall Domain/Private/Public profiles ON (CID 3950-3952)
+    [switch]  $DisableNetbios,               # opt-in: set DNSClient EnableNetbios=0 (CID 25358)
+    [switch]  $SetSmbMinSmb3,                # opt-in: mandate minimum SMB dialect 3.0.0 server+client (CID 29576/29583)
+    [switch]  $RestrictLocalAcctNetworkLogon,# opt-in: LocalAccountTokenFilterPolicy=0 - PtH mitigation (CID 9024)
+    [switch]  $EnableUacHardening,           # opt-in: FilterAdministratorToken=1, ConsentPromptBehaviorAdmin=2, EnableVirtualization=1 (CID 2586/2587/3940)
+    [switch]  $ApplyAccountPolicy,           # opt-in: set Minimum Password Length / Account Lockout Threshold via secedit (CID 1071/2342)
+    [switch]  $EnableServerAsrRules,         # opt-in: enable ASR rule a8f5898e (server webshell) in Block (CID 30456)
+    [ValidateRange(8,256)]
+    [int]     $MinPasswordLength      = 14,  # target for CID 1071 when -ApplyAccountPolicy is set
+    [ValidateRange(1,20)]
+    [int]     $AccountLockoutThreshold = 3,  # target for CID 2342 when -ApplyAccountPolicy is set
 
     [switch]  $DisableWinRM,
     [string[]]$WinRmAllowedSourceRange,
@@ -183,14 +197,14 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference     = 'SilentlyContinue'
-$ScriptBuild = '2026-09-04c-lsp-guestname-default'
+$ScriptBuild = '2026-09-04d-iso-pc-r1'
 
 # =====================================================================================
 # 0. Banner
 # =====================================================================================
 Write-Host ("Invoke-RemoteSecurityGapRemediation.ps1  [build $ScriptBuild]") -ForegroundColor Magenta
 Write-Host ("Running from: {0}" -f $PSCommandPath) -ForegroundColor DarkGray
-Write-Host ("If the build above is not '2026-09-04c-lsp-guestname-default' you are running an OLD copy - update it.") -ForegroundColor DarkGray
+Write-Host ("If the build above is not '2026-09-04d-iso-pc-r1' you are running an OLD copy - update it.") -ForegroundColor DarkGray
 if ($Apply) {
     Write-Host "*** -Apply IS SET: validated guests WILL have configuration changed. ***" -ForegroundColor Red
     Write-Host "    This tool never snapshots, reboots, or alters any VM/vSphere setting." -ForegroundColor Yellow
@@ -261,7 +275,7 @@ param()
 #__INJECT_PARAMS__
 
 $ProgressPreference = 'SilentlyContinue'
-$ScriptBuild = '2026-08-17-02-winrm-listener-filter / remote-payload-r1'
+$ScriptBuild = '2026-08-17-02-winrm-listener-filter / remote-payload-r1 / iso-pc-r1'
 
 $Results             = New-Object System.Collections.Generic.List[object]
 $RebootRequiredItems = New-Object System.Collections.Generic.List[string]
@@ -1130,6 +1144,425 @@ try {
     } else {
         Add-ResultRow -Category '7. Extended Baseline (Cybersecurity Review)' -Item 'All items' -Status 'Skipped (category)' -Details '-SkipExtendedBaseline was passed'
     }
+
+    # ===========================================================================
+    # 8. ISO Policy Compliance (Qualys PC) - Windows Server 2025 WORKGROUP
+    #    Consolidated coverage for the Control IDs in iso.xlsx (Qualys Policy
+    #    Compliance export). Uses the SAME Add-ResultRow / Invoke-Remediation
+    #    contract, status vocabulary (AlreadyCompliant / DryRun - would apply /
+    #    Applied / Failed / Manual/External Required / Not Applicable / Skipped)
+    #    and reboot-flag model as categories 1-7. No new columns / statuses /
+    #    output format. High-impact items stay opt-in behind their own switch.
+    # ===========================================================================
+    if (-not $SkipIsoPolicy) {
+        $ICAT = '8. ISO Policy Compliance (Qualys PC)'
+
+        function Invoke-IsoReg {
+            param([int]$Cid,[string]$Title,[string]$Path,[string]$Name,[string]$Type,$Data,
+                  [bool]$Reboot = $false,[string]$Risk = '')
+            Invoke-Remediation -Category $ICAT -Item ("CID {0} - {1}" -f $Cid, $Title) `
+                -Description ("Set {0}\{1} = {2} (REG_{3})" -f $Path, $Name, $Data, $Type) `
+                -RequiresReboot $Reboot -RiskNote $Risk `
+                -ExpectedValue ("{0} = {1}" -f $Name, $Data) `
+                -CurrentStateBlock ({ Get-RegValueString $Path $Name }.GetNewClosure()) `
+                -CheckBlock ({
+                    $cur = Get-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue
+                    if ($null -eq $cur) { return $false }
+                    if ($Type -eq 'String') { [string]$cur.$Name -eq [string]$Data }
+                    else { [int]$cur.$Name -eq [int]$Data }
+                }.GetNewClosure()) `
+                -ApplyBlock ({
+                    if (-not (Test-Path -LiteralPath $Path)) { New-Item -Path $Path -Force -ErrorAction SilentlyContinue | Out-Null }
+                    $v = if ($Type -eq 'String') { [string]$Data } else { [int]$Data }
+                    Set-ItemProperty -Path $Path -Name $Name -Value $v -Type $Type -Force
+                }.GetNewClosure())
+        }
+
+        # Registry-backed controls (Qualys value path -> value name -> type -> expected).
+        $IsoReg = @(
+        @{ Cid=1366; Title='''Accounts: Limit local account use of blank passwords to console logon only'''; Path='HKLM:\System\CurrentControlSet\Control\Lsa'; Name='LimitBlankPasswordUse'; Type='DWord'; Data=1; Reboot=$false; IE=$false; Gate=''; Risk='' }
+        @{ Cid=2584; Title='''UAC: Only elevate UIAccess applications installed in secure locations'''; Path='HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\System'; Name='EnableSecureUIAPaths'; Type='DWord'; Data=1; Reboot=$false; IE=$false; Gate=''; Risk='' }
+        @{ Cid=2586; Title='''UAC: Admin Approval Mode for the Built-in Administrator account'''; Path='HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\System'; Name='FilterAdministratorToken'; Type='DWord'; Data=1; Reboot=$true; IE=$false; Gate='$EnableUacHardening'; Risk='Registry value set; takes effect only after a reboot and (for VBS/Device Guard items) once the VM exposes Secure Boot + virtualization. This tool never reboots.' }
+        @{ Cid=2587; Title='''UAC: Behavior of the elevation prompt for administrators in Admin Approval Mode'''; Path='HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\System'; Name='ConsentPromptBehaviorAdmin'; Type='DWord'; Data=2; Reboot=$false; IE=$false; Gate='$EnableUacHardening'; Risk='Medium - interactive admins get a consent prompt (minor). Real risk is non-interactive automation that elevates via runas/Task Scheduler ''Run with highest privileges'' while a user is NOT logged on - test the maintenance jobs. Consider value 5 (prompt for non-Windows binaries) as a lighter option if 2 breaks tooling.' }
+        @{ Cid=3940; Title='''UAC: Virtualize file and registry write failures to per-user locations'''; Path='HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\System'; Name='EnableVirtualization'; Type='DWord'; Data=1; Reboot=$false; IE=$false; Gate='$EnableUacHardening'; Risk='Low/Medium - this is the Windows default (1). If it was deliberately set to 0 for a specific 64-bit-only application requirement, confirm before reverting (64-bit apps are never virtualized regardless).' }
+        @{ Cid=8274; Title='''Configure Windows Defender SmartScreen'' (Explorer)'; Path='HKLM:\Software\Policies\Microsoft\Windows\System'; Name='EnableSmartScreen'; Type='DWord'; Data=1; Reboot=$false; IE=$false; Gate=''; Risk='' }
+        @{ Cid=9024; Title='''Apply UAC restrictions to local accounts on network logons'' (LocalAccountTokenFilterPolicy)'; Path='HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\System'; Name='LocalAccountTokenFilterPolicy'; Type='DWord'; Data=0; Reboot=$false; IE=$false; Gate='$RestrictLocalAcctNetworkLogon'; Risk='Medium - any tool that manages this host remotely by authenticating with a LOCAL account (not a domain account, not the VM guest-ops channel) will lose admin capability. VMware guest operations, console and RDP are unaffected. Verify remote-admin tooling does not depend on local-account network logon before applying.' }
+        @{ Cid=10068; Title='IE - Restricted Sites Zone - ''Access data sources across domains'' (Zones\4\1406)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\4'; Name='1406'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=10472; Title='''Turn On Virtualization Based Security'''; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceGuard'; Name='EnableVirtualizationBasedSecurity'; Type='DWord'; Data=1; Reboot=$true; IE=$false; Gate=''; Risk='Registry value set; takes effect only after a reboot and (for VBS/Device Guard items) once the VM exposes Secure Boot + virtualization. This tool never reboots.' }
+        @{ Cid=10473; Title='''Turn On VBS (Credential Guard Configuration)'''; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceGuard'; Name='LsaCfgFlags'; Type='DWord'; Data=1; Reboot=$true; IE=$false; Gate=''; Risk='Registry value set; takes effect only after a reboot and (for VBS/Device Guard items) once the VM exposes Secure Boot + virtualization. This tool never reboots.' }
+        @{ Cid=10474; Title='''Turn On VBS (Enable Virtualization Based Protection of Code Integrity)'' - HVCI'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceGuard'; Name='HypervisorEnforcedCodeIntegrity'; Type='DWord'; Data=1; Reboot=$true; IE=$false; Gate=''; Risk='Registry value set; takes effect only after a reboot and (for VBS/Device Guard items) once the VM exposes Secure Boot + virtualization. This tool never reboots.' }
+        @{ Cid=10475; Title='''Turn On VBS (Select Platform Security Level)'''; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceGuard'; Name='RequirePlatformSecurityFeatures'; Type='DWord'; Data=1; Reboot=$true; IE=$false; Gate=''; Risk='Registry value set; takes effect only after a reboot and (for VBS/Device Guard items) once the VM exposes Secure Boot + virtualization. This tool never reboots.' }
+        @{ Cid=10970; Title='''Script Block Invocation Logging'''; Path='HKLM:\Software\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging'; Name='EnableScriptBlockInvocationLogging'; Type='DWord'; Data=1; Reboot=$false; IE=$false; Gate=''; Risk='' }
+        @{ Cid=11573; Title='IE - Security Zones: Do not allow users to add/delete sites'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings'; Name='Security_zones_map_edit'; Type='DWord'; Data=1; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=11574; Title='IE - Security Zones: Do not allow users to change policies'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings'; Name='Security_options_edit'; Type='DWord'; Data=1; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=11615; Title='IE - Allow software to run or install even if the signature is invalid'; Path='HKLM:\Software\Policies\Microsoft\Internet Explorer\Download'; Name='RunInvalidSignatures'; Type='DWord'; Data=0; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=11619; Title='IE - Turn off Encryption Support'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings'; Name='SecureProtocols'; Type='DWord'; Data=2560; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=11621; Title='IE - Check for signatures on downloaded programs'; Path='HKLM:\Software\Policies\Microsoft\Internet Explorer\Download'; Name='CheckExeSignatures'; Type='String'; Data='yes'; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=11742; Title='IE - Restricted Sites Zone - ''Download signed ActiveX controls'' (Zones\4\1001)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\4'; Name='1001'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=11743; Title='IE - Restricted Sites Zone - ''Download unsigned ActiveX controls'' (Zones\4\1004)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\4'; Name='1004'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=11744; Title='IE - Restricted Sites Zone - ''Run ActiveX controls and plugins'' (Zones\4\1200)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\4'; Name='1200'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=11745; Title='IE - Restricted Sites Zone - ''Script ActiveX controls marked safe for scripting'' (Zones\4\1405)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\4'; Name='1405'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=11746; Title='IE - Restricted Sites Zone - ''Initialize and script ActiveX controls not marked as safe'' (Zones\4\1201)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\4'; Name='1201'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=11747; Title='IE - Restricted Sites Zone - ''Allow file downloads'' (Zones\4\1803)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\4'; Name='1803'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=11750; Title='IE - Restricted Sites Zone - ''Allow META REFRESH'' (Zones\4\1608)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\4'; Name='1608'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=11753; Title='IE - Restricted Sites Zone - ''Allow drag and drop or copy and paste files'' (Zones\4\1802)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\4'; Name='1802'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=11754; Title='IE - Restricted Sites Zone - ''Launching applications and files in an IFRAME'' (Zones\4\1804)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\4'; Name='1804'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=11755; Title='IE - Restricted Sites Zone - ''Navigate windows and frames across different domains'' (Zones\4\1607)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\4'; Name='1607'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=11757; Title='IE - Restricted Sites Zone - ''Userdata persistence'' (Zones\4\1606)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\4'; Name='1606'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=11758; Title='IE - Restricted Sites Zone - ''Allow Active scripting'' (Zones\4\1400)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\4'; Name='1400'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=11759; Title='IE - Restricted Sites Zone - ''Scripting of Java applets'' (Zones\4\1402)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\4'; Name='1402'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=11760; Title='IE - Restricted Sites Zone - ''Allow updates to status bar via script'' (Zones\4\2103)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\4'; Name='2103'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=11761; Title='IE - Restricted Sites Zone - ''Logon options (Anonymous logon)'' (Zones\4\1A00)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\4'; Name='1A00'; Type='DWord'; Data=196608; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=11763; Title='IE - Internet Zone - ''Download signed ActiveX controls'' (Zones\3\1001)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\3'; Name='1001'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=11764; Title='IE - Internet Zone - ''Download unsigned ActiveX controls'' (Zones\3\1004)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\3'; Name='1004'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=11767; Title='IE - Internet Zone - ''Initialize and script ActiveX controls not marked as safe'' (Zones\3\1201)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\3'; Name='1201'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=11770; Title='IE - Internet Zone - ''Access data sources across domains'' (Zones\3\1406)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\3'; Name='1406'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=11774; Title='IE - Internet Zone - ''Allow drag and drop or copy and paste files'' (Zones\3\1802)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\3'; Name='1802'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=11775; Title='IE - Internet Zone - ''Launching applications and files in an IFRAME'' (Zones\3\1804)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\3'; Name='1804'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=11776; Title='IE - Internet Zone - ''Navigate windows and frames across different domains'' (Zones\3\1607)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\3'; Name='1607'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=11778; Title='IE - Internet Zone - ''Userdata persistence'' (Zones\3\1606)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\3'; Name='1606'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=11781; Title='IE - Internet Zone - ''Allow updates to status bar via script'' (Zones\3\2103)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\3'; Name='2103'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=11782; Title='IE - Internet Zone - ''Logon options (Prompt for user name and password)'' (Zones\3\1A00)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\3'; Name='1A00'; Type='DWord'; Data=65536; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=11787; Title='IE - Local Intranet Zone - ''Initialize and script ActiveX controls not marked as safe'' (Zones\1\1201)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\1'; Name='1201'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=11807; Title='IE - Trusted Sites Zone - ''Initialize and script ActiveX controls not marked as safe'' (Zones\2\1201)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\2'; Name='1201'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=11930; Title='IE - Prevent Bypassing SmartScreen Filter Warnings'; Path='HKLM:\Software\Policies\Microsoft\Internet Explorer\PhishingFilter'; Name='PreventOverride'; Type='DWord'; Data=1; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=11947; Title='IE - Check for server certificate revocation'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings'; Name='CertificateRevocation'; Type='DWord'; Data=1; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=11948; Title='IE - Turn on certificate address mismatch warning'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings'; Name='WarnOnBadCertRecving'; Type='DWord'; Data=1; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=11949; Title='IE - Prevent ignoring certificate errors'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings'; Name='PreventIgnoreCertErrors'; Type='DWord'; Data=1; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12011; Title='IE - Internet Zone - ''Allow paste operations via scripts'' (Zones\3\1407)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\3'; Name='1407'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12027; Title='IE - Internet Zone - ''Turn on Cross Site Scripting Filter (Enable)'' (Zones\3\1409)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\3'; Name='1409'; Type='DWord'; Data=0; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12028; Title='IE - Internet Zone - ''Run .NET Framework-reliant components signed with Authenticode'' (Zones\3\2001)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\3'; Name='2001'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12029; Title='IE - Internet Zone - ''Use pop-up blocker (Enable)'' (Zones\3\1809)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\3'; Name='1809'; Type='DWord'; Data=0; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12030; Title='IE - Internet Zone - ''Allow scriptlets'' (Zones\3\1209)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\3'; Name='1209'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12032; Title='IE - Internet Zone - ''Run .NET Framework-reliant components not signed with Authenticode'' (Zones\3\2004)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\3'; Name='2004'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12033; Title='IE - Internet Zone - ''Allow scripting of Internet Explorer WebBrowser control'' (Zones\3\1206)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\3'; Name='1206'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12037; Title='IE - Internet Zone - ''Launching programs and unsafe files (Prompt)'' (Zones\3\1806)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\3'; Name='1806'; Type='DWord'; Data=1; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12038; Title='IE - Internet Zone - ''Automatic prompting for file downloads'' (Zones\3\2200)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\3'; Name='2200'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12048; Title='IE - Internet Zone - ''Allow loading of XAML files'' (Zones\3\2402)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\3'; Name='2402'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12050; Title='IE - Internet Zone - ''Include local directory path when uploading files to a server'' (Zones\3\160A)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\3'; Name='160A'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12051; Title='IE - Internet Zone - ''Enable dragging of content from different domains within a window'' (Zones\3\2708)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\3'; Name='2708'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12052; Title='IE - Internet Zone - ''Enable dragging of content from different domains across windows'' (Zones\3\2709)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\3'; Name='2709'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12053; Title='IE - Internet Zone - ''Allow script-initiated windows without size or position constraints'' (Zones\3\2102)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\3'; Name='2102'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12055; Title='IE - Internet Zone - ''Web sites in less privileged zones can navigate into this zone'' (Zones\3\2101)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\3'; Name='2101'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12057; Title='IE - Intranet Sites: Include all network paths (UNCs)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\ZoneMap'; Name='UNCAsIntranet'; Type='DWord'; Data=0; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12059; Title='IE - Restricted Sites Zone - ''Turn on Cross-Site Scripting Filter (Enable)'' (Zones\4\1409)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\4'; Name='1409'; Type='DWord'; Data=0; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12060; Title='IE - Restricted Sites Zone - ''Run .NET Framework-reliant components signed with Authenticode'' (Zones\4\2001)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\4'; Name='2001'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12061; Title='IE - Restricted Sites Zone - ''Allow paste operations via script'' (Zones\4\1407)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\4'; Name='1407'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12064; Title='IE - Restricted Sites Zone - ''Launching programs and unsafe files'' (Zones\4\1806)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\4'; Name='1806'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12065; Title='IE - Restricted Sites Zone - ''Automatic prompting for file downloads'' (Zones\4\2200)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\4'; Name='2200'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12066; Title='IE - Restricted Sites Zone - ''Allow loading of XAML files'' (Zones\4\2402)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\4'; Name='2402'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12068; Title='IE - Restricted Sites Zone - ''Allow scripting of Internet Explorer WebBrowser controls'' (Zones\4\1206)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\4'; Name='1206'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12069; Title='IE - Restricted Sites Zone - ''Allow Binary and Script Behaviors'' (Zones\4\2000)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\4'; Name='2000'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12070; Title='IE - Restricted Sites Zone - ''Use Pop-up Blocker (Enable)'' (Zones\4\1809)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\4'; Name='1809'; Type='DWord'; Data=0; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12071; Title='IE - Restricted Sites Zone - ''Allow Scriptlets'' (Zones\4\1209)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\4'; Name='1209'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12074; Title='IE - Restricted Sites Zone - ''Use SmartScreen Filter (Enable)'' (Zones\4\2301)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\4'; Name='2301'; Type='DWord'; Data=0; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12075; Title='IE - Restricted Sites Zone - ''Run .NET Framework-reliant components not signed with Authenticode'' (Zones\4\2004)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\4'; Name='2004'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12076; Title='IE - Restricted Sites Zone - ''Allow script-initiated windows without size or position constraints'' (Zones\4\2102)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\4'; Name='2102'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12077; Title='IE - Restricted Sites Zone - ''Include local directory path when uploading files to a server'' (Zones\4\160A)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\4'; Name='160A'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12078; Title='IE - Restricted Sites Zone - ''Enable dragging of content from different domains within a window'' (Zones\4\2708)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\4'; Name='2708'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12079; Title='IE - Restricted Sites Zone - ''Web sites in less privileged zones can navigate into this zone'' (Zones\4\2101)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\4'; Name='2101'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12081; Title='IE - Restricted Sites Zone - ''Enable dragging of content from different domains across windows'' (Zones\4\2709)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\4'; Name='2709'; Type='DWord'; Data=3; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12101; Title='IE - Turn off the Security Settings Check feature'; Path='HKLM:\Software\Policies\Microsoft\Internet Explorer\Security'; Name='DisableSecuritySettingsCheck'; Type='DWord'; Data=0; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12105; Title='IE - Restrict ActiveX Install - IE Processes ((Reserved))'; Path='HKLM:\Software\Policies\Microsoft\Internet Explorer\Main\FeatureControl\FEATURE_RESTRICT_ACTIVEXINSTALL'; Name='(Reserved)'; Type='DWord'; Data=1; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12106; Title='IE - Restrict ActiveX Install - IE Processes (explorer.exe)'; Path='HKLM:\Software\Policies\Microsoft\Internet Explorer\Main\FeatureControl\FEATURE_RESTRICT_ACTIVEXINSTALL'; Name='explorer.exe'; Type='DWord'; Data=1; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12107; Title='IE - Restrict ActiveX Install - IE Processes (iexplore.exe)'; Path='HKLM:\Software\Policies\Microsoft\Internet Explorer\Main\FeatureControl\FEATURE_RESTRICT_ACTIVEXINSTALL'; Name='iexplore.exe'; Type='DWord'; Data=1; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12120; Title='IE - Consistent Mime Handling - IE Processes ((Reserved))'; Path='HKLM:\Software\Policies\Microsoft\Internet Explorer\Main\FeatureControl\FEATURE_MIME_HANDLING'; Name='(Reserved)'; Type='DWord'; Data=1; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12121; Title='IE - Consistent Mime Handling - IE Processes (explorer.exe)'; Path='HKLM:\Software\Policies\Microsoft\Internet Explorer\Main\FeatureControl\FEATURE_MIME_HANDLING'; Name='explorer.exe'; Type='DWord'; Data=1; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12122; Title='IE - Consistent Mime Handling - IE Processes (iexplore.exe)'; Path='HKLM:\Software\Policies\Microsoft\Internet Explorer\Main\FeatureControl\FEATURE_MIME_HANDLING'; Name='iexplore.exe'; Type='DWord'; Data=1; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12123; Title='IE - Restrict File Download - IE Processes ((Reserved))'; Path='HKLM:\Software\Policies\Microsoft\Internet Explorer\Main\FeatureControl\FEATURE_RESTRICT_FILEDOWNLOAD'; Name='(Reserved)'; Type='DWord'; Data=1; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12124; Title='IE - Restrict File Download - IE Processes (explorer.exe)'; Path='HKLM:\Software\Policies\Microsoft\Internet Explorer\Main\FeatureControl\FEATURE_RESTRICT_FILEDOWNLOAD'; Name='explorer.exe'; Type='DWord'; Data=1; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12125; Title='IE - Restrict File Download - IE Processes (iexplore.exe)'; Path='HKLM:\Software\Policies\Microsoft\Internet Explorer\Main\FeatureControl\FEATURE_RESTRICT_FILEDOWNLOAD'; Name='iexplore.exe'; Type='DWord'; Data=1; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12126; Title='IE - Protection From Zone Elevation - IE Processes ((Reserved))'; Path='HKLM:\Software\Policies\Microsoft\Internet Explorer\Main\FeatureControl\FEATURE_ZONE_ELEVATION'; Name='(Reserved)'; Type='DWord'; Data=1; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12127; Title='IE - Protection From Zone Elevation - IE Processes (explorer.exe)'; Path='HKLM:\Software\Policies\Microsoft\Internet Explorer\Main\FeatureControl\FEATURE_ZONE_ELEVATION'; Name='explorer.exe'; Type='DWord'; Data=1; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12128; Title='IE - Protection From Zone Elevation - IE Processes (iexplore.exe)'; Path='HKLM:\Software\Policies\Microsoft\Internet Explorer\Main\FeatureControl\FEATURE_ZONE_ELEVATION'; Name='iexplore.exe'; Type='DWord'; Data=1; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12131; Title='IE - Internet Zone - ''Don''t run antimalware programs against ActiveX controls (Disable)'' (Zones\3\270C)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\3'; Name='270C'; Type='DWord'; Data=0; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12132; Title='IE - Local Intranet Zone - ''Don''t run antimalware programs against ActiveX controls (Disable)'' (Zones\1\270C)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\1'; Name='270C'; Type='DWord'; Data=0; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12133; Title='IE - Restricted Sites Zone - ''Don''t run antimalware programs against ActiveX controls (Disable)'' (Zones\4\270C)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\4'; Name='270C'; Type='DWord'; Data=0; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12135; Title='IE - Trusted Sites Zone - ''Don''t run antimalware programs against ActiveX controls (Disable)'' (Zones\2\270C)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\2'; Name='270C'; Type='DWord'; Data=0; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12161; Title='IE - Prevent Managing SmartScreen Filter (mode On)'; Path='HKLM:\Software\Policies\Microsoft\Internet Explorer\PhishingFilter'; Name='EnabledV9'; Type='DWord'; Data=1; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12164; Title='IE - Internet Zone - ''Turn on SmartScreen Filter scan (Enable)'' (Zones\3\2301)'; Path='HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\3'; Name='2301'; Type='DWord'; Data=0; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12165; Title='IE - Remove the "Run this time" button for outdated ActiveX controls'; Path='HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\Ext'; Name='RunThisTimeEnabled'; Type='DWord'; Data=0; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=12166; Title='IE - Turn off blocking of outdated ActiveX controls (Disabled)'; Path='HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\Ext'; Name='VersionCheckEnabled'; Type='DWord'; Data=1; Reboot=$false; IE=$true; Gate=''; Risk='' }
+        @{ Cid=13918; Title='''Turn On VBS: Require UEFI Memory Attributes Table'' (HVCIMATRequired)'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceGuard'; Name='HVCIMATRequired'; Type='DWord'; Data=1; Reboot=$true; IE=$false; Gate=''; Risk='Registry value set; takes effect only after a reboot and (for VBS/Device Guard items) once the VM exposes Secure Boot + virtualization. This tool never reboots.' }
+        @{ Cid=16104; Title='''Turn On VBS (Secure Launch Configuration)'' (ConfigureSystemGuardLaunch)'; Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceGuard'; Name='ConfigureSystemGuardLaunch'; Type='DWord'; Data=1; Reboot=$true; IE=$false; Gate=''; Risk='Registry value set; takes effect only after a reboot and (for VBS/Device Guard items) once the VM exposes Secure Boot + virtualization. This tool never reboots.' }
+        @{ Cid=25349; Title='''Kernel-mode Hardware-enforced Stack Protection'' (enforcement)'; Path='HKLM:\Software\Policies\Microsoft\Windows\DeviceGuard'; Name='ConfigureKernelShadowStacksLaunch'; Type='DWord'; Data=1; Reboot=$true; IE=$false; Gate=''; Risk='Registry value set; takes effect only after a reboot and (for VBS/Device Guard items) once the VM exposes Secure Boot + virtualization. This tool never reboots.' }
+        @{ Cid=25358; Title='''Configure NetBIOS settings'' (EnableNetbios) - disable NetBIOS name resolution'; Path='HKLM:\Software\Policies\Microsoft\Windows NT\DNSClient'; Name='EnableNetbios'; Type='DWord'; Data=0; Reboot=$false; IE=$false; Gate='$DisableNetbios'; Risk='Medium - if any legacy application, script or share access relies on a NetBIOS (short) name that is not resolvable via DNS, it will break. Confirm DNS has records for everything these servers talk to by short name; test, then roll out. Value 2 is a lower-risk interim step.' }
+        @{ Cid=25359; Title='''Configure RPC listener settings: Authentication protocol to use for incoming RPC connections'' (ForceKerberosForRpc)'; Path='HKLM:\Software\Policies\Microsoft\Windows NT\Printers\RPC'; Name='ForceKerberosForRpc'; Type='DWord'; Data=0; Reboot=$false; IE=$false; Gate=''; Risk='' }
+        @{ Cid=25361; Title='''Configure RPC listener settings: Protocols to allow for incoming RPC connections'' (RpcProtocols)'; Path='HKLM:\Software\Policies\Microsoft\Windows NT\Printers\RPC'; Name='RpcProtocols'; Type='DWord'; Data=5; Reboot=$false; IE=$false; Gate=''; Risk='' }
+        @{ Cid=25938; Title='''Configures LSASS to run as a protected process (Enabled with UEFI Lock)'' (RunAsPPL)'; Path='HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'; Name='RunAsPPL'; Type='DWord'; Data=1; Reboot=$true; IE=$false; Gate=''; Risk='Registry value set; takes effect only after a reboot and (for VBS/Device Guard items) once the VM exposes Secure Boot + virtualization. This tool never reboots.' }
+        @{ Cid=27615; Title='''Control whether exclusions are visible to Local Admins'' (HideExclusionsFromLocalAdmins)'; Path='HKLM:\Software\Policies\Microsoft\Windows Defender'; Name='HideExclusionsFromLocalAdmins'; Type='DWord'; Data=1; Reboot=$false; IE=$false; Gate=''; Risk='' }
+        @{ Cid=29570; Title='''Network\LanmanServer: AuditClientDoesNotSupportEncryption'''; Path='HKLM:\Software\Policies\Microsoft\Windows\LanmanServer'; Name='AuditClientDoesNotSupportEncryption'; Type='DWord'; Data=1; Reboot=$false; IE=$false; Gate=''; Risk='' }
+        @{ Cid=29571; Title='''Network\LanmanServer: AuditClientDoesNotSupportSigning'''; Path='HKLM:\Software\Policies\Microsoft\Windows\LanmanServer'; Name='AuditClientDoesNotSupportSigning'; Type='DWord'; Data=1; Reboot=$false; IE=$false; Gate=''; Risk='' }
+        @{ Cid=29572; Title='''Network\LanmanServer: AuditInsecureGuestLogon'''; Path='HKLM:\Software\Policies\Microsoft\Windows\LanmanServer'; Name='AuditInsecureGuestLogon'; Type='DWord'; Data=1; Reboot=$false; IE=$false; Gate=''; Risk='' }
+        @{ Cid=29573; Title='''Network\LanmanServer: EnableAuthRateLimiter'''; Path='HKLM:\Software\Policies\Microsoft\Windows\LanmanServer'; Name='EnableAuthRateLimiter'; Type='DWord'; Data=1; Reboot=$false; IE=$false; Gate=''; Risk='' }
+        @{ Cid=29574; Title='''Lanman Server: Enable remote mailslots'''; Path='HKLM:\Software\Policies\Microsoft\Windows\Bowser'; Name='EnableMailslots'; Type='DWord'; Data=0; Reboot=$false; IE=$false; Gate=''; Risk='' }
+        @{ Cid=29577; Title='''Network\LanmanServer: InvalidAuthenticationDelayTimeInMs'''; Path='HKLM:\Software\Policies\Microsoft\Windows\LanmanServer'; Name='InvalidAuthenticationDelayTimeInMs'; Type='DWord'; Data=2000; Reboot=$false; IE=$false; Gate=''; Risk='' }
+        @{ Cid=29578; Title='''Network\LanmanWorkstation: AuditInsecureGuestLogon'''; Path='HKLM:\Software\Policies\Microsoft\Windows\LanmanWorkstation'; Name='AuditInsecureGuestLogon'; Type='DWord'; Data=1; Reboot=$false; IE=$false; Gate=''; Risk='' }
+        @{ Cid=29579; Title='''Network\LanmanWorkstation: AuditServerDoesNotSupportEncryption'''; Path='HKLM:\Software\Policies\Microsoft\Windows\LanmanWorkstation'; Name='AuditServerDoesNotSupportEncryption'; Type='DWord'; Data=1; Reboot=$false; IE=$false; Gate=''; Risk='' }
+        @{ Cid=29580; Title='''Network\LanmanWorkstation: AuditServerDoesNotSupportSigning'''; Path='HKLM:\Software\Policies\Microsoft\Windows\LanmanWorkstation'; Name='AuditServerDoesNotSupportSigning'; Type='DWord'; Data=1; Reboot=$false; IE=$false; Gate=''; Risk='' }
+        @{ Cid=29581; Title='''Lanman Workstation: Enable remote mailslots'''; Path='HKLM:\Software\Policies\Microsoft\Windows\NetworkProvider'; Name='EnableMailslots'; Type='DWord'; Data=0; Reboot=$false; IE=$false; Gate=''; Risk='' }
+        @{ Cid=29592; Title='''Control whether exclusions are visible to local users'' (HideExclusionsFromLocalUsers)'; Path='HKLM:\Software\Policies\Microsoft\Windows Defender'; Name='HideExclusionsFromLocalUsers'; Type='DWord'; Data=1; Reboot=$false; IE=$false; Gate=''; Risk='' }
+        @{ Cid=29594; Title='''Configure real-time protection and Security Intelligence Updates during OOBE'' (OobeEnableRtpAndSigUpdate)'; Path='HKLM:\Software\Policies\Microsoft\Windows Defender\Real-Time Protection'; Name='OobeEnableRtpAndSigUpdate'; Type='DWord'; Data=1; Reboot=$false; IE=$false; Gate=''; Risk='' }
+        @{ Cid=29595; Title='''Configure whether to report Dynamic Signature dropped events'' (EnableDynamicSignatureDroppedEventReporting)'; Path='HKLM:\Software\Policies\Microsoft\Windows Defender\Reporting'; Name='EnableDynamicSignatureDroppedEventReporting'; Type='DWord'; Data=1; Reboot=$false; IE=$false; Gate=''; Risk='' }
+        @{ Cid=29596; Title='''Scan excluded files and directories during quick scans'' (QuickScanIncludeExclusions)'; Path='HKLM:\Software\Policies\Microsoft\Windows Defender\Scan'; Name='QuickScanIncludeExclusions'; Type='DWord'; Data=1; Reboot=$false; IE=$false; Gate=''; Risk='' }
+        @{ Cid=29741; Title='''Kerberos - Configure hash algorithms for certificate logon (PKInitHashAlgorithmConfigurationEnabled)'' - client'; Path='HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\System\Kerberos\Parameters'; Name='PKInitHashAlgorithmConfigurationEnabled'; Type='DWord'; Data=1; Reboot=$false; IE=$false; Gate=''; Risk='' }
+        @{ Cid=29742; Title='''Kerberos - Configure hash algorithms for certificate logon (PKInitSHA1)'' - client'; Path='HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\System\Kerberos\Parameters'; Name='PKINITSHA1'; Type='DWord'; Data=1; Reboot=$false; IE=$false; Gate=''; Risk='' }
+        @{ Cid=29743; Title='''Kerberos - Configure hash algorithms for certificate logon (PKInitSHA256)'' - client'; Path='HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\System\Kerberos\Parameters'; Name='PKINITSHA256'; Type='DWord'; Data=3; Reboot=$false; IE=$false; Gate=''; Risk='' }
+        @{ Cid=29744; Title='''Kerberos - Configure hash algorithms for certificate logon (PKInitSHA384)'' - client'; Path='HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\System\Kerberos\Parameters'; Name='PKINITSHA384'; Type='DWord'; Data=3; Reboot=$false; IE=$false; Gate=''; Risk='' }
+        @{ Cid=29745; Title='''Kerberos - Configure hash algorithms for certificate logon (PKInitSHA512)'' - client'; Path='HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\System\Kerberos\Parameters'; Name='PKInitSHA512'; Type='DWord'; Data=3; Reboot=$false; IE=$false; Gate=''; Risk='' }
+        @{ Cid=30458; Title='''Select the channel for Microsoft Defender daily security intelligence updates'' (SignaturesRing)'; Path='HKLM:\Software\Policies\Microsoft\Windows Defender'; Name='SignaturesRing'; Type='String'; Data='5'; Reboot=$false; IE=$false; Gate=''; Risk='' }
+        @{ Cid=30459; Title='''Select the channel for Microsoft Defender monthly engine updates'' (EngineRing)'; Path='HKLM:\Software\Policies\Microsoft\Windows Defender'; Name='EngineRing'; Type='String'; Data='5'; Reboot=$false; IE=$false; Gate=''; Risk='' }
+        @{ Cid=30460; Title='''Select the channel for Microsoft Defender monthly platform updates'' (PlatformRing)'; Path='HKLM:\Software\Policies\Microsoft\Windows Defender'; Name='PlatformRing'; Type='String'; Data='5'; Reboot=$false; IE=$false; Gate=''; Risk='' }
+        )
+        foreach ($it in $IsoReg) {
+            if ($it.IE -and $SkipIeHardening) { continue }
+            if ($it.Gate) {
+                $gateOn = (Get-Variable -Name ($it.Gate.TrimStart('$')) -ValueOnly -ErrorAction SilentlyContinue) -eq $true
+                if (-not $gateOn) {
+                    Add-ResultRow -Category $ICAT -Item ("CID {0} - {1}" -f $it.Cid, $it.Title) -Status 'Manual/External Required' `
+                        -Details ("NOT changed automatically (change-review item). {0} Re-run with -{1} to apply." -f $it.Risk, $it.Gate.TrimStart('$')) `
+                        -DetectedValue (Get-RegValueString $it.Path $it.Name) -ExpectedValue ("{0} = {1}" -f $it.Name, $it.Data)
+                    continue
+                }
+            }
+            Invoke-IsoReg -Cid $it.Cid -Title $it.Title -Path $it.Path -Name $it.Name -Type $it.Type -Data $it.Data -Reboot $it.Reboot -Risk $it.Risk
+        }
+        if ($SkipIeHardening) {
+            Add-ResultRow -Category $ICAT -Item 'Internet Explorer hardening (89 control IDs)' -Status 'Skipped (category)' `
+                -Details '-SkipIeHardening was passed. Re-run without it to remediate the IE zone-lockdown and feature-control registry policy values (HKLM only; no reboot; IE is not installed on WS2025 so production impact is minimal).'
+        }
+
+        # --- CID 4501 : advanced audit 'Audit Policy Change' = Success and Failure (auditpol) ---
+        Invoke-Remediation -Category $ICAT -Item 'CID 4501 - Audit "Audit Policy Change" = Success and Failure' `
+            -Description 'auditpol /set /subcategory:"Audit Policy Change" /success:enable /failure:enable' `
+            -ExpectedValue 'Success and Failure' `
+            -CurrentStateBlock {
+                try {
+                    $csv = (& auditpol /get /subcategory:"Audit Policy Change" /r 2>$null | ConvertFrom-Csv)
+                    $row = $csv | Where-Object { $_.Subcategory -eq 'Audit Policy Change' } | Select-Object -First 1
+                    "Inclusion Setting=$($row.'Inclusion Setting')"
+                } catch { 'unknown' }
+            } `
+            -CheckBlock {
+                $csv = (& auditpol /get /subcategory:"Audit Policy Change" /r 2>$null | ConvertFrom-Csv)
+                $row = $csv | Where-Object { $_.Subcategory -eq 'Audit Policy Change' } | Select-Object -First 1
+                $row -and $row.'Inclusion Setting' -eq 'Success and Failure'
+            } `
+            -ApplyBlock {
+                $o = & auditpol /set /subcategory:"Audit Policy Change" /success:enable /failure:enable 2>&1
+                if ($LASTEXITCODE) { throw "auditpol exited $LASTEXITCODE. $o" }
+            }
+
+        # --- CID 3950/3951/3952 : Windows Firewall profile state = On  (opt-in: -EnableFirewallProfiles) ---
+        foreach ($fp in @(
+            @{ Cid=3952; Profile='Domain' }, @{ Cid=3951; Profile='Private' }, @{ Cid=3950; Profile='Public' } )) {
+            if (-not $EnableFirewallProfiles) {
+                Add-ResultRow -Category $ICAT -Item ("CID {0} - Windows Firewall: Firewall state ({1})" -f $fp.Cid, $fp.Profile) -Status 'Manual/External Required' `
+                    -Details "Host firewall OFF for the $($fp.Profile) profile (finding on 10.50.16.32). NOT changed automatically - enabling the firewall with the default inbound-block stance can cut RDP / agent / app traffic. Stage inbound allow rules, then re-run with -EnableFirewallProfiles during a change window (keep VM-console fallback)." `
+                    -DetectedValue 'EnableFirewall = 0 (Off)' -ExpectedValue 'On (1)'
+                continue
+            }
+            $fpp = "HKLM:\Software\Policies\Microsoft\WindowsFirewall\$($fp.Profile)Profile"
+            Invoke-Remediation -Category $ICAT -Item ("CID {0} - Windows Firewall: Firewall state ({1})" -f $fp.Cid, $fp.Profile) `
+                -Description ("Set-NetFirewallProfile -Profile {0} -Enabled True (also $fpp\EnableFirewall=1)" -f $fp.Profile) `
+                -RiskNote 'Enabling the firewall can black-hole inbound RDP/agent/app traffic if matching allow rules are absent. Confirmed opt-in via -EnableFirewallProfiles.' `
+                -ExpectedValue 'Enabled = True' `
+                -CurrentStateBlock ({ try { 'Enabled=' + (Get-NetFirewallProfile -Profile $fp.Profile -ErrorAction Stop).Enabled } catch { Get-RegValueString $fpp 'EnableFirewall' } }.GetNewClosure()) `
+                -CheckBlock ({ try { (Get-NetFirewallProfile -Profile $fp.Profile -ErrorAction Stop).Enabled -eq $true } catch { $v = Get-ItemProperty -Path $fpp -Name EnableFirewall -ErrorAction SilentlyContinue; $v -and $v.EnableFirewall -eq 1 } }.GetNewClosure()) `
+                -ApplyBlock ({
+                    try { Set-NetFirewallProfile -Profile $fp.Profile -Enabled True -ErrorAction Stop }
+                    catch {
+                        if (-not (Test-Path -LiteralPath $fpp)) { New-Item -Path $fpp -Force -ErrorAction SilentlyContinue | Out-Null }
+                        Set-ItemProperty -Path $fpp -Name EnableFirewall -Value 1 -Type DWord -Force
+                    }
+                }.GetNewClosure())
+        }
+
+        # --- CID 29576 / 29583 : mandate minimum SMB dialect 3.0.0  (opt-in: -SetSmbMinSmb3) ---
+        foreach ($sd in @(
+            @{ Cid=29576; Side='Server'; Key='HKLM:\Software\Policies\Microsoft\Windows\LanmanServer' },
+            @{ Cid=29583; Side='Client'; Key='HKLM:\Software\Policies\Microsoft\Windows\LanmanWorkstation' } )) {
+            if (-not $SetSmbMinSmb3) {
+                Add-ResultRow -Category $ICAT -Item ("CID {0} - Mandate minimum SMB version ({1})" -f $sd.Cid, $sd.Side) -Status 'Manual/External Required' `
+                    -Details "NOT changed automatically - clients that only speak SMB 2.0.2/2.1 lose connectivity, and applying the server value can bounce active SMB sessions. Inventory SMB peers (Get-SmbSession / arrays / backup), then re-run with -SetSmbMinSmb3 in a change window." `
+                    -DetectedValue 'MinSmb2Dialect = Setting not found' -ExpectedValue 'SMB 3.0.0 (768)'
+                continue
+            }
+            Invoke-Remediation -Category $ICAT -Item ("CID {0} - Mandate minimum SMB version ({1})" -f $sd.Cid, $sd.Side) `
+                -Description ("Set-Smb{0}Configuration -MinSmb2Dialect SMB300 (also $($sd.Key)\MinSmb2Dialect=768)" -f $sd.Side) `
+                -RiskNote 'Blocks SMB 2.0.2/2.1 peers; server-side apply can drop active SMB sessions. Confirmed opt-in via -SetSmbMinSmb3.' `
+                -ExpectedValue 'MinSmb2Dialect = 768 (SMB 3.0.0)' `
+                -CurrentStateBlock ({ Get-RegValueString $sd.Key 'MinSmb2Dialect' }.GetNewClosure()) `
+                -CheckBlock ({ $v = Get-ItemProperty -Path $sd.Key -Name MinSmb2Dialect -ErrorAction SilentlyContinue; $v -and [int]$v.MinSmb2Dialect -eq 768 }.GetNewClosure()) `
+                -ApplyBlock ({
+                    try {
+                        if ($sd.Side -eq 'Server') { Set-SmbServerConfiguration -MinSmb2Dialect SMB300 -Confirm:$false -ErrorAction Stop }
+                        else { Set-SmbClientConfiguration -MinSmb2Dialect SMB300 -Confirm:$false -ErrorAction Stop }
+                    } catch {
+                        if (-not (Test-Path -LiteralPath $sd.Key)) { New-Item -Path $sd.Key -Force -ErrorAction SilentlyContinue | Out-Null }
+                        Set-ItemProperty -Path $sd.Key -Name MinSmb2Dialect -Value 768 -Type DWord -Force
+                    }
+                }.GetNewClosure())
+        }
+
+        # --- CID 1071 / 2342 : account policy via secedit  (opt-in: -ApplyAccountPolicy) ---
+        foreach ($ap in @(
+            @{ Cid=1071; Key='MinimumPasswordLength'; Target=$MinPasswordLength;      Cmp='ge'; Label='Minimum Password Length' },
+            @{ Cid=2342; Key='LockoutBadCount';       Target=$AccountLockoutThreshold; Cmp='le'; Label='Account Lockout Threshold' } )) {
+            if (-not $ApplyAccountPolicy) {
+                Add-ResultRow -Category $ICAT -Item ("CID {0} - {1}" -f $ap.Cid, $ap.Label) -Status 'Manual/External Required' `
+                    -Details ("NOT changed automatically. Set via secedit [System Access] {0} = {1} (or 'net accounts'). Re-run with -ApplyAccountPolicy (and -MinPasswordLength / -AccountLockoutThreshold) once the target values are agreed with the security team - a low lockout threshold plus AllowAdministratorLockout can enable account-lockout DoS." -f $ap.Key, $ap.Target) `
+                    -DetectedValue 'see secedit /export /areas SECURITYPOLICY' -ExpectedValue ("{0} {1} {2}" -f $ap.Key, $(if($ap.Cmp -eq 'ge'){'>='}else{'<='}), $ap.Target)
+                continue
+            }
+            Invoke-Remediation -Category $ICAT -Item ("CID {0} - {1}" -f $ap.Cid, $ap.Label) `
+                -Description ("secedit /configure [System Access] {0} = {1}" -f $ap.Key, $ap.Target) `
+                -RiskNote 'Account-policy change. Confirmed opt-in via -ApplyAccountPolicy.' `
+                -ExpectedValue ("{0} {1} {2}" -f $ap.Key, $(if($ap.Cmp -eq 'ge'){'>='}else{'<='}), $ap.Target) `
+                -CurrentStateBlock ({
+                    $cfg = Join-Path $env:TEMP ("iso_sa_{0}.cfg" -f [guid]::NewGuid().ToString('N'))
+                    try { & secedit /export /cfg $cfg /areas SECURITYPOLICY /quiet 2>&1 | Out-Null
+                        (Select-String -LiteralPath $cfg -Pattern ("^\s*{0}\s*=" -f $ap.Key) | Select-Object -First 1).Line.Trim()
+                    } finally { Remove-Item -LiteralPath $cfg -Force -ErrorAction SilentlyContinue }
+                }.GetNewClosure()) `
+                -CheckBlock ({
+                    $cfg = Join-Path $env:TEMP ("iso_sa_{0}.cfg" -f [guid]::NewGuid().ToString('N'))
+                    try { & secedit /export /cfg $cfg /areas SECURITYPOLICY /quiet 2>&1 | Out-Null
+                        $l = (Select-String -LiteralPath $cfg -Pattern ("^\s*{0}\s*=\s*(\d+)" -f $ap.Key) | Select-Object -First 1)
+                        if (-not $l) { return $false }
+                        $cur = [int]$l.Matches[0].Groups[1].Value
+                        if ($ap.Cmp -eq 'ge') { $cur -ge [int]$ap.Target } else { $cur -le [int]$ap.Target -and $cur -gt 0 }
+                    } finally { Remove-Item -LiteralPath $cfg -Force -ErrorAction SilentlyContinue }
+                }.GetNewClosure()) `
+                -ApplyBlock ({
+                    $inf = Join-Path $env:TEMP ("iso_sa_{0}.inf" -f [guid]::NewGuid().ToString('N'))
+                    $sdb = Join-Path $env:TEMP ("iso_sa_{0}.sdb" -f [guid]::NewGuid().ToString('N'))
+                    $body = @('[Unicode]','Unicode=yes','[Version]','signature="$CHICAGO$"','Revision=1','[System Access]',("{0} = {1}" -f $ap.Key, [int]$ap.Target)) -join "
+"
+                    try { Set-Content -LiteralPath $inf -Value $body -Encoding Unicode
+                        $o = & secedit /configure /db $sdb /cfg $inf /areas SECURITYPOLICY /quiet 2>&1
+                        if ($LASTEXITCODE) { throw "secedit exited $LASTEXITCODE. $o" }
+                    } finally { Remove-Item -LiteralPath $inf, $sdb -Force -ErrorAction SilentlyContinue }
+                }.GetNewClosure())
+        }
+
+        # --- CID 2196 : Deny access to this computer from the network (secedit; same right as category 7.12) ---
+        Invoke-Remediation -Category $ICAT -Item 'CID 2196 - Deny access to this computer from the network (user right)' `
+            -Description 'secedit: [Privilege Rights] SeDenyNetworkLogonRight = *S-1-5-32-546,*S-1-5-113,*S-1-5-114' `
+            -RiskNote 'Network-logon deny only (SMB/RPC/WinRM) for Guests + all local accounts. Does NOT affect console or RDP. Safe on a VMware guest-ops managed estate; verify no app authenticates to this host over SMB with a local account first.' `
+            -ExpectedValue 'Contains S-1-5-32-546, S-1-5-113 and S-1-5-114' `
+            -CurrentStateBlock {
+                $cfg = Join-Path $env:TEMP ("iso_ura_{0}.cfg" -f [guid]::NewGuid().ToString('N'))
+                try { & secedit /export /cfg $cfg /areas USER_RIGHTS /quiet 2>&1 | Out-Null
+                    $l = (Select-String -LiteralPath $cfg -Pattern '^\s*SeDenyNetworkLogonRight\s*=' | Select-Object -First 1).Line
+                    if ($l) { $l.Trim() } else { 'SeDenyNetworkLogonRight = (not set)' }
+                } finally { Remove-Item -LiteralPath $cfg -Force -ErrorAction SilentlyContinue }
+            } `
+            -CheckBlock {
+                $cfg = Join-Path $env:TEMP ("iso_ura_{0}.cfg" -f [guid]::NewGuid().ToString('N'))
+                try { & secedit /export /cfg $cfg /areas USER_RIGHTS /quiet 2>&1 | Out-Null
+                    $l = (Select-String -LiteralPath $cfg -Pattern '^\s*SeDenyNetworkLogonRight\s*=' | Select-Object -First 1).Line
+                    if (-not $l) { return $false }
+                    $ok = $true
+                    foreach ($sid in 'S-1-5-32-546','S-1-5-113','S-1-5-114') { if ($l -notmatch [regex]::Escape($sid)) { $ok = $false } }
+                    $ok
+                } finally { Remove-Item -LiteralPath $cfg -Force -ErrorAction SilentlyContinue }
+            } `
+            -ApplyBlock {
+                $inf = Join-Path $env:TEMP ("iso_ura_{0}.inf" -f [guid]::NewGuid().ToString('N'))
+                $sdb = Join-Path $env:TEMP ("iso_ura_{0}.sdb" -f [guid]::NewGuid().ToString('N'))
+                $body = @('[Unicode]','Unicode=yes','[Version]','signature="$CHICAGO$"','Revision=1','[Privilege Rights]','SeDenyNetworkLogonRight = *S-1-5-32-546,*S-1-5-113,*S-1-5-114') -join "
+"
+                try { Set-Content -LiteralPath $inf -Value $body -Encoding Unicode
+                    $o = & secedit /configure /db $sdb /cfg $inf /areas USER_RIGHTS /quiet 2>&1
+                    if ($LASTEXITCODE) { throw "secedit exited $LASTEXITCODE. $o" }
+                } finally { Remove-Item -LiteralPath $inf, $sdb -Force -ErrorAction SilentlyContinue }
+            }
+
+        # --- CID 25357 / 30456 : Attack Surface Reduction rules ---
+        foreach ($ar in @(
+            @{ Cid=25357; Guid='56a863a9-875e-4185-98a7-b882c64b5ce5'; Name='Block abuse of exploited vulnerable signed drivers'; Optin=$false },
+            @{ Cid=30456; Guid='a8f5898e-1dc8-49a9-9878-85004b8a61e6'; Name='ASR rule a8f5898e (server webshell / verify friendly name)'; Optin=$true } )) {
+            if ($ar.Optin -and -not $EnableServerAsrRules) {
+                Add-ResultRow -Category $ICAT -Item ("CID {0} - {1}" -f $ar.Cid, $ar.Name) -Status 'Manual/External Required' `
+                    -Details ("Confirm the rule's friendly name/intent with the security team, then re-run with -EnableServerAsrRules (starts the rule in Block). GUID {0}." -f $ar.Guid) `
+                    -DetectedValue 'Rule not configured' -ExpectedValue 'Block (1)'
+                continue
+            }
+            if (-not (Get-Command Add-MpPreference -ErrorAction SilentlyContinue)) {
+                Add-ResultRow -Category $ICAT -Item ("CID {0} - {1}" -f $ar.Cid, $ar.Name) -Status 'Manual/External Required' `
+                    -Details 'Defender module (Add-MpPreference) not present - configure the ASR rule via the third-party AV / Defender console.' `
+                    -DetectedValue 'Defender cmdlets unavailable' -ExpectedValue 'Block (1)'
+                continue
+            }
+            Invoke-Remediation -Category $ICAT -Item ("CID {0} - {1}" -f $ar.Cid, $ar.Name) `
+                -Description ("Add-MpPreference -AttackSurfaceReductionRules_Ids {0} -AttackSurfaceReductionRules_Actions Enabled" -f $ar.Guid) `
+                -RiskNote 'ASR rules can block legitimate behaviour. Pilot in AuditMode first if the host runs affected workloads (drivers / web roots).' `
+                -ExpectedValue 'Rule action = Block (1)' `
+                -CurrentStateBlock ({
+                    try { $p = Get-MpPreference -ErrorAction Stop
+                        $i = [array]::IndexOf(@($p.AttackSurfaceReductionRules_Ids), $ar.Guid)
+                        if ($i -ge 0) { "action=$(@($p.AttackSurfaceReductionRules_Actions)[$i])" } else { 'not configured' }
+                    } catch { 'unknown' }
+                }.GetNewClosure()) `
+                -CheckBlock ({
+                    $p = Get-MpPreference -ErrorAction Stop
+                    $i = [array]::IndexOf(@($p.AttackSurfaceReductionRules_Ids), $ar.Guid)
+                    $i -ge 0 -and [int](@($p.AttackSurfaceReductionRules_Actions)[$i]) -eq 1
+                }.GetNewClosure()) `
+                -ApplyBlock ({ Add-MpPreference -AttackSurfaceReductionRules_Ids $ar.Guid -AttackSurfaceReductionRules_Actions Enabled -ErrorAction Stop }.GetNewClosure())
+        }
+
+        Add-ResultRow -Category $ICAT -Item ('CID {0} - {1}' -f 29586, '''Configure hash algorithms for certificate logon (PKINITHashAlgorithmConfigurationEnabled)'' - KDC') -Status 'Not Applicable' `
+            -Details 'NOT APPLICABLE - KDC role not installed (not a Domain Controller) Evidence: Get-CimInstance Win32_ComputerSystem (PartOfDomain=False / DomainRole 2) and Get-WindowsFeature AD-Domain-Services (not installed).' -DetectedValue 'PKINITHashAlgorithmConfigurationEnabled = Setting not found' -ExpectedValue 'N/A (would be 1 on a Domain Controller)'
+
+        Add-ResultRow -Category $ICAT -Item ('CID {0} - {1}' -f 29587, '''Configure hash algorithms for certificate logon (PKINITSHA1)'' - KDC') -Status 'Not Applicable' `
+            -Details 'NOT APPLICABLE - KDC role not installed (not a Domain Controller) Evidence: Get-CimInstance Win32_ComputerSystem (PartOfDomain=False / DomainRole 2) and Get-WindowsFeature AD-Domain-Services (not installed).' -DetectedValue 'PKINITSHA1 = Setting not found' -ExpectedValue 'N/A (would be 1 on a Domain Controller)'
+
+        Add-ResultRow -Category $ICAT -Item ('CID {0} - {1}' -f 29588, '''Configure hash algorithms for certificate logon (PKINITSHA256)'' - KDC') -Status 'Not Applicable' `
+            -Details 'NOT APPLICABLE - KDC role not installed (not a Domain Controller) Evidence: Get-CimInstance Win32_ComputerSystem (PartOfDomain=False / DomainRole 2) and Get-WindowsFeature AD-Domain-Services (not installed).' -DetectedValue 'PKINITSHA256 = Setting not found' -ExpectedValue 'N/A (would be 3 on a Domain Controller)'
+
+        Add-ResultRow -Category $ICAT -Item ('CID {0} - {1}' -f 29589, '''Configure hash algorithms for certificate logon (PKINITSHA384)'' - KDC') -Status 'Not Applicable' `
+            -Details 'NOT APPLICABLE - KDC role not installed (not a Domain Controller) Evidence: Get-CimInstance Win32_ComputerSystem (PartOfDomain=False / DomainRole 2) and Get-WindowsFeature AD-Domain-Services (not installed).' -DetectedValue 'PKINITSHA384 = Setting not found' -ExpectedValue 'N/A (would be 3 on a Domain Controller)'
+
+        Add-ResultRow -Category $ICAT -Item ('CID {0} - {1}' -f 29590, '''Configure hash algorithms for certificate logon (PKINITSHA512)'' - KDC') -Status 'Not Applicable' `
+            -Details 'NOT APPLICABLE - KDC role not installed (not a Domain Controller) Evidence: Get-CimInstance Win32_ComputerSystem (PartOfDomain=False / DomainRole 2) and Get-WindowsFeature AD-Domain-Services (not installed).' -DetectedValue 'PKINITSHA512 = Setting not found' -ExpectedValue 'N/A (would be 3 on a Domain Controller)'
+
+        Add-ResultRow -Category $ICAT -Item ('CID {0} - {1}' -f 29740, '''Turn On VBS (Machine Identity Isolation Policy)''') -Status 'Not Applicable' `
+            -Details 'NOT APPLICABLE - Workgroup - no AD machine identity to isolate Evidence: Get-CimInstance Win32_ComputerSystem (PartOfDomain=False / DomainRole 2) and Get-WindowsFeature AD-Domain-Services (not installed).' -DetectedValue 'MachineIdentityIsolation = Key not found' -ExpectedValue 'N/A unless domain-joined (would be 2 = enforcement on a domain member)'
+
+        Add-ResultRow -Category $ICAT -Item ('CID {0} - {1}' -f 2186, 'Groups/accounts with ''Back up files and directories'' (SeBackupPrivilege)') -Status 'Manual/External Required' `
+            -Details 'Either (a) file a Qualys exception documenting Splunk''s operational need, or (b) remove NT SERVICE\SplunkForwarder via secedit and validate Splunk still forwards. Do NOT auto-remove.' -DetectedValue 'BUILTIN\Administrators, NT SERVICE\SplunkForwarder' -ExpectedValue 'Administrators only (Qualys also accepts ''Right not assigned'')'
+
+        Add-ResultRow -Category $ICAT -Item ('CID {0} - {1}' -f 2195, 'Groups/accounts with ''Debug Programs'' (SeDebugPrivilege)') -Status 'Manual/External Required' `
+            -Details 'Remove the ''ServiceNow Users'' group from SeDebugPrivilege via secedit unless a written justification exists; then re-scan. Treat as change-reviewed manual remediation.' -DetectedValue 'BUILTIN\Administrators, <host>\ServiceNow Users' -ExpectedValue 'Administrators only (Qualys also accepts ''Right not assigned'')'
+
+        Add-ResultRow -Category $ICAT -Item ('CID {0} - {1}' -f 2200, 'Groups/accounts with ''Deny log on through Remote Desktop Services'' (SeDenyRemoteInteractiveLogonRight)') -Status 'Manual/External Required' `
+            -Details 'MANUAL on this estate: adding ''Local account'' (S-1-5-113) denies RDP to every local account, including the local Administrator used to manage these WORKGROUP servers. Apply only ''Guests'' automatically; apply the full list manually once console/iLO/VM-console access is confirmed as the management path. A deny right cannot be granted an exception.' -DetectedValue 'Right not assigned' -ExpectedValue 'Contains S-1-5-113 (Local account). CIS: Guests + Local account.'
+
+        Add-ResultRow -Category $ICAT -Item ('CID {0} - {1}' -f 2392, 'Groups/accounts with ''Manage auditing and security log'' (SeSecurityPrivilege)') -Status 'Manual/External Required' `
+            -Details 'Preferred: remove SeSecurityPrivilege from SplunkForwarder and add the Splunk service account to BUILTIN\Event Log Readers (read-only). Otherwise document a Qualys exception. Do NOT auto-remediate.' -DetectedValue 'BUILTIN\Administrators, NT SERVICE\SplunkForwarder' -ExpectedValue 'Administrators only (Qualys also accepts ''Right not assigned'')'
+
+        Add-ResultRow -Category $ICAT -Item ('CID {0} - {1}' -f 2642, 'Groups/accounts with ''Impersonate a client after authentication'' (SeImpersonatePrivilege)') -Status 'Manual/External Required' `
+            -Details 'If IIS is legitimately installed on 10.50.16.32, file a Qualys exception (IIS_IUSRS + SeImpersonate is by design). The ''RESTRICTED SERVICES\PrintSpoolerService'' entry matches the \bSERVICE$ regex and is compliant - the finding is likely a scanner display artefact; re-scan after the other user-rights fixes. No automatic change.' -DetectedValue 'BUILTIN\Administrators, BUILTIN\IIS_IUSRS (host .32), NT AUTHORITY\{LOCAL SERVICE, NETWORK SERVICE, SERVICE}, RESTRICTED SERVICES\PrintSpoolerService' -ExpectedValue 'Administrators, LOCAL SERVICE, NETWORK SERVICE, SERVICE (regex allows the \bSERVICE$ pattern which already covers the spooler service SID)'
+
+        Add-ResultRow -Category $ICAT -Item ('CID {0} - {1}' -f 25350, '''Allow Custom SSPs and APs to be loaded into LSASS'' (AllowCustomSSPsAPs)') -Status 'Manual/External Required' `
+            -Details 'Decision required - do NOT auto-remediate. If hardened stance (0) is chosen and Qualys policy insists on 1, file a documented exception referencing RunAsPPL + Credential Guard as compensating controls.' -DetectedValue 'AllowCustomSSPsAPs = Not Configured' -ExpectedValue '1 per Qualys policy - VALIDATE; recommended hardened value is 0 unless a custom SSP is required'
+
+        Add-ResultRow -Category $ICAT -Item ('CID {0} - {1}' -f 30461, '''Allow network protection on Windows Server'' (AllowNetworkProtectionOnWinServer)') -Status 'Manual/External Required' `
+            -Details 'Decision required. If confirmed: New-Item + Set-ItemProperty ''...\Network Protection'' AllowNetworkProtectionOnWinServer 0 (DWORD). Recommended alternative: set to 1 and set EnableNetworkProtection=1 (Block) and file a Qualys exception.' -DetectedValue 'AllowNetworkProtectionOnWinServer = Key not found' -ExpectedValue '0 (per Qualys policy) - VALIDATE against your Defender standard'
+
+        Add-ResultRow -Category $ICAT -Item ('CID {0} - {1}' -f 10821, 'IE (per-user) - Turn on the auto-complete feature for user names and passwords on forms (FormSuggest Passwords = no)') -Status 'Manual/External Required' `
+            -Details 'PER-USER (HKEY_USERS) setting - not a single machine value. For each loaded hive under HKEY_USERS and for HKU\.DEFAULT (and every profile hive mounted from NTUSER.DAT): New-Item -Force ''<hive>\Software\Policies\Microsoft\Internet Explorer\Main'' ; Set-ItemProperty ... ''FormSuggest Passwords'' ''no'' (REG_SZ). Best delivered as a per-user logon script / Active Setup rather than a one-shot machine script.' -DetectedValue 'FormSuggest Passwords: ''Setting not found'' for several profile SIDs (some profiles already = ''no'')' -ExpectedValue 'no for every user hive (Qualys regex no$)'
+
+        Add-ResultRow -Category $ICAT -Item ('CID {0} - {1}' -f 17333, 'IE (per-user) - Prompt me to save passwords (FormSuggest PW Ask = no)') -Status 'Manual/External Required' `
+            -Details 'PER-USER (HKEY_USERS) setting - not a single machine value. For each loaded hive under HKEY_USERS and for HKU\.DEFAULT (and every profile hive mounted from NTUSER.DAT): New-Item -Force ''<hive>\Software\Policies\Microsoft\Internet Explorer\Main'' ; Set-ItemProperty ... ''FormSuggest PW Ask'' ''no'' (REG_SZ). Best delivered as a per-user logon script / Active Setup rather than a one-shot machine script.' -DetectedValue 'FormSuggest PW Ask: ''Setting not found'' for several profile SIDs (some profiles already = ''no'')' -ExpectedValue 'no for every user hive (Qualys regex no$)'
+
+        Add-ResultRow -Category $ICAT -Item ('CID {0} - {1}' -f 30467, 'IE (per-user) - Turn on the auto-complete feature ... (Control Panel\FormSuggest Passwords = 1, i.e. policy-locked)') -Status 'Manual/External Required' `
+            -Details 'PER-USER (HKEY_USERS) setting - not a single machine value. For each loaded hive under HKEY_USERS and for HKU\.DEFAULT (and every profile hive mounted from NTUSER.DAT): New-Item -Force ''<hive>\Software\Policies\Microsoft\Internet Explorer\Control Panel'' ; Set-ItemProperty ... ''FormSuggest Passwords'' ''1'' (REG_SZ). Best delivered as a per-user logon script / Active Setup rather than a one-shot machine script.' -DetectedValue 'FormSuggest Passwords: ''Setting not found'' for several profile SIDs (some profiles already = ''1'')' -ExpectedValue '1 for every user hive (Qualys regex .+:1)'
+    } else {
+        Add-ResultRow -Category '8. ISO Policy Compliance (Qualys PC)' -Item 'All items' -Status 'Skipped (category)' -Details '-SkipIsoPolicy was passed'
+    }
 } catch {
     $fatal = $_.Exception.Message
     Write-GuestLog "FATAL: $fatal" 'ERROR'
@@ -1240,6 +1673,17 @@ function New-RemediationPayload {
 `$SkipBaselineGpoApply   = $(ConvertTo-PsBool $SkipBaselineGpoApply)
 `$SkipExtendedBaseline   = $(ConvertTo-PsBool $SkipExtendedBaseline)
 `$SkipExtendedManualItems = $(ConvertTo-PsBool $SkipExtendedManualItems)
+`$SkipIsoPolicy          = $(ConvertTo-PsBool $SkipIsoPolicy)
+`$SkipIeHardening        = $(ConvertTo-PsBool $SkipIeHardening)
+`$EnableFirewallProfiles = $(ConvertTo-PsBool $EnableFirewallProfiles)
+`$DisableNetbios         = $(ConvertTo-PsBool $DisableNetbios)
+`$SetSmbMinSmb3          = $(ConvertTo-PsBool $SetSmbMinSmb3)
+`$RestrictLocalAcctNetworkLogon = $(ConvertTo-PsBool $RestrictLocalAcctNetworkLogon)
+`$EnableUacHardening     = $(ConvertTo-PsBool $EnableUacHardening)
+`$ApplyAccountPolicy     = $(ConvertTo-PsBool $ApplyAccountPolicy)
+`$EnableServerAsrRules   = $(ConvertTo-PsBool $EnableServerAsrRules)
+`$MinPasswordLength      = $([int]$MinPasswordLength)
+`$AccountLockoutThreshold = $([int]$AccountLockoutThreshold)
 `$CachedLogonsCount      = $([int]$CachedLogonsCount)
 `$WinRmFilterRange       = $winRmFilterLiteral
 `$GuestAccountNewName    = $guestNameLiteral
