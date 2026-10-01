@@ -1,12 +1,12 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Injects evidence photos into an already-generated Infrastructure Weekly Health Check
-    dashboard. Optional and separate on purpose: a month with no photos supplied needs no
-    change to Infrastructure_Weekly_HealthCheck.ps1 at all - just don't run this script.
+    Injects evidence photos into an already-generated Network Weekly Health Check dashboard.
+    Optional and separate on purpose: a month with no photos supplied needs no change to
+    Network_Weekly_HealthCheck.ps1 at all - just don't run this script.
 
 .DESCRIPTION
-    Infrastructure_Weekly_HealthCheck.ps1 tags every IDF Room Issues row in the dashboard HTML
+    Network_Weekly_HealthCheck.ps1 tags every IDF Room Issues row in the dashboard HTML
     with a data-idf-row="<No.>" attribute and an empty evidence cell. This script:
       1. Reads that dashboard HTML.
       2. Walks -PicturesPath, one subfolder per site (subfolder name must match the site name
@@ -26,7 +26,7 @@
     NEVER modifies the source dashboard HTML file or the picture files themselves.
 
 .PARAMETER DashboardPath
-    Path to the dashboard .html file produced by Infrastructure_Weekly_HealthCheck.ps1.
+    Path to the dashboard .html file produced by Network_Weekly_HealthCheck.ps1.
 .PARAMETER PicturesPath
     Folder containing one subfolder per site (e.g. Pictures\SixFlags\10-1.jpg). Defaults to a
     "Pictures" folder next to this script.
@@ -35,7 +35,7 @@
     "-WithPhotos" inserted before the .html extension, in the same folder.
 
 .EXAMPLE
-    .\Infrastructure_Evidence_Photos.ps1 -DashboardPath "C:\...\Infrastructure_HealthCheck_Dashboard_2026-10-01.html" -PicturesPath "C:\...\Pictures"
+    .\Network_Evidence_Photos.ps1 -DashboardPath "C:\...\Network_HealthCheck_Dashboard_2026-10-01.html" -PicturesPath "C:\...\Pictures"
 #>
 
 [CmdletBinding()]
@@ -93,7 +93,7 @@ function ConvertTo-ImgTagsHtml {
     return ($tags -join ' ')
 }
 
-Write-Host "Infrastructure_Evidence_Photos.ps1" -ForegroundColor Magenta
+Write-Host "Network_Evidence_Photos.ps1" -ForegroundColor Magenta
 $html = Get-Content -Path $DashboardPath -Raw
 
 $siteFolders = Get-ChildItem -Path $PicturesPath -Directory -ErrorAction SilentlyContinue
