@@ -134,7 +134,7 @@ foreach ($siteFolder in $siteFolders) {
     foreach ($rowNum in $dashboardRows) {
         if ($rowPhotoMap.ContainsKey($rowNum)) {
             $imgHtml = ConvertTo-ImgTagsHtml -Photos $rowPhotoMap[$rowNum]
-            $rowPattern = '(?s)(<tr data-idf-row="' + [regex]::Escape($rowNum) + '"[^>]*>.*?<td class="idf-evidence-cell">)(</td>\s*</tr>)'
+            $rowPattern = '(?s)(<div class="idf-issue-card" data-idf-row="' + [regex]::Escape($rowNum) + '"[^>]*>.*?<div class="idf-evidence-cell">)(</div>)'
             $newSectionBody = [regex]::Replace($sectionBody, $rowPattern, { param($m) $m.Groups[1].Value + $imgHtml + $m.Groups[2].Value }, 1)
             if ($newSectionBody -eq $sectionBody) {
                 Write-Warning "Row $rowNum - found photo(s) but could not locate its table row in the HTML (unexpected)."

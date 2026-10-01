@@ -486,23 +486,21 @@ function Get-SiteDashboardSummary {
 
     $CritCount = @($SiteFindings | Where-Object { $_.Status -eq 'Critical' }).Count
     $WarnCount = @($SiteFindings | Where-Object { $_.Status -eq 'Warning' }).Count
-    $OverallHealth = if ($CritCount -gt 0) { 'Critical' } elseif ($WarnCount -gt 0) { 'Warning' } else { 'Healthy' }
 
     # --- IDF issues (exceptions list - grouped back up by source row) ---
     $idfFindings = @($SiteFindings | Where-Object { $_.Area -eq 'IDF' })
     $idfIssueRows = @($idfFindings | Group-Object RowNum | ForEach-Object {
         $grp = $_.Group
         $first = $grp[0]
-        $locText = ($grp | ForEach-Object {
+        $locList = @($grp | ForEach-Object {
             if ($_.Object -eq '(unspecified location)') { $null }
             elseif ($_.Group) { "$($_.Group): $($_.Object)" }
             else { $_.Object }
-        } | Where-Object { $_ }) -join '; '
-        if (-not $locText) { $locText = '(no location specified)' }
+        } | Where-Object { $_ })
         [pscustomobject]@{
             RowNum    = $first.RowNum
             Issue     = $first.Item
-            Locations = $locText
+            Locations = $locList
             Notes     = $first.Notes
         }
     } | Sort-Object { [int]($_.RowNum -replace '\D','0') })
@@ -513,9 +511,14 @@ function Get-SiteDashboardSummary {
     $rackHealthFindings = @($SiteFindings | Where-Object { $_.Area -eq 'Rack' -and $_.Item -eq 'Rack Health' })
     $rackRowsUnsorted = @(foreach ($rf in $rackHealthFindings) {
         $p = $rf.Value -split '\|'
+        $rackYesN = 0; $rackNoN = 0; $nodeYesN = 0; $nodeNoN = 0
+        [int]::TryParse("$($p[1])", [ref]$rackYesN) | Out-Null
+        [int]::TryParse("$($p[2])", [ref]$rackNoN) | Out-Null
+        [int]::TryParse("$($p[3])", [ref]$nodeYesN) | Out-Null
+        [int]::TryParse("$($p[4])", [ref]$nodeNoN) | Out-Null
         [pscustomobject]@{
             Rack = $rf.Group; HealthPct = [double]$p[0]
-            RackYes = $p[1]; RackNo = $p[2]; NodeYes = $p[3]; NodeNo = $p[4]
+            RackYes = $rackYesN; RackNo = $rackNoN; NodeYes = $nodeYesN; NodeNo = $nodeNoN
             Status = $rf.Status; Comments = $rf.Notes
         }
     })
@@ -523,7 +526,18 @@ function Get-SiteDashboardSummary {
     $rackCount = $rackRows.Count
     $rackHealthyCount = @($rackRows | Where-Object { $_.Status -eq 'Healthy' }).Count
     $rackAttentionCount = @($rackRows | Where-Object { $_.Status -ne 'Healthy' }).Count
+    $rackCriticalCount = @($rackRows | Where-Object { $_.Status -eq 'Critical' }).Count
     $avgHealthPct = if ($rackCount -gt 0) { ($rackRows | Measure-Object -Property HealthPct -Average).Average } else { $null }
+
+    # A couple of bad racks out of what can be 15-20 per site shouldn't flip the WHOLE site to a
+    # red "Critical" badge - that collapsed "Healthy Sites" to 0 even when the overwhelming
+    # majority of racks were fine. Critical is reserved for sites where the problem is actually
+    # widespread (more than a quarter of racks Critical, or the site-wide average itself is
+    # poor); an isolated issue or two still shows as Warning, fully itemized in Action Plan.
+    $criticalRackFraction = if ($rackCount -gt 0) { $rackCriticalCount / $rackCount } else { 0 }
+    $OverallHealth = if (($avgHealthPct -ne $null -and $avgHealthPct -lt 70) -or $criticalRackFraction -gt 0.25) { 'Critical' }
+        elseif ($CritCount -gt 0 -or $WarnCount -gt 0) { 'Warning' }
+        else { 'Healthy' }
 
     # --- Action plan: every Rack/Node item needing attention (IDF issues get their own panel
     # instead, and the per-rack Health rollup is already shown in the Rack Health panel). ---
@@ -634,39 +648,65 @@ function Write-DashboardHtml {
         $slug = ConvertTo-Slug $s.Site
         $color = $healthColor[$s.OverallHealth]
 
-        # Each row carries a data-idf-row attribute so Network_Evidence_Photos.ps1 (a separate,
+        # Each card carries a data-idf-row attribute so Network_Evidence_Photos.ps1 (a separate,
         # optional script) can find the right insertion point when photos are supplied for a
         # given month - this script itself never depends on photos existing.
         $idfRows = if ($s.IdfIssueRows.Count -gt 0) {
             ($s.IdfIssueRows | ForEach-Object {
+                $chips = if ($_.Locations.Count -gt 0) {
+                    (($_.Locations | ForEach-Object { "<span class=`"loc-chip`">$(ConvertTo-HtmlSafe $_)</span>" }) -join '')
+                } else { '<span class="loc-chip loc-chip-empty">No location specified</span>' }
 @"
-          <tr data-idf-row="$(ConvertTo-HtmlSafe $_.RowNum)"><td>$(ConvertTo-HtmlSafe $_.RowNum)</td><td>$(ConvertTo-HtmlSafe $_.Issue)</td><td>$(ConvertTo-HtmlSafe $_.Locations)</td>
-            <td class="idf-evidence-cell"></td></tr>
+          <div class="idf-issue-card" data-idf-row="$(ConvertTo-HtmlSafe $_.RowNum)">
+            <div class="issue-no">$(ConvertTo-HtmlSafe $_.RowNum)</div>
+            <div class="issue-body">
+              <div class="issue-title">$(ConvertTo-HtmlSafe $_.Issue)</div>
+              <div class="loc-chips">$chips</div>
+$(if ($_.Notes) { "              <div class=`"issue-notes`">$(ConvertTo-HtmlSafe $_.Notes)</div>" })
+              <div class="idf-evidence-cell"></div>
+            </div>
+          </div>
 "@
             }) -join "`n"
-        } else { "<tr><td colspan='4' style='color:#999'>No IDF issues reported</td></tr>" }
+        } else { '<div class="center-callout">' + (Get-StatusPillHtml -Status 'Healthy' -Text 'No IDF issues reported for this site') + '</div>' }
 
-        $rackRows = if ($s.RackRows.Count -gt 0) {
+        $rackCards = if ($s.RackRows.Count -gt 0) {
             ($s.RackRows | ForEach-Object {
+                $rackTotal = $_.RackYes + $_.RackNo
+                $nodeTotal = $_.NodeYes + $_.NodeNo
+                $trackColor = switch ($_.Status) { 'Critical' { '#fdecea' }; 'Warning' { '#fff6e0' }; default { '#e8f5e9' } }
 @"
-          <tr><td>$(ConvertTo-HtmlSafe $_.Rack)</td>
-            <td><div class="mini-bar-wrap"><div class="mini-bar-track"><div class="mini-bar-fill" style="width:$($_.HealthPct)%;background:$(Get-PctBarColor $_.HealthPct)"></div></div><span>$("{0:N1}" -f $_.HealthPct)%</span></div></td>
-            <td>$(Get-StatusPillHtml -Status $_.Status -Text $_.Status)</td></tr>
+          <div class="rack-card">
+            <div class="rack-id"><span>$(ConvertTo-HtmlSafe $_.Rack)</span>$(Get-StatusPillHtml -Status $_.Status -Text $_.Status)</div>
+            <div class="meter-track" style="background:$trackColor"><div class="meter-fill" style="width:$($_.HealthPct)%;background:$(Get-PctBarColor $_.HealthPct)"></div></div>
+            <div class="rack-health-pct">$("{0:N1}" -f $_.HealthPct)% health</div>
+            <div class="rack-stats">
+              <span>Rack checks: <strong>$($_.RackYes)/$rackTotal</strong></span>
+              <span>Device checks: <strong>$($_.NodeYes)/$nodeTotal</strong></span>
+            </div>
+$(if ($_.Comments) { "            <div class=`"rack-comment`">$(ConvertTo-HtmlSafe $_.Comments)</div>" })
+          </div>
 "@
             }) -join "`n"
-        } else { "<tr><td colspan='3' style='color:#999'>No rack data found</td></tr>" }
+        } else { '<div class="center-callout">' + (Get-StatusPillHtml -Status 'Information' -Text 'No rack data found for this site') + '</div>' }
 
         $actionRows = if ($s.ActionItems.Count -gt 0) {
             ($s.ActionItems | ForEach-Object {
                 $sevClass = if ($_.Severity -eq 'High') { 'high' } else { 'med' }
-                $subtitle = if ($_.Notes) { "$($_.Group) / $($_.Object) - $($_.Notes)" } else { "$($_.Group) / $($_.Object)" }
+                $location = if ($_.Group -and $_.Group -ne $_.Object) { "$($_.Group) / $($_.Object)" } else { "$($_.Object)" }
 @"
-        <li><span class="sev $sevClass">$($_.Severity)</span><div class="txt"><strong>$(ConvertTo-HtmlSafe $_.Item): $(ConvertTo-HtmlSafe $_.Value)</strong><span>$(ConvertTo-HtmlSafe $subtitle)</span></div></li>
+          <div class="action-card $sevClass">
+            <span class="sev-badge $sevClass">$($_.Severity)</span>
+            <div class="ac-body">
+              <div class="ac-title">$(ConvertTo-HtmlSafe $_.Item): $(ConvertTo-HtmlSafe $_.Value)</div>
+              <div class="ac-sub">$(ConvertTo-HtmlSafe $location)$(if ($_.Notes) { " - $(ConvertTo-HtmlSafe $_.Notes)" })</div>
+            </div>
+          </div>
 "@
             }) -join "`n"
         } else { $null }
         $actionPlanBody = if ($actionRows) {
-            "<ul class=`"action-list`">`n$actionRows`n</ul>"
+            "<div class=`"action-grid`">`n$actionRows`n</div>"
         } else {
             "<div class=`"center-callout`">$(Get-StatusPillHtml -Status 'Healthy' -Text 'No Rack/Node items flagged for this site')</div>"
         }
@@ -698,25 +738,15 @@ function Write-DashboardHtml {
         <div class="panel-grid">
           <div class="panel panel-full" style="border-top-color:$tilePurple">
             <h3><span class="n" style="background:$tilePurple">&#127968;</span>IDF Room Issues <span style="font-weight:normal;font-size:14px;color:#999">($($s.IdfIssueCount) reported)</span></h3>
-            <div class="scroll-box">
-              <table class="metrics wide">
-                <thead><tr><th>No.</th><th>Issue</th><th>Affected Location(s)</th><th>Evidence</th></tr></thead>
-                <tbody>
+            <div class="idf-issue-list">
 $idfRows
-                </tbody>
-              </table>
             </div>
           </div>
 
           <div class="panel panel-full" style="border-top-color:$tileTeal">
             <h3><span class="n" style="background:$tileTeal">&#128451;&#65039;</span>Rack Health <span style="font-weight:normal;font-size:14px;color:#999">($($s.RackCount) racks)</span></h3>
-            <div class="scroll-box">
-              <table class="metrics wide">
-                <thead><tr><th>Rack</th><th>Health %</th><th>Status</th></tr></thead>
-                <tbody>
-$rackRows
-                </tbody>
-              </table>
+            <div class="rack-grid">
+$rackCards
             </div>
           </div>
 
@@ -798,24 +828,43 @@ $actionPlanBody
   table.metrics.wide td { text-align:center; }
   table.metrics.wide td:first-child { text-align:left; color:#333; font-weight:600; width:auto; }
   table.metrics.wide td:last-child:not(:first-child) { text-align:center; font-weight:normal; }
-  .scroll-box { max-height:340px; overflow-y:auto; border:1px solid #f0f0f0; border-radius:6px; }
-  .scroll-box table.metrics.wide { font-size:15px; }
-  .scroll-box thead th { position:sticky; top:0; background:#fff; }
   .panel-full { grid-column: 1 / -1; }
-  .mini-bar-wrap { display:flex; align-items:center; gap:8px; justify-content:center; }
-  .mini-bar-track { width:60px; height:8px; background:#eef1f4; border-radius:4px; overflow:hidden; flex-shrink:0; }
-  .mini-bar-fill { height:100%; border-radius:4px; }
-  .action-list { list-style:none; margin:0; padding:0; }
-  .action-list li { display:flex; gap:14px; padding:14px 0; border-bottom:1px solid #eee; align-items:flex-start; }
-  .action-list li:last-child { border-bottom:none; }
-  .action-list .sev { flex-shrink:0; padding:4px 12px; border-radius:6px; font-size:12px; font-weight:bold; white-space:nowrap; margin-top:2px; }
-  .action-list .sev.high { background:#fdecea; color:#c62828; }
-  .action-list .sev.med { background:#fff6e0; color:#8a6100; }
-  .action-list .txt strong { display:block; font-size:15px; color:#1a1a1a; }
-  .action-list .txt span { font-size:14px; color:#666; }
   .summary-text { color:#444; font-size:15px; line-height:1.6; }
   .center-callout { text-align:center; padding:8px 0 18px; }
+
+  /* IDF Room Issues - one card per reported issue */
+  .idf-issue-list { display:flex; flex-direction:column; gap:12px; }
+  .idf-issue-card { display:flex; gap:16px; padding:16px 18px; border-radius:8px; background:#fff; border-left:5px solid #e6a100; box-shadow:0 1px 3px rgba(0,0,0,0.08); }
+  .idf-issue-card .issue-no { flex-shrink:0; width:34px; height:34px; border-radius:50%; background:#e6a100; color:#fff; display:flex; align-items:center; justify-content:center; font-weight:bold; font-size:14px; }
+  .idf-issue-card .issue-body { flex:1; min-width:0; }
+  .idf-issue-card .issue-title { font-weight:bold; font-size:15px; color:#1a1a1a; margin-bottom:8px; }
+  .idf-issue-card .issue-notes { font-size:13px; color:#8a6100; margin-top:6px; font-style:italic; }
+  .loc-chips { display:flex; flex-wrap:wrap; gap:6px; }
+  .loc-chip { display:inline-block; background:#eef2f5; color:#444; font-size:12px; font-weight:600; padding:4px 11px; border-radius:12px; }
+  .loc-chip-empty { background:#f5f5f5; color:#999; font-weight:normal; font-style:italic; }
+  .idf-evidence-cell:empty { display:none; }
+  .idf-evidence-cell { margin-top:10px; display:flex; gap:8px; flex-wrap:wrap; }
   .idf-evidence-cell img { max-width:90px; max-height:90px; border-radius:4px; box-shadow:0 1px 3px rgba(0,0,0,0.3); cursor:zoom-in; }
+
+  /* Rack Health - one card per rack */
+  .rack-grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap:14px; }
+  .rack-card { background:#fff; border:1px solid #eee; border-radius:8px; padding:16px 18px; box-shadow:0 1px 3px rgba(0,0,0,0.06); }
+  .rack-card .rack-id { display:flex; justify-content:space-between; align-items:center; font-weight:bold; font-size:17px; color:#1a1a1a; margin-bottom:10px; }
+  .rack-card .meter-track { height:9px; border-radius:5px; overflow:hidden; margin-bottom:6px; }
+  .rack-card .meter-fill { height:100%; border-radius:5px; }
+  .rack-card .rack-health-pct { font-size:13px; color:#666; font-weight:600; margin-bottom:10px; }
+  .rack-card .rack-stats { font-size:12.5px; color:#555; display:flex; flex-direction:column; gap:4px; padding-top:10px; border-top:1px solid #f0f0f0; }
+  .rack-card .rack-comment { font-size:12.5px; color:#8a6100; margin-top:10px; font-style:italic; }
+
+  /* Action Plan - one card per item */
+  .action-grid { display:flex; flex-direction:column; gap:12px; }
+  .action-card { display:flex; gap:14px; padding:16px 18px; border-radius:8px; background:#fff; border:1px solid #eee; border-left:5px solid #c62828; box-shadow:0 1px 3px rgba(0,0,0,0.08); align-items:flex-start; }
+  .action-card.med { border-left-color:#e6a100; }
+  .action-card .sev-badge { flex-shrink:0; padding:5px 12px; border-radius:6px; font-size:12px; font-weight:bold; white-space:nowrap; background:#fdecea; color:#c62828; }
+  .action-card .sev-badge.med { background:#fff6e0; color:#8a6100; }
+  .action-card .ac-body { flex:1; min-width:0; }
+  .action-card .ac-title { font-weight:bold; font-size:15px; color:#1a1a1a; margin-bottom:4px; }
+  .action-card .ac-sub { font-size:13.5px; color:#666; }
 </style>
 </head>
 <body>
