@@ -993,6 +993,9 @@ $actionPlanBody
   .evidence-photos { display:none; gap:6px; flex-wrap:wrap; margin-top:8px; }
   .evidence-photos.show { display:flex; }
   .evidence-photos img { max-width:70px; max-height:70px; border-radius:4px; box-shadow:0 1px 3px rgba(0,0,0,0.3); cursor:zoom-in; }
+  .lightbox-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.85); z-index:1000; align-items:center; justify-content:center; padding:30px; box-sizing:border-box; cursor:zoom-out; }
+  .lightbox-overlay.show { display:flex; }
+  .lightbox-overlay img { max-width:100%; max-height:100%; border-radius:6px; box-shadow:0 4px 24px rgba(0,0,0,0.5); }
 
   /* No-data placeholder page (template site with no workbook paths supplied yet) */
   .nodata-panel { text-align:center; padding:48px 24px; }
@@ -1050,6 +1053,10 @@ $overviewCards
 
 $sitePages
 
+<div class="lightbox-overlay" id="lightbox" onclick="closeLightbox()">
+  <img id="lightbox-img" src="" alt="Evidence photo full size">
+</div>
+
 <script>
 function showPage(slug) {
   document.querySelectorAll('.page').forEach(function(el){ el.classList.remove('active'); });
@@ -1063,6 +1070,14 @@ function showPage(slug) {
 function toggleEvidence(id) {
   var el = document.getElementById(id);
   if (el) { el.classList.toggle('show'); }
+}
+function openLightbox(src) {
+  document.getElementById('lightbox-img').src = src;
+  document.getElementById('lightbox').classList.add('show');
+}
+function closeLightbox() {
+  document.getElementById('lightbox').classList.remove('show');
+  document.getElementById('lightbox-img').src = '';
 }
 </script>
 </body>

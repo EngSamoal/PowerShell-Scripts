@@ -99,7 +99,7 @@ function ConvertTo-EvidenceHtml {
         $bytes = [System.IO.File]::ReadAllBytes($p.Path)
         $b64 = [System.Convert]::ToBase64String($bytes)
         $dataUri = "data:$mime;base64,$b64"
-        "<a href=`"$dataUri`" target=`"_blank`"><img src=`"$dataUri`" alt=`"Evidence photo`"></a>"
+        "<img src=`"$dataUri`" alt=`"Evidence photo`" onclick=`"openLightbox(this.src)`">"
     }
     $imgHtml = $imgTags -join ' '
     $label = if ($Photos.Count -eq 1) { '1 photo' } else { "$($Photos.Count) photos" }
