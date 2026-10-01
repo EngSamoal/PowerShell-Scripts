@@ -690,7 +690,6 @@ function Write-DashboardHtml {
     $racksNoteHtml     = Get-SiteBreakdownNoteHtml -Property RackCount
 
     $tabPalette = @('#2C5577','#3F6652','#6B3F42','#5B4B77','#7A5C3E','#45586B','#3E6B6B','#5A5240')
-    $tabNoDataColor = '#9aa0a6'
     $tileBlue = '#1565C0'; $tilePurple = '#6A1B9A'; $tileTeal = '#00897B'; $tileIndigo = '#283593'
 
     function Get-StatusPillHtml {
@@ -739,7 +738,7 @@ function Write-DashboardHtml {
     $siteTabButtons = $(for ($i = 0; $i -lt $summaries.Count; $i++) {
         $s = $summaries[$i]
         $slug = ConvertTo-Slug $s.Site
-        $tabColor = if ($s.HasData) { $tabPalette[$i % $tabPalette.Count] } else { $tabNoDataColor }
+        $tabColor = $tabPalette[$i % $tabPalette.Count]
         "<button class=`"tab`" id=`"tab-$slug`" onclick=`"showPage('$slug')`" style=`"background:$tabColor`">$(ConvertTo-HtmlSafe $s.Site)</button>"
     }) -join "`n    "
     $tabButtons = @($overviewTabButton, $siteTabButtons) -join "`n    "
