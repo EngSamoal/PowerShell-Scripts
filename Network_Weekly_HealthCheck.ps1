@@ -911,7 +911,7 @@ $actionPlanBody
   .dashboard-header { width:100%; text-align:left; background:#1E3A5F; border-radius:10px; padding:26px 32px; margin:24px 0 0; box-sizing:border-box; }
   .dashboard-header h1 { color:#fff; font-size:36px; }
   .dashboard-header .subtitle { color:rgba(255,255,255,0.8); margin:8px 0 0; font-size:16px; }
-  .overview-box { display:flex; justify-content:flex-start; width:100%; text-align:left; margin-top:16px; font-size:30px; padding:20px 32px; min-height:0; box-sizing:border-box; }
+  .overview-box { display:flex; justify-content:center; align-items:center; width:100%; text-align:center; margin-top:16px; font-size:52px; letter-spacing:1px; padding:34px 32px; min-height:0; box-sizing:border-box; }
   .tabs { display:grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap:20px; padding:24px 0 20px; position:sticky; top:0; background:#eef1f5; z-index:10; border-bottom:1px solid #dfe3e8; margin-bottom:32px; }
   .page { display:none; }
   .page.active { display:block; }
