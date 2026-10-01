@@ -734,14 +734,12 @@ function Write-DashboardHtml {
 "@
     }) -join "`n"
 
-    $overviewTabButton = '<button class="tab overview-tab active" id="tab-overview" onclick="showPage(''overview'')">Overview</button>'
     $siteTabButtons = $(for ($i = 0; $i -lt $summaries.Count; $i++) {
         $s = $summaries[$i]
         $slug = ConvertTo-Slug $s.Site
         $tabColor = $tabPalette[$i % $tabPalette.Count]
         "<button class=`"tab`" id=`"tab-$slug`" onclick=`"showPage('$slug')`" style=`"background:$tabColor`">$(ConvertTo-HtmlSafe $s.Site)</button>"
     }) -join "`n    "
-    $tabButtons = @($overviewTabButton, $siteTabButtons) -join "`n    "
 
     # --- Per-site pages ---
     $sitePages = ($summaries | ForEach-Object {
@@ -908,13 +906,12 @@ $actionPlanBody
   body { font-family: Calibri, Arial, sans-serif; background:#eef1f5; color:#1a1a1a; margin:0; padding:0 32px 32px; font-size:16px; line-height:1.4; }
   h1 { color:#1E3A5F; margin:0; font-size:36px; }
   .subtitle { color:#555; margin:6px 0 20px; font-size:16px; }
-  .dashboard-header { background:#1E3A5F; border-radius:10px; padding:26px 32px; margin:24px 0 0; box-shadow:0 1px 4px rgba(0,0,0,0.2); }
-  .dashboard-header h1 { color:#fff; }
-  .dashboard-header .subtitle { color:rgba(255,255,255,0.8); margin:8px 0 0; }
-  .tabs { display:grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap:20px; padding:24px 0 20px; position:sticky; top:0; background:#eef1f5; z-index:10; border-bottom:1px solid #dfe3e8; margin-bottom:32px; }
   .tab { display:flex; align-items:center; justify-content:center; text-align:center; cursor:pointer; border:3px solid transparent; border-radius:10px; padding:28px 16px; font-family:inherit; font-weight:bold; font-size:18px; color:#fff; background:#1E3A5F; box-shadow:0 1px 4px rgba(0,0,0,0.2); min-height:90px; box-sizing:border-box; }
-  .tab.overview-tab { background:#1E3A5F; }
   .tab.active { border-color:#1a1a1a; box-shadow:0 0 0 3px rgba(0,0,0,0.15), 0 1px 4px rgba(0,0,0,0.2); }
+  .dashboard-header { display:block; width:100%; text-align:left; background:#1E3A5F; border-radius:10px; padding:26px 32px; margin:24px 0 0; min-height:0; }
+  .dashboard-header h1 { color:#fff; font-size:36px; }
+  .dashboard-header .subtitle { color:rgba(255,255,255,0.8); margin:8px 0 0; font-size:16px; }
+  .tabs { display:grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap:20px; padding:24px 0 20px; position:sticky; top:0; background:#eef1f5; z-index:10; border-bottom:1px solid #dfe3e8; margin-bottom:32px; }
   .page { display:none; }
   .page.active { display:block; }
 
@@ -1024,13 +1021,13 @@ $actionPlanBody
 </style>
 </head>
 <body>
-  <div class="dashboard-header">
+  <button type="button" class="tab dashboard-header active" id="tab-overview" onclick="showPage('overview')">
     <h1>Network Weekly Health Check - Dashboard</h1>
     <p class="subtitle">Generated $(ConvertTo-HtmlSafe $RunDateDisplay) - $($summaries.Count) site(s)</p>
-  </div>
+  </button>
 
   <nav class="tabs">
-    $tabButtons
+    $siteTabButtons
   </nav>
 
   <section class="page active" id="page-overview">
