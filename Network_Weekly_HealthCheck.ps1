@@ -757,6 +757,11 @@ $(if ($_.Notes) { "            <div class=`"ac-notes`">$(ConvertTo-HtmlSafe $_.N
         </div>
 
         <div class="panel-grid">
+          <div class="panel panel-full" style="border-top-color:#1E3A5F">
+            <h3><span class="n" style="background:#1E3A5F">&#128203;</span>Summary</h3>
+            <p class="summary-text">$(ConvertTo-HtmlSafe $s.SummaryText)</p>
+          </div>
+
           <div class="panel panel-full" style="border-top-color:$tilePurple">
             <h3><span class="n" style="background:$tilePurple">&#127968;</span>IDF Room Issues <span style="font-weight:normal;font-size:14px;color:#999">($($s.IdfIssueCount) reported)</span></h3>
 $idfLocationBars
@@ -770,11 +775,6 @@ $idfRows
             <div class="rack-grid">
 $rackCards
             </div>
-          </div>
-
-          <div class="panel panel-full" style="border-top-color:#1E3A5F">
-            <h3><span class="n" style="background:#1E3A5F">&#128203;</span>Summary</h3>
-            <p class="summary-text">$(ConvertTo-HtmlSafe $s.SummaryText)</p>
           </div>
         </div>
 
@@ -863,13 +863,13 @@ $actionPlanBody
   .loc-bar-track { flex:1; height:10px; background:#eef1f4; border-radius:5px; overflow:hidden; }
   .loc-bar-fill { height:100%; border-radius:5px; background:#6A1B9A; }
   .loc-bar-count { flex:0 0 20px; font-size:12.5px; font-weight:bold; color:#666; }
-  .idf-issue-list { display:grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap:12px; align-items:start; }
-  .idf-issue-card { padding:12px 14px; border-radius:8px; background:#fff; border-left:4px solid #e6a100; box-shadow:0 1px 3px rgba(0,0,0,0.08); }
+  .idf-issue-list { display:grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap:12px; }
+  .idf-issue-card { padding:12px 14px; border-radius:8px; background:#fff; border-left:4px solid #e6a100; box-shadow:0 1px 3px rgba(0,0,0,0.08); display:flex; flex-direction:column; }
   .idf-issue-card .issue-head { display:flex; align-items:center; gap:8px; margin-bottom:8px; }
   .idf-issue-card .issue-no { flex-shrink:0; width:22px; height:22px; border-radius:50%; background:#e6a100; color:#fff; display:flex; align-items:center; justify-content:center; font-weight:bold; font-size:11px; }
   .idf-issue-card .issue-title { font-weight:bold; font-size:13.5px; color:#1a1a1a; line-height:1.3; }
   .idf-issue-card .issue-notes { font-size:12px; color:#8a6100; margin-top:7px; font-style:italic; }
-  .loc-chips { display:flex; flex-wrap:wrap; gap:5px; }
+  .loc-chips { display:flex; flex-wrap:wrap; gap:5px; align-content:flex-start; }
   .loc-chip { display:inline-block; background:#eef2f5; color:#444; font-size:11px; font-weight:600; padding:3px 9px; border-radius:11px; }
   .loc-chip-empty { background:#f5f5f5; color:#999; font-weight:normal; font-style:italic; }
   .idf-evidence-cell:empty { display:none; }
@@ -887,8 +887,8 @@ $actionPlanBody
   .rack-card .rack-comment { font-size:12.5px; color:#8a6100; margin-top:10px; font-style:italic; }
 
   /* Action Plan - one card per item, adjacent boxes like Rack Health */
-  .action-grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap:14px; align-items:start; }
-  .action-card { padding:14px 16px; border-radius:8px; background:#fff; border:1px solid #eee; border-left:5px solid #c62828; box-shadow:0 1px 3px rgba(0,0,0,0.08); }
+  .action-grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap:14px; }
+  .action-card { padding:14px 16px; border-radius:8px; background:#fff; border:1px solid #eee; border-left:5px solid #c62828; box-shadow:0 1px 3px rgba(0,0,0,0.08); display:flex; flex-direction:column; }
   .action-card.med { border-left-color:#e6a100; }
   .action-card .ac-head { margin-bottom:8px; }
   .action-card .sev-badge { padding:4px 11px; border-radius:6px; font-size:11.5px; font-weight:bold; white-space:nowrap; background:#fdecea; color:#c62828; }
