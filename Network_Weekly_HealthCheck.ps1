@@ -45,14 +45,35 @@
 
     NEVER writes/modifies the source workbooks - opened read-only, closed without saving.
 
+    This dashboard template covers 6 sites (AquaArabia, SixFlags, SceneCinema, SEVEN Tabuk,
+    SEVEN ABHA, SEVEN Alhamra) so it's ready to use as each site's data becomes available - a
+    site runs with no workbook paths supplied at all still gets its own tab and page, showing
+    "No data available yet" instead of being silently left out.
+
 .PARAMETER AquaArabiaIdfPath
-    Path to AquaArabia's IDF Room Report workbook. Omit to skip AquaArabia's IDF section.
+    Path to AquaArabia's IDF Room Report workbook. Omit to leave AquaArabia's IDF section empty.
 .PARAMETER AquaArabiaRackPath
-    Path to AquaArabia's DC RackWise Health Check workbook. Omit to skip AquaArabia's rack section.
+    Path to AquaArabia's DC RackWise Health Check workbook. Omit to leave AquaArabia's rack section empty.
 .PARAMETER SixFlagsIdfPath
-    Path to SixFlags' IDF Room Report workbook. Omit to skip SixFlags' IDF section.
+    Path to SixFlags' IDF Room Report workbook. Omit to leave SixFlags' IDF section empty.
 .PARAMETER SixFlagsRackPath
-    Path to SixFlags' DC RackWise Health Check workbook. Omit to skip SixFlags' rack section.
+    Path to SixFlags' DC RackWise Health Check workbook. Omit to leave SixFlags' rack section empty.
+.PARAMETER SceneCinemaIdfPath
+    Path to SceneCinema's IDF Room Report workbook. Omit while this site's data isn't available yet.
+.PARAMETER SceneCinemaRackPath
+    Path to SceneCinema's DC RackWise Health Check workbook. Omit while this site's data isn't available yet.
+.PARAMETER SevenTabukIdfPath
+    Path to SEVEN Tabuk's IDF Room Report workbook. Omit while this site's data isn't available yet.
+.PARAMETER SevenTabukRackPath
+    Path to SEVEN Tabuk's DC RackWise Health Check workbook. Omit while this site's data isn't available yet.
+.PARAMETER SevenAbhaIdfPath
+    Path to SEVEN ABHA's IDF Room Report workbook. Omit while this site's data isn't available yet.
+.PARAMETER SevenAbhaRackPath
+    Path to SEVEN ABHA's DC RackWise Health Check workbook. Omit while this site's data isn't available yet.
+.PARAMETER SevenAlhamraIdfPath
+    Path to SEVEN Alhamra's IDF Room Report workbook. Omit while this site's data isn't available yet.
+.PARAMETER SevenAlhamraRackPath
+    Path to SEVEN Alhamra's DC RackWise Health Check workbook. Omit while this site's data isn't available yet.
 .PARAMETER OutputPath
     Folder the dashboard + log are written to.
 #>
@@ -63,6 +84,14 @@ param(
     [string]$AquaArabiaRackPath = '',
     [string]$SixFlagsIdfPath = '',
     [string]$SixFlagsRackPath = '',
+    [string]$SceneCinemaIdfPath = '',
+    [string]$SceneCinemaRackPath = '',
+    [string]$SevenTabukIdfPath = '',
+    [string]$SevenTabukRackPath = '',
+    [string]$SevenAbhaIdfPath = '',
+    [string]$SevenAbhaRackPath = '',
+    [string]$SevenAlhamraIdfPath = '',
+    [string]$SevenAlhamraRackPath = '',
 
     [string]$OutputPath = (Join-Path $PSScriptRoot "Network_HealthCheck_Reports")
 )
@@ -439,8 +468,12 @@ function Read-RackWorkbook {
 # 4. RUN COLLECTION
 # ============================================================================
 $Sites = @(
-    [pscustomobject]@{ Site = 'AquaArabia'; IdfPath = $AquaArabiaIdfPath; RackPath = $AquaArabiaRackPath }
-    [pscustomobject]@{ Site = 'SixFlags';   IdfPath = $SixFlagsIdfPath;   RackPath = $SixFlagsRackPath }
+    [pscustomobject]@{ Site = 'AquaArabia';    IdfPath = $AquaArabiaIdfPath;    RackPath = $AquaArabiaRackPath }
+    [pscustomobject]@{ Site = 'SixFlags';      IdfPath = $SixFlagsIdfPath;      RackPath = $SixFlagsRackPath }
+    [pscustomobject]@{ Site = 'SceneCinema';   IdfPath = $SceneCinemaIdfPath;   RackPath = $SceneCinemaRackPath }
+    [pscustomobject]@{ Site = 'SEVEN Tabuk';   IdfPath = $SevenTabukIdfPath;    RackPath = $SevenTabukRackPath }
+    [pscustomobject]@{ Site = 'SEVEN ABHA';    IdfPath = $SevenAbhaIdfPath;     RackPath = $SevenAbhaRackPath }
+    [pscustomobject]@{ Site = 'SEVEN Alhamra'; IdfPath = $SevenAlhamraIdfPath;  RackPath = $SevenAlhamraRackPath }
 )
 
 $Excel = $null
@@ -482,7 +515,28 @@ function ConvertTo-Slug {
 function Get-SiteDashboardSummary {
     param([string]$SiteLabel)
     $SiteFindings = $Global:AllResults | Where-Object { $_.Site -eq $SiteLabel }
-    if (-not $SiteFindings) { return $null }
+    if (-not $SiteFindings) {
+        # No workbook paths were supplied for this site yet - still returns a summary (so it
+        # gets its own tab/page in the template) rather than being silently left out.
+        return [pscustomobject]@{
+            Site               = $SiteLabel
+            HasData            = $false
+            OverallHealth      = 'NoData'
+            HighRisk           = 0
+            MediumRisk         = 0
+            IdfIssueCount      = 0
+            IdfLocationCount   = 0
+            IdfIssueRows       = @()
+            IdfLocationCounts  = @()
+            RackCount          = 0
+            RackHealthyCount   = 0
+            RackAttentionCount = 0
+            AvgHealthPct       = $null
+            RackRows           = @()
+            ActionItems        = @()
+            SummaryText        = ''
+        }
+    }
 
     $CritCount = @($SiteFindings | Where-Object { $_.Status -eq 'Critical' }).Count
     $WarnCount = @($SiteFindings | Where-Object { $_.Status -eq 'Warning' }).Count
@@ -506,10 +560,10 @@ function Get-SiteDashboardSummary {
     } | Sort-Object { [int]($_.RowNum -replace '\D','0') })
     $idfIssueCount = $idfIssueRows.Count
     $idfLocationCount = @($idfFindings | Where-Object { $_.Object -ne '(unspecified location)' } | Select-Object -ExpandProperty Object -Unique).Count
-    # Most-affected locations, for a compact "where are the problems" visualization at the top
-    # of the IDF Room Issues panel - cheaper to scan than reading every individual issue card.
+    # Every affected location, for a compact "where are the problems" uniform-box grid at the
+    # top of the IDF Room Issues panel - cheaper to scan than reading every individual issue card.
     $idfLocationCounts = @($idfFindings | Where-Object { $_.Object -ne '(unspecified location)' } |
-        Group-Object Object | Sort-Object Count -Descending | Select-Object -First 8 |
+        Group-Object Object | Sort-Object @{Expression='Count';Descending=$true}, Name |
         ForEach-Object { [pscustomobject]@{ Location = $_.Name; Count = $_.Count } })
 
     # --- Rack rollup ---
@@ -569,6 +623,7 @@ function Get-SiteDashboardSummary {
 
     [pscustomobject]@{
         Site               = $SiteLabel
+        HasData            = $true
         OverallHealth      = $OverallHealth
         HighRisk           = $CritCount
         MediumRisk         = $WarnCount
@@ -589,32 +644,53 @@ function Get-SiteDashboardSummary {
 function Write-DashboardHtml {
     param([string[]]$SiteLabels, [string]$OutputPath, [string]$RunDateDisplay)
 
-    $summaries = @($SiteLabels | ForEach-Object { Get-SiteDashboardSummary -SiteLabel $_ } | Where-Object { $_ } | Sort-Object Site)
+    # No Sort-Object here - site order follows $SiteLabels (AquaArabia, SixFlags, SceneCinema,
+    # SEVEN Tabuk, SEVEN ABHA, SEVEN Alhamra), not alphabetical.
+    $summaries = @($SiteLabels | ForEach-Object { Get-SiteDashboardSummary -SiteLabel $_ })
     if ($summaries.Count -eq 0) { return }
+    $dataSummaries = @($summaries | Where-Object { $_.HasData })
 
-    $healthColor = @{ Healthy = '#2e7d32'; Warning = '#e6a100'; Critical = '#c62828' }
-    $healthLabelText = @{ Healthy = 'Healthy - No Issues Detected'; Warning = 'Healthy - Minor Issues Detected'; Critical = 'Attention Required - Critical Issues' }
-    # Mutually exclusive - each site counts toward exactly one bucket, so these three always sum
-    # to the total number of sites (a site previously could count as both "Healthy" and "Warning"
-    # at once, which didn't add up).
-    $healthCounts = @{
-        Healthy  = @($summaries | Where-Object { $_.OverallHealth -eq 'Healthy' }).Count
-        Warning  = @($summaries | Where-Object { $_.OverallHealth -eq 'Warning' }).Count
-        Critical = @($summaries | Where-Object { $_.OverallHealth -eq 'Critical' }).Count
+    $healthColor = @{ Healthy = '#2e7d32'; Warning = '#e6a100'; Critical = '#c62828'; NoData = '#8a8f98' }
+    $healthLabelText = @{ Healthy = 'Healthy - No Issues Detected'; Warning = 'Healthy - Minor Issues Detected'; Critical = 'Attention Required - Critical Issues'; NoData = 'No Data Available Yet' }
+    # Mutually exclusive, and only counted over sites that actually have data - a site with no
+    # workbook supplied yet is neither Healthy, Warning nor Critical, so it doesn't skew these.
+    $healthyNames  = @($dataSummaries | Where-Object { $_.OverallHealth -eq 'Healthy' }  | Select-Object -ExpandProperty Site)
+    $warningNames  = @($dataSummaries | Where-Object { $_.OverallHealth -eq 'Warning' }  | Select-Object -ExpandProperty Site)
+    $criticalNames = @($dataSummaries | Where-Object { $_.OverallHealth -eq 'Critical' } | Select-Object -ExpandProperty Site)
+    $healthCounts = @{ Healthy = $healthyNames.Count; Warning = $warningNames.Count; Critical = $criticalNames.Count }
+
+    # Small "which site(s) exactly" sub-line under every overview stat tile, so a number is never
+    # left unattributed. For the three site-count tiles that's just the site names; for the sum
+    # tiles it's each contributing site's own number.
+    function Get-SiteListNoteHtml {
+        param([string[]]$Names)
+        if ($Names.Count -eq 0) { return '<div class="stat-note">No sites in this bucket</div>' }
+        return "<div class=`"stat-note`">$(($Names | ForEach-Object { ConvertTo-HtmlSafe $_ }) -join ', ')</div>"
+    }
+    function Get-SiteBreakdownNoteHtml {
+        param([string]$Property)
+        $parts = @($dataSummaries | Where-Object { $_.$Property -gt 0 } | ForEach-Object { "$(ConvertTo-HtmlSafe $_.Site): $($_.$Property)" })
+        if ($parts.Count -eq 0) { return '<div class="stat-note">None reported</div>' }
+        return "<div class=`"stat-note`">$($parts -join ', ')</div>"
     }
     # "Healthy" requires a site to have zero flagged items at all (no IDF issues, every rack/
     # device check passing) - a strict bar that's genuinely rare across 15-20 racks per site in
-    # a real week, so a 0 here isn't a scoring error. Shown directly under the tile when it's 0
-    # so the number doesn't read as unexplained or alarming.
+    # a real week, so a 0 here isn't a scoring error.
     $healthyNoteHtml = if ($healthCounts.Healthy -eq 0) {
         '<div class="stat-note">0 is expected here - "Healthy" requires zero flagged items anywhere; see Warning below for sites with only minor issues</div>'
-    } else { '' }
-    $totalHigh      = ($summaries | Measure-Object -Property HighRisk -Sum).Sum
-    $totalMedium    = ($summaries | Measure-Object -Property MediumRisk -Sum).Sum
-    $totalIdfIssues = ($summaries | Measure-Object -Property IdfIssueCount -Sum).Sum
-    $totalRacks     = ($summaries | Measure-Object -Property RackCount -Sum).Sum
+    } else { Get-SiteListNoteHtml -Names $healthyNames }
+    $warningNoteHtml  = Get-SiteListNoteHtml -Names $warningNames
+    $criticalNoteHtml = Get-SiteListNoteHtml -Names $criticalNames
+    $totalHigh      = ($dataSummaries | Measure-Object -Property HighRisk -Sum).Sum
+    $totalMedium    = ($dataSummaries | Measure-Object -Property MediumRisk -Sum).Sum
+    $totalIdfIssues = ($dataSummaries | Measure-Object -Property IdfIssueCount -Sum).Sum
+    $totalRacks     = ($dataSummaries | Measure-Object -Property RackCount -Sum).Sum
+    $mediumNoteHtml    = Get-SiteBreakdownNoteHtml -Property MediumRisk
+    $idfIssuesNoteHtml = Get-SiteBreakdownNoteHtml -Property IdfIssueCount
+    $racksNoteHtml     = Get-SiteBreakdownNoteHtml -Property RackCount
 
     $tabPalette = @('#2C5577','#3F6652','#6B3F42','#5B4B77','#7A5C3E','#45586B','#3E6B6B','#5A5240')
+    $tabNoDataColor = '#9aa0a6'
     $tileBlue = '#1565C0'; $tilePurple = '#6A1B9A'; $tileTeal = '#00897B'; $tileIndigo = '#283593'
 
     function Get-StatusPillHtml {
@@ -634,11 +710,21 @@ function Write-DashboardHtml {
         $s = $_
         $slug = ConvertTo-Slug $s.Site
         $color = $healthColor[$s.OverallHealth]
+        if (-not $s.HasData) {
+@"
+      <div class="ov-card ov-card-nodata" onclick="showPage('$slug')" style="border-top-color:$color">
+        <div class="ov-head"><h2>$(ConvertTo-HtmlSafe $s.Site)</h2><span class="badge" style="background:$color">$(ConvertTo-HtmlSafe $healthLabelText.NoData)</span></div>
+        <p class="nodata-text">No data available yet</p>
+        <span class="ov-link">View Page &rarr;</span>
+      </div>
+"@
+            return
+        }
         $avgHealthText = if ($s.AvgHealthPct -ne $null) { "{0:N1}%" -f $s.AvgHealthPct } else { 'n/a' }
 @"
       <div class="ov-card" onclick="showPage('$slug')" style="border-top-color:$color">
         <div class="ov-head"><h2>$(ConvertTo-HtmlSafe $s.Site)</h2><span class="badge" style="background:$color">$(ConvertTo-HtmlSafe $healthLabelText[$s.OverallHealth])</span></div>
-        <div class="risk-row"><span class="risk risk-high">High: $($s.HighRisk)</span><span class="risk risk-med">Medium: $($s.MediumRisk)</span></div>
+        <div class="risk-row"><span class="risk risk-high">High Risk: $($s.HighRisk)</span><span class="risk risk-med">Medium Risk: $($s.MediumRisk)</span></div>
         <table class="metrics">
           <tr><td>IDF Issues Reported</td><td>$($s.IdfIssueCount) ($($s.IdfLocationCount) locations)</td></tr>
           <tr><td>Racks (Healthy / Attention)</td><td>$($s.RackCount) ($($s.RackHealthyCount) / $($s.RackAttentionCount))</td></tr>
@@ -653,7 +739,7 @@ function Write-DashboardHtml {
     $siteTabButtons = $(for ($i = 0; $i -lt $summaries.Count; $i++) {
         $s = $summaries[$i]
         $slug = ConvertTo-Slug $s.Site
-        $tabColor = $tabPalette[$i % $tabPalette.Count]
+        $tabColor = if ($s.HasData) { $tabPalette[$i % $tabPalette.Count] } else { $tabNoDataColor }
         "<button class=`"tab`" id=`"tab-$slug`" onclick=`"showPage('$slug')`" style=`"background:$tabColor`">$(ConvertTo-HtmlSafe $s.Site)</button>"
     }) -join "`n    "
     $tabButtons = @($overviewTabButton, $siteTabButtons) -join "`n    "
@@ -664,21 +750,41 @@ function Write-DashboardHtml {
         $slug = ConvertTo-Slug $s.Site
         $color = $healthColor[$s.OverallHealth]
 
-        # Each card carries a data-idf-row attribute so Network_Evidence_Photos.ps1 (a separate,
-        # optional script) can find the right insertion point when photos are supplied for a
-        # given month - this script itself never depends on photos existing.
-        $idfLocationBars = if ($s.IdfLocationCounts.Count -gt 1) {
-            $maxCount = ($s.IdfLocationCounts | Measure-Object -Property Count -Maximum).Maximum
-            $bars = ($s.IdfLocationCounts | ForEach-Object {
-                $pct = [Math]::Round(($_.Count / $maxCount) * 100)
+        if (-not $s.HasData) {
 @"
-            <div class="loc-bar-row"><span class="loc-bar-label">$(ConvertTo-HtmlSafe $_.Location)</span><div class="loc-bar-track"><div class="loc-bar-fill" style="width:$pct%"></div></div><span class="loc-bar-count">$($_.Count)</span></div>
+      <section class="page" id="page-$slug" data-site="$(ConvertTo-HtmlSafe $s.Site)">
+        <div class="site-hero" style="border-left-color:$color">
+          <h1>$(ConvertTo-HtmlSafe $s.Site)</h1>
+          <span class="badge big" style="background:$color">$(ConvertTo-HtmlSafe $healthLabelText.NoData)</span>
+          <div class="meta">Report generated $(ConvertTo-HtmlSafe $RunDateDisplay)</div>
+        </div>
+        <div class="panel panel-full nodata-panel">
+          <p class="nodata-text-big">No data available yet</p>
+          <p class="nodata-text-small">This site's IDF Room Report and DC RackWise Health Check workbooks haven't been supplied for this run yet. Once their paths are passed in, this page fills in the same way as AquaArabia and SixFlags.</p>
+        </div>
+      </section>
+"@
+            return
+        }
+
+        # Every affected zone/location shown as a uniform-size box (not a proportional bar chart,
+        # which stops being useful once most locations only have 1 reported issue each) so
+        # "where are the problems" stays scannable even with many distinct locations. Each card
+        # carries a data-idf-row attribute so Network_Evidence_Photos.ps1 (a separate, optional
+        # script) can find the right insertion point when photos are supplied for a given month -
+        # this script itself never depends on photos existing.
+        $idfZoneGrid = if ($s.IdfLocationCounts.Count -gt 0) {
+            $zoneBoxes = ($s.IdfLocationCounts | ForEach-Object {
+@"
+            <div class="zone-box"><span class="zone-box-label">$(ConvertTo-HtmlSafe $_.Location)</span><span class="zone-box-count">$($_.Count)</span></div>
 "@
             }) -join "`n"
 @"
-          <div class="loc-bar-chart">
-            <div class="loc-bar-chart-title">Most affected locations</div>
-$bars
+          <div class="zone-grid-wrap">
+            <div class="zone-grid-title">Affected Zones</div>
+            <div class="zone-grid">
+$zoneBoxes
+            </div>
           </div>
 "@
         } else { '' }
@@ -756,10 +862,10 @@ $(if ($_.Notes) { "            <div class=`"ac-notes`">$(ConvertTo-HtmlSafe $_.N
 
         <div class="tile-row">
           <div class="tile" style="background:$tileBlue"><span class="num">$($s.IdfIssueCount)</span><span class="label">IDF Issues Reported</span></div>
-          <div class="tile" style="background:$tilePurple"><span class="num">$($s.IdfLocationCount)</span><span class="label">Locations Affected</span></div>
+          <div class="tile" style="background:$tilePurple"><span class="num">$($s.IdfLocationCount)</span><span class="label">Affected Locations</span></div>
           <div class="tile" style="background:$tileTeal"><span class="num">$($s.RackCount)</span><span class="label">Racks</span></div>
-          <div class="tile" style="background:#2e7d32"><span class="num">$($s.RackHealthyCount)</span><span class="label">Racks Healthy</span></div>
-          <div class="tile" style="background:#c62828"><span class="num">$($s.RackAttentionCount)</span><span class="label">Racks Attention</span></div>
+          <div class="tile" style="background:#2e7d32"><span class="num">$($s.RackHealthyCount)</span><span class="label">Healthy Racks</span></div>
+          <div class="tile" style="background:#c62828"><span class="num">$($s.RackAttentionCount)</span><span class="label">Require Attention Racks</span></div>
           <div class="tile" style="background:$tileIndigo"><span class="num" style="font-size:18px">$avgHealthValueText</span><span class="label">Avg Rack Health</span></div>
         </div>
 
@@ -771,7 +877,7 @@ $(if ($_.Notes) { "            <div class=`"ac-notes`">$(ConvertTo-HtmlSafe $_.N
 
           <div class="panel panel-full" style="border-top-color:$tilePurple">
             <h3><span class="n" style="background:$tilePurple">&#127968;</span>IDF Room Issues <span style="font-weight:normal;font-size:14px;color:#999">($($s.IdfIssueCount) reported)</span></h3>
-$idfLocationBars
+$idfZoneGrid
             <div class="idf-issue-list">
 $idfRows
             </div>
@@ -803,6 +909,9 @@ $actionPlanBody
   body { font-family: Calibri, Arial, sans-serif; background:#eef1f5; color:#1a1a1a; margin:0; padding:0 32px 32px; font-size:16px; line-height:1.4; }
   h1 { color:#1E3A5F; margin:0; font-size:36px; }
   .subtitle { color:#555; margin:6px 0 20px; font-size:16px; }
+  .dashboard-header { background:#1E3A5F; border-radius:10px; padding:26px 32px; margin:24px 0 0; box-shadow:0 1px 4px rgba(0,0,0,0.2); }
+  .dashboard-header h1 { color:#fff; }
+  .dashboard-header .subtitle { color:rgba(255,255,255,0.8); margin:8px 0 0; }
   .tabs { display:grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap:20px; padding:24px 0 20px; position:sticky; top:0; background:#eef1f5; z-index:10; border-bottom:1px solid #dfe3e8; margin-bottom:32px; }
   .tab { display:flex; align-items:center; justify-content:center; text-align:center; cursor:pointer; border:3px solid transparent; border-radius:10px; padding:28px 16px; font-family:inherit; font-weight:bold; font-size:18px; color:#fff; background:#1E3A5F; box-shadow:0 1px 4px rgba(0,0,0,0.2); min-height:90px; box-sizing:border-box; }
   .tab.overview-tab { background:#1E3A5F; }
@@ -822,6 +931,8 @@ $actionPlanBody
   .ov-head { display:flex; flex-direction:column; align-items:flex-start; gap:10px; margin-bottom:14px; }
   .ov-head h2 { margin:0; font-size:24px; color:#1E3A5F; }
   .ov-link { display:inline-block; margin-top:14px; color:#1E3A5F; font-weight:bold; font-size:14px; }
+  .ov-card-nodata { opacity:0.85; }
+  .nodata-text { color:#999; font-style:italic; margin:4px 0 0; }
   .badge { color:#fff; padding:6px 14px; border-radius:6px; font-size:14px; font-weight:bold; white-space:nowrap; display:inline-block; text-align:center; width:280px; }
   .badge.big { font-size:20px; padding:10px 22px; width:420px; }
   .risk-row { display:flex; gap:12px; margin-bottom:16px; flex-wrap:wrap; }
@@ -862,27 +973,30 @@ $actionPlanBody
   .summary-text { color:#444; font-size:15px; line-height:1.6; }
   .center-callout { text-align:center; padding:8px 0 18px; }
 
-  /* IDF Room Issues - most-affected-locations mini chart + a compact grid of issue tiles */
-  .loc-bar-chart { background:#fafbfc; border:1px solid #f0f0f0; border-radius:8px; padding:14px 18px; margin-bottom:16px; }
-  .loc-bar-chart-title { font-size:12px; font-weight:bold; color:#999; text-transform:uppercase; margin-bottom:10px; }
-  .loc-bar-row { display:flex; align-items:center; gap:10px; margin-bottom:7px; }
-  .loc-bar-row:last-child { margin-bottom:0; }
-  .loc-bar-label { flex:0 0 90px; font-size:13px; font-weight:600; color:#444; text-align:right; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  .loc-bar-track { flex:1; height:10px; background:#eef1f4; border-radius:5px; overflow:hidden; }
-  .loc-bar-fill { height:100%; border-radius:5px; background:#6A1B9A; }
-  .loc-bar-count { flex:0 0 20px; font-size:12.5px; font-weight:bold; color:#666; }
+  /* IDF Room Issues - uniform affected-zone boxes + a compact grid of issue tiles */
+  .zone-grid-wrap { background:#fafbfc; border:1px solid #f0f0f0; border-radius:8px; padding:14px 18px; margin-bottom:16px; }
+  .zone-grid-title { font-size:12px; font-weight:bold; color:#999; text-transform:uppercase; margin-bottom:10px; }
+  .zone-grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); gap:8px; }
+  .zone-box { background:#f3eaf7; border:1px solid #e3d3ec; border-radius:6px; padding:8px 6px; text-align:center; display:flex; flex-direction:column; align-items:center; justify-content:center; min-height:52px; box-sizing:border-box; }
+  .zone-box-label { font-size:12px; font-weight:700; color:#5a3a68; word-break:break-word; }
+  .zone-box-count { font-size:11px; color:#8a6b96; margin-top:3px; }
   .idf-issue-list { display:grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap:12px; }
   .idf-issue-card { padding:12px 14px; border-radius:8px; background:#fff; border-left:4px solid #e6a100; box-shadow:0 1px 3px rgba(0,0,0,0.08); display:flex; flex-direction:column; }
   .idf-issue-card .issue-head { display:flex; align-items:center; gap:8px; margin-bottom:8px; }
   .idf-issue-card .issue-no { flex-shrink:0; width:22px; height:22px; border-radius:50%; background:#e6a100; color:#fff; display:flex; align-items:center; justify-content:center; font-weight:bold; font-size:11px; }
   .idf-issue-card .issue-title { font-weight:bold; font-size:13.5px; color:#1a1a1a; line-height:1.3; }
   .idf-issue-card .issue-notes { font-size:12px; color:#8a6100; margin-top:7px; font-style:italic; }
-  .loc-chips { display:flex; flex-wrap:wrap; gap:5px; align-content:flex-start; }
+  .loc-chips { display:flex; flex-wrap:wrap; gap:5px; align-content:flex-start; max-height:110px; overflow-y:auto; }
   .loc-chip { display:inline-block; background:#eef2f5; color:#444; font-size:11px; font-weight:600; padding:3px 9px; border-radius:11px; }
   .loc-chip-empty { background:#f5f5f5; color:#999; font-weight:normal; font-style:italic; }
   .idf-evidence-cell:empty { display:none; }
   .idf-evidence-cell { margin-top:8px; display:flex; gap:6px; flex-wrap:wrap; }
   .idf-evidence-cell img { max-width:70px; max-height:70px; border-radius:4px; box-shadow:0 1px 3px rgba(0,0,0,0.3); cursor:zoom-in; }
+
+  /* No-data placeholder page (template site with no workbook paths supplied yet) */
+  .nodata-panel { text-align:center; padding:48px 24px; }
+  .nodata-text-big { font-size:22px; font-weight:bold; color:#8a8f98; margin:0 0 10px; }
+  .nodata-text-small { font-size:14px; color:#999; max-width:520px; margin:0 auto; line-height:1.6; }
 
   /* Rack Health - one card per rack */
   .rack-grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap:14px; }
@@ -907,8 +1021,10 @@ $actionPlanBody
 </style>
 </head>
 <body>
-  <h1>Network Weekly Health Check - Dashboard</h1>
-  <p class="subtitle">Generated $(ConvertTo-HtmlSafe $RunDateDisplay) - $($summaries.Count) site(s)</p>
+  <div class="dashboard-header">
+    <h1>Network Weekly Health Check - Dashboard</h1>
+    <p class="subtitle">Generated $(ConvertTo-HtmlSafe $RunDateDisplay) - $($summaries.Count) site(s)</p>
+  </div>
 
   <nav class="tabs">
     $tabButtons
@@ -917,11 +1033,11 @@ $actionPlanBody
   <section class="page active" id="page-overview">
     <div class="stat-row">
       <div class="stat" style="background:#2e7d32"><span class="num">$($healthCounts.Healthy)</span><span class="label">Healthy Sites</span>$healthyNoteHtml</div>
-      <div class="stat" style="background:#e6a100"><span class="num">$($healthCounts.Warning)</span><span class="label">Sites with Warnings</span></div>
-      <div class="stat" style="background:#c62828"><span class="num">$($healthCounts.Critical)</span><span class="label">Sites Critical</span></div>
-      <div class="stat" style="background:#4F46E5"><span class="num">$totalMedium</span><span class="label">Total Medium Risk Issues</span></div>
-      <div class="stat" style="background:#1565C0"><span class="num">$totalIdfIssues</span><span class="label">Total IDF Issues Reported</span></div>
-      <div class="stat" style="background:#00897B"><span class="num">$totalRacks</span><span class="label">Total Racks</span></div>
+      <div class="stat" style="background:#e6a100"><span class="num">$($healthCounts.Warning)</span><span class="label">Sites with Warnings</span>$warningNoteHtml</div>
+      <div class="stat" style="background:#c62828"><span class="num">$($healthCounts.Critical)</span><span class="label">Critical Sites</span>$criticalNoteHtml</div>
+      <div class="stat" style="background:#4F46E5"><span class="num">$totalMedium</span><span class="label">Total Medium Risk Issues</span>$mediumNoteHtml</div>
+      <div class="stat" style="background:#1565C0"><span class="num">$totalIdfIssues</span><span class="label">Total IDF Issues Reported</span>$idfIssuesNoteHtml</div>
+      <div class="stat" style="background:#00897B"><span class="num">$totalRacks</span><span class="label">Total Racks</span>$racksNoteHtml</div>
     </div>
 
     <div class="ov-grid">
@@ -954,7 +1070,7 @@ function showPage(slug) {
 # ============================================================================
 # 6. OUTPUT: DASHBOARD + LOG
 # ============================================================================
-$SiteLabels = $Global:AllResults | Select-Object -ExpandProperty Site -Unique
+$SiteLabels = $Sites | Select-Object -ExpandProperty Site
 Invoke-SafeCheck -CheckName 'Dashboard generation' -Site 'n/a' -ObjectName 'Dashboard' -Script {
     Write-DashboardHtml -SiteLabels $SiteLabels -OutputPath $OutputPath -RunDateDisplay $RunDateDisplay
 }
