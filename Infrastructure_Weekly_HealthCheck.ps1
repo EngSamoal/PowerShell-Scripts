@@ -7,25 +7,37 @@
 
 .DESCRIPTION
     Reads 4 source workbooks (2 per site):
-      - <Site> IDF Room Report: one "Zone - N" tab per zone, each a per-switch/per-cabinet
-        checklist (IDF Room clean, Rodent Trap, Air Conditioning, Cabinet doors, Switch Label,
-        Fiber Uplink Labeling, Access Card Working) plus free-text Comments.
+      - <Site> IDF Room Report: a single "Summary" tab that lists ONLY the issues found (an
+        exceptions list, not a full per-switch checklist) - one row per issue, each naming the
+        affected zone/location code(s). The two companies word this slightly differently
+        (AquaArabia: "Issues" + a free-text "Zone N: loc1, loc2" cell per issue type; SixFlags:
+        "No." + "Observation" + a flat comma-separated "Zone - IDF(s)" list per observation) but
+        both are read the same way: find the issue-label column, the affected-location column is
+        always the one immediately to its right.
       - <Site> DC RackWise Health Check: a "Summary" tab with one row per rack (Health %,
-        Status, Rack/Node check counts), and one tab per rack (A01, B01, P1, S1, ...) with a
-        14-item rack-level checklist followed by a per-device ("Node-Wise"/"Device-Wise")
-        checklist further down the same sheet.
+        Status, Rack/Node check counts - note the "Status" text on this tab is manually set by
+        the engineer and is NOT reliably tied to Health % in the real data, so this script
+        derives each rack's own Healthy/Warning/Critical status from its Health % instead), and
+        one tab per rack (A01, B01, P1, S1, ...) with a rack-level checklist (Check Item /
+        Status / Comments, read until the first blank row rather than matched against a fixed
+        item list, since the exact wording/row count varies slightly by company) followed by a
+        per-device checklist anchored on the "RU" column further down the same sheet.
 
     Every tab is located by searching for its known column headers rather than assuming a
     fixed row/column position, since the real workbooks have inconsistent header rows (a
-    title row, blank spacer rows, or a second workbook's extra stray columns) - a tab whose
+    banner/logo above the real header, blank spacer rows, or typos in item text) - a tab whose
     headers can't be found is skipped and logged, never guessed at.
 
     Produces ONE combined HTML dashboard (no Word/PDF) covering both sites, matching the
-    VMware dashboard's look: circular site tabs, KPI stat tiles, colored panels, an itemized
-    Action Plan of every "No" answer (room/rack/device) with its Comments as context, and a
-    Backup & Disaster Recovery panel driven by -BackupInfo exactly like the VMware script
-    (this workbook set has no backup data of its own, so that panel reads "Manual/External
-    Required" unless you pass it).
+    VMware dashboard's look: circular site tabs, KPI stat tiles, colored panels, an IDF Room
+    Issues panel, a Rack Health panel, an itemized Action Plan of every Rack/Node item needing
+    attention, and a Backup & Disaster Recovery panel driven by -BackupInfo exactly like the
+    VMware script (this workbook set has no backup data of its own, so that panel reads
+    "Manual/External Required" unless you pass it).
+
+    This script never embeds evidence photos - that is handled by a separate, optional script
+    (Infrastructure_Evidence_Photos.ps1) run afterward against the dashboard this script
+    produces, so a month with no photos supplied needs no change here.
 
     NEVER writes/modifies the source workbooks - opened read-only, closed without saving.
 
@@ -56,7 +68,7 @@ param(
     [hashtable]$BackupInfo = @{}
 )
 
-$ScriptBuild = '2026-10-01-01-initial'
+$ScriptBuild = '2026-10-01-02-real-structure-rebuild'
 Write-Host "Infrastructure_Weekly_HealthCheck.ps1 - build $ScriptBuild" -ForegroundColor Magenta
 
 $ErrorActionPreference = 'Stop'
@@ -70,7 +82,6 @@ if (-not (Test-Path $OutputPath)) { New-Item -ItemType Directory -Path $OutputPa
 # ============================================================================
 $Global:FailureLog = [System.Collections.Generic.List[object]]::new()
 $Global:AllResults = [System.Collections.Generic.List[object]]::new()
-$Global:SiteRackMap = @{}   # Site label -> ordered list of rack names discovered (for per-site Clusters-style table).
 
 function Write-CheckLog {
     param([string]$Site, [string]$Object, [string]$CheckName, [string]$ErrorMessage)
@@ -102,13 +113,15 @@ function Invoke-SafeCheck {
 function New-Finding {
     param(
         [string]$Site, [string]$Area, [string]$Group, [string]$Object,
-        [string]$Item, [string]$Value, [string]$Status, [string]$Notes = ''
+        [string]$Item, [string]$Value, [string]$Status, [string]$Notes = '', [string]$RowNum = ''
     )
-    # Area: IDF | Rack | Node. Group: zone name (IDF) or rack ID (Rack/Node).
+    # Area: IDF | Rack | Node. Group: zone/location label (IDF) or rack ID (Rack/Node).
+    # RowNum: the IDF Summary row this finding came from (used only to match evidence photos,
+    # which are supplied separately and named by row number - see Infrastructure_Evidence_Photos.ps1).
     # Status: Healthy / Warning / Critical / Information / Unable to Check / Manual/External Required
     $obj = [pscustomobject]@{
         Site = $Site; Area = $Area; Group = $Group; Object = $Object
-        Item = $Item; Value = $Value; Status = $Status; Notes = $Notes
+        Item = $Item; Value = $Value; Status = $Status; Notes = $Notes; RowNum = $RowNum
     }
     $Global:AllResults.Add($obj) | Out-Null
 }
@@ -120,14 +133,25 @@ function Get-WorstStatus {
     return ($Statuses | Sort-Object { $order[$_] } -Descending | Select-Object -First 1)
 }
 
-# Maps a plain Yes/No/N/A-style answer to a Status - used for every IDF/Rack/Node checklist item.
+# Maps a rack/node checklist answer to a Status. Real answers seen in the workbooks go beyond
+# plain Yes/No: 'Ok' is used interchangeably with 'Yes' on the PDU columns, 'Pending' means the
+# device isn't fully set up yet (not a failure, but not confirmed healthy either), and 'N/A'
+# means the check doesn't apply to this device (e.g. a passive patch panel). -AlarmStyle is for
+# the two inverted-polarity columns ("Any Disk Alarms", "Front/Back Led Alarms") where an empty
+# answer or 'None'/'N/A' is the GOOD outcome and anything else indicates a real alarm.
 function Get-YesNoStatus {
-    param([string]$Value)
-    switch -Regex ($Value.Trim()) {
-        '^Yes$'     { return 'Healthy' }
-        '^No$'      { return 'Warning' }
-        '^(N/A|Pending)$' { return 'Information' }
-        default     { return 'Information' }
+    param([string]$Value, [switch]$AlarmStyle)
+    $v = "$Value".Trim()
+    if ($AlarmStyle) {
+        if ($v -eq '' -or $v -ieq 'None' -or $v -ieq 'N/A' -or $v -ieq 'No') { return 'Healthy' }
+        return 'Critical'
+    }
+    switch -Regex ($v) {
+        '^(Yes|Ok)$' { return 'Healthy' }
+        '^No$'       { return 'Critical' }
+        '^Pending$'  { return 'Warning' }
+        '^N/A$'      { return 'Information' }
+        default      { return 'Information' }
     }
 }
 
@@ -142,9 +166,9 @@ function ConvertTo-CompactNote {
 # ============================================================================
 # 1. EXCEL HEADER-ANCHORING HELPERS
 #    Every tab is located by searching for its known header text rather than assuming a fixed
-#    row/column - the real workbooks have inconsistent header rows (title rows, blank spacer
-#    rows, stray leftover columns from a different tab's data-validation list) that make a
-#    fixed-position read silently wrong instead of simply failing.
+#    row/column - the real workbooks have inconsistent header rows (a banner/logo above the
+#    real header, blank spacer rows, typo'd item text) that make a fixed-position read silently
+#    wrong instead of simply failing.
 # ============================================================================
 
 # Finds the first row (within MaxRow/MaxCol) where every label in $Labels appears as an exact
@@ -168,12 +192,9 @@ function Find-HeaderRow {
     return $null
 }
 
-# Finds the first cell (within MaxRow/MaxCol) whose text CONTAINS $Contains (case-insensitive) -
-# used for the IDF checklist header, whose exact wording drifts slightly between tabs/sites
-# ("IDF Room (Clean)" vs "IDF Room" vs "IDF Room(Clean)") but always starts the same 8-column
-# checklist block in the same fixed order.
+# Finds the first cell (within MaxRow/MaxCol) whose text CONTAINS $Contains (case-insensitive).
 function Find-HeaderCellContains {
-    param($Worksheet, [string]$Contains, [int]$MaxRow = 10, [int]$MaxCol = 40)
+    param($Worksheet, [string]$Contains, [int]$MaxRow = 20, [int]$MaxCol = 40)
     for ($r = 1; $r -le $MaxRow; $r++) {
         for ($c = 1; $c -le $MaxCol; $c++) {
             $v = $Worksheet.Cells.Item($r, $c).Value2
@@ -186,13 +207,17 @@ function Find-HeaderCellContains {
 }
 
 # ============================================================================
-# 2. IDF ROOM REPORT COLLECTION
+# 2. IDF ROOM REPORT COLLECTION (exceptions-list format)
+#    The real IDF Room Report workbooks have no per-zone checklist tabs at all - just a single
+#    "Summary" tab listing only the issues found, each naming the affected zone/location
+#    code(s). AquaArabia words the issue-label column "Issues" (issue TYPE in each row, e.g.
+#    "Rodent Trap Missing", with a multi-line "Zone N: loc1, loc2" cell listing every affected
+#    location); SixFlags words it "Observation" (a free-text description per row, e.g. "Access
+#    control is not working", with a flat comma-separated zone/IDF-code list and no "Zone N:"
+#    grouping). Both are read the same way: locate the issue-label column, and the affected-
+#    location list is always the column immediately to its right.
 # ============================================================================
-# Fixed, confirmed-consistent order of the 8 checklist columns starting at the "IDF Room"
-# column - hardcoded rather than read from the (inconsistently worded) header text itself.
-$IdfChecklistItems = @('IDF Room Clean','Rodent Trap','Air Conditioning','Cabinet - Front & Back Door','Switch Label','Fiber Uplink Labeling','Access Card Working')
-
-function Read-IdfWorkbook {
+function Read-IdfIssuesWorkbook {
     param($Excel, [string]$Site, [string]$Path)
     if (-not $Path -or -not (Test-Path $Path)) {
         if ($Path) { Write-CheckLog -Site $Site -Object $Path -CheckName 'IDF workbook' -ErrorMessage 'File not found.' }
@@ -200,48 +225,68 @@ function Read-IdfWorkbook {
     }
     $wb = $Excel.Workbooks.Open($Path, 0, $true)
     try {
-        foreach ($ws in $wb.Worksheets) {
-            if ($ws.Name.Trim() -notmatch '^Zone') { continue }
-            $zoneName = $ws.Name.Trim()
-            Invoke-SafeCheck -Site $Site -ObjectName $zoneName -CheckName 'IDF zone tab' -Script {
-                $idfCell = Find-HeaderCellContains -Worksheet $ws -Contains 'IDF Room'
-                $idCell  = Find-HeaderRow -Worksheet $ws -Labels @('Zone','Cabinet No','Building','Switch - Hostname') -MaxRow 15
-                if (-not $idfCell -or -not $idCell) {
-                    throw "Could not locate the checklist header or the Zone/Cabinet/Building/Switch-Hostname header on this tab."
+        $ws = $wb.Worksheets | Where-Object { $_.Name.Trim() -ieq 'Summary' } | Select-Object -First 1
+        if (-not $ws) { $ws = $wb.Worksheets.Item(1) }
+        Invoke-SafeCheck -Site $Site -ObjectName $ws.Name -CheckName 'IDF issues tab' -Script {
+            $issueCell = Find-HeaderCellContains -Worksheet $ws -Contains 'Issues'
+            if (-not $issueCell) { $issueCell = Find-HeaderCellContains -Worksheet $ws -Contains 'Observation' }
+            if (-not $issueCell) { throw "Could not locate an 'Issues' or 'Observation' column header on this tab." }
+            $issueCol = $issueCell.Col
+            $locCol = $issueCol + 1
+            $hdrRow = $issueCell.Row
+
+            # Optional 'No.' row-number column, one column to the left of the issue column.
+            $noCol = $null
+            if ($issueCol -gt 1) {
+                $noVal0 = $ws.Cells.Item($hdrRow, $issueCol - 1).Value2
+                if ($null -ne $noVal0 -and "$noVal0".Trim() -ieq 'No.') { $noCol = $issueCol - 1 }
+            }
+
+            # Optional 'Comments' column, searched a few columns right of the location column.
+            $commentsCol = $null
+            for ($c = $locCol + 1; $c -le ($locCol + 5); $c++) {
+                $v = $ws.Cells.Item($hdrRow, $c).Value2
+                if ($null -ne $v -and "$v".Trim() -ieq 'Comments') { $commentsCol = $c; break }
+            }
+
+            $used = $ws.UsedRange
+            $lastRow = $used.Row + $used.Rows.Count - 1
+            $rowCounter = 0
+            for ($r = $hdrRow + 1; $r -le $lastRow; $r++) {
+                $issueVal = $ws.Cells.Item($r, $issueCol).Value2
+                if (-not $issueVal -or "$issueVal".Trim() -eq '') { continue }
+                $issueText = "$issueVal".Trim()
+                $rowCounter++
+                $rowLabel = "$rowCounter"
+                if ($noCol) {
+                    $nv = $ws.Cells.Item($r, $noCol).Value2
+                    if ($nv -and "$nv".Trim() -ne '') { $rowLabel = "$nv".Trim() }
                 }
-                $checklistStartCol = $idfCell.Col
-                $zoneCol   = $idCell.Columns['Zone']
-                $cabCol    = $idCell.Columns['Cabinet No']
-                $bldgCol   = $idCell.Columns['Building']
-                $switchCol = $idCell.Columns['Switch - Hostname']
-                $commentsCol = $checklistStartCol + 7   # 8th checklist column, after the 7 Yes/No items
 
-                $used = $ws.UsedRange
-                $lastRow = $used.Row + $used.Rows.Count - 1
-                $dataStart = $idCell.Row + 1
+                $locVal = $ws.Cells.Item($r, $locCol).Value2
+                $locText = if ($locVal) { "$locVal" } else { '' }
+                $commentsVal = if ($commentsCol) { ConvertTo-CompactNote "$($ws.Cells.Item($r, $commentsCol).Value2)" } else { '' }
 
-                $currentCabinet = ''
-                $currentBuilding = ''
-                for ($r = $dataStart; $r -le $lastRow; $r++) {
-                    $zoneVal = $ws.Cells.Item($r, $zoneCol).Value2
-                    $cabVal  = $ws.Cells.Item($r, $cabCol).Value2
-                    $bldgVal = $ws.Cells.Item($r, $bldgCol).Value2
-                    $switchVal = $ws.Cells.Item($r, $switchCol).Value2
-                    if ($cabVal -and "$cabVal".Trim() -ne '') { $currentCabinet = "$cabVal".Trim() }
-                    if ($bldgVal -and "$bldgVal".Trim() -ne '') { $currentBuilding = "$bldgVal".Trim() }
-                    if (-not $switchVal -or "$switchVal".Trim() -eq '') { continue }   # a pure spacer row
-                    $objectLabel = "$($currentBuilding) / $($currentCabinet) / $("$switchVal".Trim())"
+                if (-not $locText.Trim()) {
+                    New-Finding -Site $Site -Area 'IDF' -Group '' -Object '(unspecified location)' `
+                        -Item $issueText -Value 'Reported' -Status 'Warning' -Notes $commentsVal -RowNum $rowLabel
+                    continue
+                }
 
-                    $commentsRaw = $ws.Cells.Item($r, $commentsCol).Value2
-                    $commentsNote = ConvertTo-CompactNote "$commentsRaw"
-
-                    for ($i = 0; $i -lt $IdfChecklistItems.Count; $i++) {
-                        $cellVal = $ws.Cells.Item($r, $checklistStartCol + $i).Value2
-                        if ($null -eq $cellVal -or "$cellVal".Trim() -eq '') { continue }
-                        $status = Get-YesNoStatus "$cellVal"
-                        $notes = if ($status -eq 'Warning') { $commentsNote } else { '' }
-                        New-Finding -Site $Site -Area 'IDF' -Group $zoneName -Object $objectLabel `
-                            -Item $IdfChecklistItems[$i] -Value "$cellVal".Trim() -Status $status -Notes $notes
+                # AquaArabia-style: one "Zone N: loc1, loc2" line per affected zone (multi-line cell).
+                # SixFlags-style: a single line of flat comma-separated location codes, no zone prefix.
+                $lines = $locText -split '\r?\n' | Where-Object { $_.Trim() -ne '' }
+                foreach ($line in $lines) {
+                    if ($line -match '^\s*([^:]+):\s*(.+)$') {
+                        $zoneLabel = $Matches[1].Trim()
+                        $locations = $Matches[2] -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+                    } else {
+                        $zoneLabel = ''
+                        $locations = $line -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+                    }
+                    foreach ($loc in $locations) {
+                        New-Finding -Site $Site -Area 'IDF' -Group $zoneLabel -Object $loc `
+                            -Item $issueText -Value 'Reported' -Status 'Warning' -Notes $commentsVal -RowNum $rowLabel
                     }
                 }
             }
@@ -255,17 +300,17 @@ function Read-IdfWorkbook {
 # ============================================================================
 # 3. DC RACKWISE HEALTH CHECK COLLECTION
 # ============================================================================
-# Fixed, confirmed-consistent column order of the per-device grid starting at the "RU" column.
-$NodeGridItems = @('Expected Device','Mac Address / IP','Device Powered On','Device PDU-1','Device PDU-2','Any Disk Alarms','Device Labeling','Fiber/UTP Link Labeling','Temp OK','Link OK','Front/Back Led Alarms')
-# Fixed, confirmed-consistent order of the 14-item rack-level checklist (Column A, Status in B).
-$RackChecklistItems = @('Rack power OK','PDU -1  status OK','PDU -2  status OK','Devices powered ON','No critical alarms','Temperature within threshold','Airflow clear','Cable management OK','Fiber/UTP Uplinks OK','Fiber/UTP Labeling OK','Front and Back doors locked/secure','Rack Clean (No Foreign objects)','No physical damage')
+# Fixed, confirmed-consistent column order of the per-device grid starting 2 columns after "RU"
+# ("RU" then "Expected Device" are read separately, not part of this Yes/No/Ok grid).
+$NodeGridItems = @('Mac Address / IP','Device Powered On','Device PDU-1','Device PDU-2','Any Disk Alarms','Device Labeling','Fiber/UTP Link Labeling','Temp OK','Link OK','Front/Back Led Alarms')
+$NodeGridAlarmItems = @('Any Disk Alarms','Front/Back Led Alarms')
 
 function Read-RackSummaryTab {
     param($Worksheet, [string]$Site)
     $hdr = Find-HeaderRow -Worksheet $Worksheet -Labels @('Rack','Health %','Status') -MaxRow 20 -MaxCol 40
     if (-not $hdr) { throw "Could not locate the Rack/Health %/Status header on the Summary tab." }
     $cols = $hdr.Columns
-    $rackCol = $cols['Rack']; $healthCol = $cols['Health %']; $statusCol = $cols['Status']
+    $rackCol = $cols['Rack']; $healthCol = $cols['Health %']
     $yesCol = $null; $noCol = $null; $nodeYesCol = $null; $nodeNoCol = $null; $commentsCol = $null
     foreach ($name in @('Rack Checks (Yes)','Rack Checks (No)','Node Yes','Node No','Comments')) {
         for ($c = 1; $c -le 40; $c++) {
@@ -291,20 +336,18 @@ function Read-RackSummaryTab {
         if (-not $rackVal -or "$rackVal".Trim() -eq '') { continue }
         $rackName = "$rackVal".Trim()
         $healthVal = $Worksheet.Cells.Item($r, $healthCol).Value2
-        $statusVal = $Worksheet.Cells.Item($r, $statusCol).Value2
         $rackYes = if ($yesCol) { $Worksheet.Cells.Item($r, $yesCol).Value2 } else { $null }
         $rackNo  = if ($noCol) { $Worksheet.Cells.Item($r, $noCol).Value2 } else { $null }
         $nodeYes = if ($nodeYesCol) { $Worksheet.Cells.Item($r, $nodeYesCol).Value2 } else { $null }
         $nodeNo  = if ($nodeNoCol) { $Worksheet.Cells.Item($r, $nodeNoCol).Value2 } else { $null }
         $comments = if ($commentsCol) { ConvertTo-CompactNote "$($Worksheet.Cells.Item($r, $commentsCol).Value2)" } else { '' }
 
-        $status = switch ("$statusVal".Trim()) {
-            'Healthy'   { 'Healthy' }
-            'Attention' { 'Warning' }
-            default     { 'Unable to Check' }
-        }
         $healthPct = 0.0
         if ($healthVal) { try { $healthPct = [double]$healthVal * 100 } catch { } }
+        # The sheet's own "Status" column is set manually and is not reliably tied to Health % in
+        # the real data (racks at 45% have shown "Healthy" while racks at 59% show "Attention") -
+        # so the rack's Status here is derived from Health % instead, for a consistent dashboard.
+        $status = if ($healthPct -ge 90) { 'Healthy' } elseif ($healthPct -ge 75) { 'Warning' } else { 'Critical' }
 
         New-Finding -Site $Site -Area 'Rack' -Group $rackName -Object $rackName -Item 'Rack Health' `
             -Value "$([Math]::Round($healthPct,1))|$rackYes|$rackNo|$nodeYes|$nodeNo" -Status $status -Notes $comments
@@ -315,17 +358,19 @@ function Read-RackSummaryTab {
 
 function Read-RackDetailTab {
     param($Worksheet, [string]$Site, [string]$RackName)
-    # Rack-level checklist: Column A = Check Item (hardcoded list), Column B = Status, Column C = Comments.
-    # Anchored by finding the literal "Check Item" / "Status" header rather than a fixed row.
+    # Rack-level checklist: Column = Check Item, next column = Status, 2 columns over = Comments.
+    # Anchored by finding the literal "Check Item" / "Status" header, then read every row until
+    # the first blank Check Item (the natural gap before the Node/Device-Wise section below) -
+    # the exact item wording/count varies slightly between companies (and has typos), so this is
+    # read verbatim rather than matched against a fixed, hardcoded item list.
     $hdr = Find-HeaderRow -Worksheet $Worksheet -Labels @('Check Item','Status') -MaxRow 15 -MaxCol 10
     if ($hdr) {
         $itemCol = $hdr.Columns['Check Item']; $statusCol = $hdr.Columns['Status']
         $commentsCol = $itemCol + 2
-        for ($r = $hdr.Row + 1; $r -le ($hdr.Row + 20); $r++) {
+        for ($r = $hdr.Row + 1; $r -le ($hdr.Row + 25); $r++) {
             $itemVal = $Worksheet.Cells.Item($r, $itemCol).Value2
-            if (-not $itemVal) { continue }
+            if (-not $itemVal -or "$itemVal".Trim() -eq '') { break }
             $itemName = "$itemVal".Trim()
-            if ($itemName -notin $RackChecklistItems) { continue }   # stop once we hit the node-grid section title/header
             $statusVal = $Worksheet.Cells.Item($r, $statusCol).Value2
             if (-not $statusVal -or "$statusVal".Trim() -eq '') { continue }
             $commentsVal = ConvertTo-CompactNote "$($Worksheet.Cells.Item($r, $commentsCol).Value2)"
@@ -335,7 +380,9 @@ function Read-RackDetailTab {
     }
 
     # Node/device grid: anchored on the literal "RU" column header - column order after it is
-    # fixed/confirmed, so read by position once that anchor is found.
+    # fixed/confirmed, so read by position once that anchor is found. "Expected Device" (the
+    # column right after RU) is descriptive metadata folded into the device label, not one of
+    # the Yes/No/Ok check columns.
     $ruHdr = Find-HeaderRow -Worksheet $Worksheet -Labels @('RU') -MaxRow 40 -MaxCol 20
     if (-not $ruHdr) { return }
     $ruCol = $ruHdr.Columns['RU']
@@ -348,12 +395,14 @@ function Read-RackDetailTab {
         $deviceLabel = "RU$("$ruVal".Trim()) $("$deviceVal".Trim())"
         $commentsVal = ConvertTo-CompactNote "$($Worksheet.Cells.Item($r, $ruCol + 12).Value2)"
         for ($i = 0; $i -lt $NodeGridItems.Count; $i++) {
+            $itemName = $NodeGridItems[$i]
             $cellVal = $Worksheet.Cells.Item($r, $ruCol + 2 + $i).Value2
             if ($null -eq $cellVal -or "$cellVal".Trim() -eq '' -or "$cellVal".Trim() -ieq 'N/A') { continue }
-            $status = Get-YesNoStatus "$cellVal"
-            $notes = if ($status -eq 'Warning') { $commentsVal } else { '' }
+            $isAlarm = $itemName -in $NodeGridAlarmItems
+            $status = Get-YesNoStatus "$cellVal" -AlarmStyle:$isAlarm
+            $notes = if ($status -in 'Critical','Warning') { $commentsVal } else { '' }
             New-Finding -Site $Site -Area 'Node' -Group $RackName -Object $deviceLabel `
-                -Item $NodeGridItems[$i] -Value "$cellVal".Trim() -Status $status -Notes $notes
+                -Item $itemName -Value "$cellVal".Trim() -Status $status -Notes $notes
         }
     }
 }
@@ -375,9 +424,11 @@ function Read-RackWorkbook {
             Read-RackSummaryTab -Worksheet $summaryWs -Site $Site
         }
         if (-not $racks) { return }
-        if (-not $Global:SiteRackMap.ContainsKey($Site)) { $Global:SiteRackMap[$Site] = [System.Collections.Generic.List[string]]::new() }
+        # Not every rack tab is necessarily listed on the Summary tab (e.g. a rack was surveyed
+        # on its own tab but never rolled into Summary) - this script can only discover racks
+        # that ARE listed there; any Summary gap like that is a workbook data-entry issue, not
+        # something this script can detect on its own.
         foreach ($rackName in $racks) {
-            $Global:SiteRackMap[$Site].Add($rackName)
             $rackWs = $wb.Worksheets | Where-Object { $_.Name.Trim() -ieq $rackName } | Select-Object -First 1
             if (-not $rackWs) {
                 Write-CheckLog -Site $Site -Object $rackName -CheckName 'RackWise rack tab' -ErrorMessage "No tab named '$rackName' found - rack-level/node detail skipped (Summary rollup still recorded)."
@@ -412,7 +463,7 @@ try {
 
 foreach ($s in $Sites) {
     Write-Host "`n=== Collecting: $($s.Site) ===" -ForegroundColor Green
-    Read-IdfWorkbook -Excel $Excel -Site $s.Site -Path $s.IdfPath
+    Read-IdfIssuesWorkbook -Excel $Excel -Site $s.Site -Path $s.IdfPath
     Read-RackWorkbook -Excel $Excel -Site $s.Site -Path $s.RackPath
 }
 
@@ -436,7 +487,7 @@ function ConvertTo-Slug {
 }
 
 # Computes every per-site aggregate the dashboard needs directly from $Global:AllResults -
-# IDF zone pass/fail rollup, per-rack health rollup, and the combined itemized Action Plan.
+# the IDF issues list, per-rack health rollup, and the combined itemized Action Plan.
 function Get-SiteDashboardSummary {
     param([string]$SiteLabel)
     $SiteFindings = $Global:AllResults | Where-Object { $_.Site -eq $SiteLabel }
@@ -446,16 +497,26 @@ function Get-SiteDashboardSummary {
     $WarnCount = @($SiteFindings | Where-Object { $_.Status -eq 'Warning' }).Count
     $OverallHealth = if ($CritCount -gt 0) { 'Critical' } elseif ($WarnCount -gt 0) { 'Warning' } else { 'Healthy' }
 
-    # --- IDF rollup ---
+    # --- IDF issues (exceptions list - grouped back up by source row) ---
     $idfFindings = @($SiteFindings | Where-Object { $_.Area -eq 'IDF' })
-    $idfZones = @($idfFindings | Select-Object -ExpandProperty Group -Unique | Sort-Object)
-    $idfZoneRows = @(foreach ($z in $idfZones) {
-        $zf = @($idfFindings | Where-Object { $_.Group -eq $z })
-        $zFail = @($zf | Where-Object { $_.Status -eq 'Warning' }).Count
-        $zInfo = @($zf | Where-Object { $_.Status -eq 'Information' }).Count
-        [pscustomobject]@{ Zone = $z; Total = $zf.Count; Fail = $zFail; Pass = $zf.Count - $zFail - $zInfo }
-    })
-    $idfSwitchCount = @($idfFindings | Select-Object -ExpandProperty Object -Unique).Count
+    $idfIssueRows = @($idfFindings | Group-Object RowNum | ForEach-Object {
+        $grp = $_.Group
+        $first = $grp[0]
+        $locText = ($grp | ForEach-Object {
+            if ($_.Object -eq '(unspecified location)') { $null }
+            elseif ($_.Group) { "$($_.Group): $($_.Object)" }
+            else { $_.Object }
+        } | Where-Object { $_ }) -join '; '
+        if (-not $locText) { $locText = '(no location specified)' }
+        [pscustomobject]@{
+            RowNum    = $first.RowNum
+            Issue     = $first.Item
+            Locations = $locText
+            Notes     = $first.Notes
+        }
+    } | Sort-Object { [int]($_.RowNum -replace '\D','0') })
+    $idfIssueCount = $idfIssueRows.Count
+    $idfLocationCount = @($idfFindings | Where-Object { $_.Object -ne '(unspecified location)' } | Select-Object -ExpandProperty Object -Unique).Count
 
     # --- Rack rollup ---
     $rackHealthFindings = @($SiteFindings | Where-Object { $_.Area -eq 'Rack' -and $_.Item -eq 'Rack Health' })
@@ -470,12 +531,12 @@ function Get-SiteDashboardSummary {
     $rackRows = @($rackRowsUnsorted | Sort-Object Rack)
     $rackCount = $rackRows.Count
     $rackHealthyCount = @($rackRows | Where-Object { $_.Status -eq 'Healthy' }).Count
-    $rackAttentionCount = @($rackRows | Where-Object { $_.Status -eq 'Warning' }).Count
+    $rackAttentionCount = @($rackRows | Where-Object { $_.Status -ne 'Healthy' }).Count
     $avgHealthPct = if ($rackCount -gt 0) { ($rackRows | Measure-Object -Property HealthPct -Average).Average } else { $null }
 
-    # --- Action plan: every Warning/Critical IDF/Rack-checklist/Node finding (the per-rack
-    # Health rollup itself is excluded here since it's already shown in the Rack Health panel). ---
-    $ActionItems = @($SiteFindings | Where-Object { $_.Status -in 'Critical','Warning' -and $_.Item -ne 'Rack Health' } |
+    # --- Action plan: every Rack/Node item needing attention (IDF issues get their own panel
+    # instead, and the per-rack Health rollup is already shown in the Rack Health panel). ---
+    $ActionItems = @($SiteFindings | Where-Object { $_.Status -in 'Critical','Warning' -and $_.Area -in 'Rack','Node' -and $_.Item -ne 'Rack Health' } |
         Sort-Object @{Expression = { if ($_.Status -eq 'Critical') { 0 } else { 1 } }} |
         ForEach-Object {
             [pscustomobject]@{
@@ -495,30 +556,30 @@ function Get-SiteDashboardSummary {
     elseif ($backupStatus -eq 'Warning' -and $OverallHealth -ne 'Critical') { $WarnCount++; $OverallHealth = 'Warning' }
 
     $SummaryText = if ($CritCount -gt 0) {
-        "$SiteLabel has $CritCount critical and $WarnCount warning item(s) across $($idfZones.Count) IDF zones and $rackCount racks that require attention."
+        "$SiteLabel has $CritCount critical and $WarnCount warning item(s) across $idfIssueCount IDF issue(s) and $rackCount racks that require attention."
     } elseif ($WarnCount -gt 0) {
-        "$SiteLabel is stable overall, with $WarnCount minor item(s) flagged across $($idfZones.Count) IDF zones and $rackCount racks - see the Action Plan below."
+        "$SiteLabel is stable overall, with $WarnCount minor item(s) flagged across $idfIssueCount IDF issue(s) and $rackCount racks - see the Action Plan below."
     } else {
-        "$SiteLabel's $($idfZones.Count) IDF zones and $rackCount racks are all reporting healthy with no items flagged."
+        "$SiteLabel's IDF rooms and $rackCount racks are all reporting healthy with no items flagged."
     }
 
     [pscustomobject]@{
-        Site               = $SiteLabel
-        OverallHealth      = $OverallHealth
-        HighRisk           = $CritCount
-        MediumRisk         = $WarnCount
-        IdfZoneCount       = $idfZones.Count
-        IdfSwitchCount     = $idfSwitchCount
-        IdfZoneRows        = $idfZoneRows
-        RackCount          = $rackCount
-        RackHealthyCount   = $rackHealthyCount
+        Site              = $SiteLabel
+        OverallHealth     = $OverallHealth
+        HighRisk          = $CritCount
+        MediumRisk        = $WarnCount
+        IdfIssueCount     = $idfIssueCount
+        IdfLocationCount  = $idfLocationCount
+        IdfIssueRows      = $idfIssueRows
+        RackCount         = $rackCount
+        RackHealthyCount  = $rackHealthyCount
         RackAttentionCount = $rackAttentionCount
-        AvgHealthPct       = $avgHealthPct
-        RackRows           = $rackRows
-        ActionItems        = $ActionItems
-        BackupSupplied     = $backupSupplied
-        BackupDetail       = $backupDetail
-        SummaryText        = $SummaryText
+        AvgHealthPct      = $avgHealthPct
+        RackRows          = $rackRows
+        ActionItems       = $ActionItems
+        BackupSupplied    = $backupSupplied
+        BackupDetail      = $backupDetail
+        SummaryText       = $SummaryText
     }
 }
 
@@ -535,10 +596,10 @@ function Write-DashboardHtml {
         Warning  = @($summaries | Where-Object { $_.OverallHealth -eq 'Warning' }).Count
         Critical = @($summaries | Where-Object { $_.OverallHealth -eq 'Critical' }).Count
     }
-    $totalHigh   = ($summaries | Measure-Object -Property HighRisk -Sum).Sum
-    $totalMedium = ($summaries | Measure-Object -Property MediumRisk -Sum).Sum
-    $totalZones  = ($summaries | Measure-Object -Property IdfZoneCount -Sum).Sum
-    $totalRacks  = ($summaries | Measure-Object -Property RackCount -Sum).Sum
+    $totalHigh      = ($summaries | Measure-Object -Property HighRisk -Sum).Sum
+    $totalMedium    = ($summaries | Measure-Object -Property MediumRisk -Sum).Sum
+    $totalIdfIssues = ($summaries | Measure-Object -Property IdfIssueCount -Sum).Sum
+    $totalRacks     = ($summaries | Measure-Object -Property RackCount -Sum).Sum
 
     $tabPalette = @('#2563EB','#7C3AED','#0D9488','#C026D3','#EA580C','#4F46E5','#DB2777','#0EA5E9')
     $tileBlue = '#1565C0'; $tilePurple = '#6A1B9A'; $tileTeal = '#00897B'; $tileIndigo = '#283593'; $tileBrown = '#6D4C41'
@@ -567,7 +628,7 @@ function Write-DashboardHtml {
         <div class="ov-head"><h2>$(ConvertTo-HtmlSafe $s.Site)</h2><span class="badge" style="background:$color">$(ConvertTo-HtmlSafe $healthLabelText[$s.OverallHealth])</span></div>
         <div class="risk-row"><span class="risk risk-high">High: $($s.HighRisk)</span><span class="risk risk-med">Medium: $($s.MediumRisk)</span></div>
         <table class="metrics">
-          <tr><td>IDF Zones / Switches</td><td>$($s.IdfZoneCount) / $($s.IdfSwitchCount)</td></tr>
+          <tr><td>IDF Issues Reported</td><td>$($s.IdfIssueCount) ($($s.IdfLocationCount) locations)</td></tr>
           <tr><td>Racks (Healthy / Attention)</td><td>$($s.RackCount) ($($s.RackHealthyCount) / $($s.RackAttentionCount))</td></tr>
           <tr><td>Average Rack Health</td><td>$avgHealthText</td></tr>
           <tr><td>Backup Status</td><td>$(ConvertTo-HtmlSafe $backupStatusText)</td></tr>
@@ -592,15 +653,17 @@ function Write-DashboardHtml {
         $slug = ConvertTo-Slug $s.Site
         $color = $healthColor[$s.OverallHealth]
 
-        $idfRows = if ($s.IdfZoneRows.Count -gt 0) {
-            ($s.IdfZoneRows | ForEach-Object {
-                $pct = if ($_.Total -gt 0) { ($_.Pass / $_.Total) * 100 } else { 0 }
+        # Each row carries a data-idf-row attribute so Infrastructure_Evidence_Photos.ps1 (a
+        # separate, optional script) can find the right insertion point when photos are supplied
+        # for a given month - this script itself never depends on photos existing.
+        $idfRows = if ($s.IdfIssueRows.Count -gt 0) {
+            ($s.IdfIssueRows | ForEach-Object {
 @"
-          <tr><td>$(ConvertTo-HtmlSafe $_.Zone)</td><td>$($_.Total)</td><td>$($_.Pass)</td><td>$($_.Fail)</td>
-            <td><div class="mini-bar-wrap"><div class="mini-bar-track"><div class="mini-bar-fill" style="width:$pct%;background:$(Get-PctBarColor $pct)"></div></div><span>$("{0:N0}" -f $pct)%</span></div></td></tr>
+          <tr data-idf-row="$(ConvertTo-HtmlSafe $_.RowNum)"><td>$(ConvertTo-HtmlSafe $_.RowNum)</td><td>$(ConvertTo-HtmlSafe $_.Issue)</td><td>$(ConvertTo-HtmlSafe $_.Locations)</td>
+            <td class="idf-evidence-cell"></td></tr>
 "@
             }) -join "`n"
-        } else { "<tr><td colspan='5' style='color:#999'>No IDF zone data found</td></tr>" }
+        } else { "<tr><td colspan='4' style='color:#999'>No IDF issues reported</td></tr>" }
 
         $rackRows = if ($s.RackRows.Count -gt 0) {
             ($s.RackRows | ForEach-Object {
@@ -624,7 +687,7 @@ function Write-DashboardHtml {
         $actionPlanBody = if ($actionRows) {
             "<ul class=`"action-list`">`n$actionRows`n</ul>"
         } else {
-            "<div class=`"center-callout`">$(Get-StatusPillHtml -Status 'Healthy' -Text 'No Warning or Critical items flagged for this site')</div>"
+            "<div class=`"center-callout`">$(Get-StatusPillHtml -Status 'Healthy' -Text 'No Rack/Node items flagged for this site')</div>"
         }
 
         $backupBody = if ($s.BackupSupplied -and $s.BackupDetail.Status -in 'Healthy','Warning','Critical') {
@@ -667,7 +730,7 @@ function Write-DashboardHtml {
         $avgHealthValueText = if ($s.AvgHealthPct -ne $null) { "{0:N1}%" -f $s.AvgHealthPct } else { 'n/a' }
 
 @"
-      <section class="page" id="page-$slug">
+      <section class="page" id="page-$slug" data-site="$(ConvertTo-HtmlSafe $s.Site)">
         <div class="site-hero" style="border-left-color:$color">
           <h1>$(ConvertTo-HtmlSafe $s.Site)</h1>
           <span class="badge big" style="background:$color">$(ConvertTo-HtmlSafe $healthLabelText[$s.OverallHealth])</span>
@@ -680,8 +743,8 @@ function Write-DashboardHtml {
         </div>
 
         <div class="tile-row">
-          <div class="tile" style="background:$tileBlue"><span class="num">$($s.IdfZoneCount)</span><span class="label">IDF Zones</span></div>
-          <div class="tile" style="background:$tilePurple"><span class="num">$($s.IdfSwitchCount)</span><span class="label">Switches / Cabinets</span></div>
+          <div class="tile" style="background:$tileBlue"><span class="num">$($s.IdfIssueCount)</span><span class="label">IDF Issues Reported</span></div>
+          <div class="tile" style="background:$tilePurple"><span class="num">$($s.IdfLocationCount)</span><span class="label">Locations Affected</span></div>
           <div class="tile" style="background:$tileTeal"><span class="num">$($s.RackCount)</span><span class="label">Racks</span></div>
           <div class="tile" style="background:#2e7d32"><span class="num">$($s.RackHealthyCount)</span><span class="label">Racks Healthy</span></div>
           <div class="tile" style="background:#c62828"><span class="num">$($s.RackAttentionCount)</span><span class="label">Racks Attention</span></div>
@@ -690,10 +753,10 @@ function Write-DashboardHtml {
 
         <div class="panel-grid">
           <div class="panel panel-full" style="border-top-color:$tilePurple">
-            <h3><span class="n" style="background:$tilePurple">&#127968;</span>IDF Room Health <span style="font-weight:normal;font-size:14px;color:#999">($($s.IdfZoneRows.Count) zones)</span></h3>
+            <h3><span class="n" style="background:$tilePurple">&#127968;</span>IDF Room Issues <span style="font-weight:normal;font-size:14px;color:#999">($($s.IdfIssueCount) reported)</span></h3>
             <div class="scroll-box">
               <table class="metrics wide">
-                <thead><tr><th>Zone</th><th>Total Checks</th><th>Pass</th><th>Fail</th><th>Pass Rate</th></tr></thead>
+                <thead><tr><th>No.</th><th>Issue</th><th>Affected Location(s)</th><th>Evidence</th></tr></thead>
                 <tbody>
 $idfRows
                 </tbody>
@@ -725,7 +788,7 @@ $backupBody
         </div>
 
         <div class="panel" style="border-top-color:#e6a100">
-          <h3><span class="n" style="background:#e6a100">&#9888;&#65039;</span>Action Plan - Items Requiring Attention</h3>
+          <h3><span class="n" style="background:#e6a100">&#9888;&#65039;</span>Action Plan - Rack/Node Items Requiring Attention</h3>
 $actionPlanBody
         </div>
       </section>
@@ -819,6 +882,7 @@ $actionPlanBody
   .backup-flag.healthy { background:#2e7d32; }
   .backup-flag.critical { background:#c62828; }
   .backup-flag.warn { background:#e6a100; }
+  .idf-evidence-cell img { max-width:90px; max-height:90px; border-radius:4px; box-shadow:0 1px 3px rgba(0,0,0,0.3); cursor:zoom-in; }
 </style>
 </head>
 <body>
@@ -835,7 +899,7 @@ $actionPlanBody
       <div class="stat" style="background:#e6a100"><span class="num">$($healthCounts.Warning)</span><span class="label">Sites with Warnings</span></div>
       <div class="stat" style="background:#c62828"><span class="num">$($healthCounts.Critical)</span><span class="label">Sites Critical</span></div>
       <div class="stat" style="background:#4F46E5"><span class="num">$totalMedium</span><span class="label">Total Medium Risk Issues</span></div>
-      <div class="stat" style="background:#1565C0"><span class="num">$totalZones</span><span class="label">Total IDF Zones</span></div>
+      <div class="stat" style="background:#1565C0"><span class="num">$totalIdfIssues</span><span class="label">Total IDF Issues Reported</span></div>
       <div class="stat" style="background:#00897B"><span class="num">$totalRacks</span><span class="label">Total Racks</span></div>
     </div>
 
