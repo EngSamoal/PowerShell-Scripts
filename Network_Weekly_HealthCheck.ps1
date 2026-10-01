@@ -909,7 +909,7 @@ $actionPlanBody
   .tab { display:flex; align-items:center; justify-content:center; text-align:center; cursor:pointer; border:3px solid transparent; border-radius:10px; padding:28px 16px; font-family:inherit; font-weight:bold; font-size:18px; color:#fff; background:#1E3A5F; box-shadow:0 1px 4px rgba(0,0,0,0.2); min-height:90px; box-sizing:border-box; }
   .tab.active { border-color:#1a1a1a; box-shadow:0 0 0 3px rgba(0,0,0,0.15), 0 1px 4px rgba(0,0,0,0.2); }
   .dashboard-header { display:block; width:100%; text-align:left; background:#1E3A5F; border-radius:10px; padding:26px 32px; margin:24px 0 0; min-height:0; }
-  .dashboard-header h1 { color:#fff; font-size:36px; }
+  .dashboard-header h1 { color:#fff; font-size:46px; }
   .dashboard-header .subtitle { color:rgba(255,255,255,0.8); margin:8px 0 0; font-size:16px; }
   .tabs { display:grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap:20px; padding:24px 0 20px; position:sticky; top:0; background:#eef1f5; z-index:10; border-bottom:1px solid #dfe3e8; margin-bottom:32px; }
   .page { display:none; }
@@ -1022,8 +1022,8 @@ $actionPlanBody
 </head>
 <body>
   <button type="button" class="tab dashboard-header active" id="tab-overview" onclick="showPage('overview')">
-    <h1>Network Weekly Health Check - Dashboard</h1>
-    <p class="subtitle">Generated $(ConvertTo-HtmlSafe $RunDateDisplay) - $($summaries.Count) site(s)</p>
+    <h1>Overview</h1>
+    <p class="subtitle">Network Weekly Health Check - Dashboard | Generated $(ConvertTo-HtmlSafe $RunDateDisplay) - $($summaries.Count) site(s)</p>
   </button>
 
   <nav class="tabs">
