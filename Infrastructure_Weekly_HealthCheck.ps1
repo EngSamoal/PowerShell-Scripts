@@ -110,8 +110,7 @@ function New-Finding {
         Site = $Site; Area = $Area; Group = $Group; Object = $Object
         Item = $Item; Value = $Value; Status = $Status; Notes = $Notes
     }
-    $Global:AllResults.Add($obj)
-    return $obj
+    $Global:AllResults.Add($obj) | Out-Null
 }
 
 function Get-WorstStatus {
