@@ -506,6 +506,11 @@ function Get-SiteDashboardSummary {
     } | Sort-Object { [int]($_.RowNum -replace '\D','0') })
     $idfIssueCount = $idfIssueRows.Count
     $idfLocationCount = @($idfFindings | Where-Object { $_.Object -ne '(unspecified location)' } | Select-Object -ExpandProperty Object -Unique).Count
+    # Most-affected locations, for a compact "where are the problems" visualization at the top
+    # of the IDF Room Issues panel - cheaper to scan than reading every individual issue card.
+    $idfLocationCounts = @($idfFindings | Where-Object { $_.Object -ne '(unspecified location)' } |
+        Group-Object Object | Sort-Object Count -Descending | Select-Object -First 8 |
+        ForEach-Object { [pscustomobject]@{ Location = $_.Name; Count = $_.Count } })
 
     # --- Rack rollup ---
     $rackHealthFindings = @($SiteFindings | Where-Object { $_.Area -eq 'Rack' -and $_.Item -eq 'Rack Health' })
@@ -570,6 +575,7 @@ function Get-SiteDashboardSummary {
         IdfIssueCount      = $idfIssueCount
         IdfLocationCount   = $idfLocationCount
         IdfIssueRows       = $idfIssueRows
+        IdfLocationCounts  = $idfLocationCounts
         RackCount          = $rackCount
         RackHealthyCount   = $rackHealthyCount
         RackAttentionCount = $rackAttentionCount
@@ -588,8 +594,11 @@ function Write-DashboardHtml {
 
     $healthColor = @{ Healthy = '#2e7d32'; Warning = '#e6a100'; Critical = '#c62828' }
     $healthLabelText = @{ Healthy = 'Healthy - No Issues Detected'; Warning = 'Healthy - Minor Issues Detected'; Critical = 'Attention Required - Critical Issues' }
+    # Mutually exclusive - each site counts toward exactly one bucket, so these three always sum
+    # to the total number of sites (a site previously could count as both "Healthy" and "Warning"
+    # at once, which didn't add up).
     $healthCounts = @{
-        Healthy  = @($summaries | Where-Object { $_.OverallHealth -ne 'Critical' }).Count
+        Healthy  = @($summaries | Where-Object { $_.OverallHealth -eq 'Healthy' }).Count
         Warning  = @($summaries | Where-Object { $_.OverallHealth -eq 'Warning' }).Count
         Critical = @($summaries | Where-Object { $_.OverallHealth -eq 'Critical' }).Count
     }
@@ -598,7 +607,7 @@ function Write-DashboardHtml {
     $totalIdfIssues = ($summaries | Measure-Object -Property IdfIssueCount -Sum).Sum
     $totalRacks     = ($summaries | Measure-Object -Property RackCount -Sum).Sum
 
-    $tabPalette = @('#2563EB','#7C3AED','#0D9488','#C026D3','#EA580C','#4F46E5','#DB2777','#0EA5E9')
+    $tabPalette = @('#2C5577','#3F6652','#6B3F42','#5B4B77','#7A5C3E','#45586B','#3E6B6B','#5A5240')
     $tileBlue = '#1565C0'; $tilePurple = '#6A1B9A'; $tileTeal = '#00897B'; $tileIndigo = '#283593'
 
     function Get-StatusPillHtml {
@@ -651,20 +660,33 @@ function Write-DashboardHtml {
         # Each card carries a data-idf-row attribute so Network_Evidence_Photos.ps1 (a separate,
         # optional script) can find the right insertion point when photos are supplied for a
         # given month - this script itself never depends on photos existing.
+        $idfLocationBars = if ($s.IdfLocationCounts.Count -gt 1) {
+            $maxCount = ($s.IdfLocationCounts | Measure-Object -Property Count -Maximum).Maximum
+            $bars = ($s.IdfLocationCounts | ForEach-Object {
+                $pct = [Math]::Round(($_.Count / $maxCount) * 100)
+@"
+            <div class="loc-bar-row"><span class="loc-bar-label">$(ConvertTo-HtmlSafe $_.Location)</span><div class="loc-bar-track"><div class="loc-bar-fill" style="width:$pct%"></div></div><span class="loc-bar-count">$($_.Count)</span></div>
+"@
+            }) -join "`n"
+@"
+          <div class="loc-bar-chart">
+            <div class="loc-bar-chart-title">Most affected locations</div>
+$bars
+          </div>
+"@
+        } else { '' }
+
         $idfRows = if ($s.IdfIssueRows.Count -gt 0) {
             ($s.IdfIssueRows | ForEach-Object {
                 $chips = if ($_.Locations.Count -gt 0) {
                     (($_.Locations | ForEach-Object { "<span class=`"loc-chip`">$(ConvertTo-HtmlSafe $_)</span>" }) -join '')
-                } else { '<span class="loc-chip loc-chip-empty">No location specified</span>' }
+                } else { '<span class="loc-chip loc-chip-empty">No location</span>' }
 @"
           <div class="idf-issue-card" data-idf-row="$(ConvertTo-HtmlSafe $_.RowNum)">
-            <div class="issue-no">$(ConvertTo-HtmlSafe $_.RowNum)</div>
-            <div class="issue-body">
-              <div class="issue-title">$(ConvertTo-HtmlSafe $_.Issue)</div>
-              <div class="loc-chips">$chips</div>
-$(if ($_.Notes) { "              <div class=`"issue-notes`">$(ConvertTo-HtmlSafe $_.Notes)</div>" })
-              <div class="idf-evidence-cell"></div>
-            </div>
+            <div class="issue-head"><span class="issue-no">$(ConvertTo-HtmlSafe $_.RowNum)</span><span class="issue-title">$(ConvertTo-HtmlSafe $_.Issue)</span></div>
+            <div class="loc-chips">$chips</div>
+$(if ($_.Notes) { "            <div class=`"issue-notes`">$(ConvertTo-HtmlSafe $_.Notes)</div>" })
+            <div class="idf-evidence-cell"></div>
           </div>
 "@
             }) -join "`n"
@@ -696,11 +718,10 @@ $(if ($_.Comments) { "            <div class=`"rack-comment`">$(ConvertTo-HtmlSa
                 $location = if ($_.Group -and $_.Group -ne $_.Object) { "$($_.Group) / $($_.Object)" } else { "$($_.Object)" }
 @"
           <div class="action-card $sevClass">
-            <span class="sev-badge $sevClass">$($_.Severity)</span>
-            <div class="ac-body">
-              <div class="ac-title">$(ConvertTo-HtmlSafe $_.Item): $(ConvertTo-HtmlSafe $_.Value)</div>
-              <div class="ac-sub">$(ConvertTo-HtmlSafe $location)$(if ($_.Notes) { " - $(ConvertTo-HtmlSafe $_.Notes)" })</div>
-            </div>
+            <div class="ac-head"><span class="sev-badge $sevClass">$($_.Severity)</span></div>
+            <div class="ac-title">$(ConvertTo-HtmlSafe $_.Item): $(ConvertTo-HtmlSafe $_.Value)</div>
+            <div class="ac-sub">$(ConvertTo-HtmlSafe $location)</div>
+$(if ($_.Notes) { "            <div class=`"ac-notes`">$(ConvertTo-HtmlSafe $_.Notes)</div>" })
           </div>
 "@
             }) -join "`n"
@@ -738,6 +759,7 @@ $(if ($_.Comments) { "            <div class=`"rack-comment`">$(ConvertTo-HtmlSa
         <div class="panel-grid">
           <div class="panel panel-full" style="border-top-color:$tilePurple">
             <h3><span class="n" style="background:$tilePurple">&#127968;</span>IDF Room Issues <span style="font-weight:normal;font-size:14px;color:#999">($($s.IdfIssueCount) reported)</span></h3>
+$idfLocationBars
             <div class="idf-issue-list">
 $idfRows
             </div>
@@ -832,19 +854,27 @@ $actionPlanBody
   .summary-text { color:#444; font-size:15px; line-height:1.6; }
   .center-callout { text-align:center; padding:8px 0 18px; }
 
-  /* IDF Room Issues - one card per reported issue */
-  .idf-issue-list { display:flex; flex-direction:column; gap:12px; }
-  .idf-issue-card { display:flex; gap:16px; padding:16px 18px; border-radius:8px; background:#fff; border-left:5px solid #e6a100; box-shadow:0 1px 3px rgba(0,0,0,0.08); }
-  .idf-issue-card .issue-no { flex-shrink:0; width:34px; height:34px; border-radius:50%; background:#e6a100; color:#fff; display:flex; align-items:center; justify-content:center; font-weight:bold; font-size:14px; }
-  .idf-issue-card .issue-body { flex:1; min-width:0; }
-  .idf-issue-card .issue-title { font-weight:bold; font-size:15px; color:#1a1a1a; margin-bottom:8px; }
-  .idf-issue-card .issue-notes { font-size:13px; color:#8a6100; margin-top:6px; font-style:italic; }
-  .loc-chips { display:flex; flex-wrap:wrap; gap:6px; }
-  .loc-chip { display:inline-block; background:#eef2f5; color:#444; font-size:12px; font-weight:600; padding:4px 11px; border-radius:12px; }
+  /* IDF Room Issues - most-affected-locations mini chart + a compact grid of issue tiles */
+  .loc-bar-chart { background:#fafbfc; border:1px solid #f0f0f0; border-radius:8px; padding:14px 18px; margin-bottom:16px; }
+  .loc-bar-chart-title { font-size:12px; font-weight:bold; color:#999; text-transform:uppercase; margin-bottom:10px; }
+  .loc-bar-row { display:flex; align-items:center; gap:10px; margin-bottom:7px; }
+  .loc-bar-row:last-child { margin-bottom:0; }
+  .loc-bar-label { flex:0 0 90px; font-size:13px; font-weight:600; color:#444; text-align:right; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .loc-bar-track { flex:1; height:10px; background:#eef1f4; border-radius:5px; overflow:hidden; }
+  .loc-bar-fill { height:100%; border-radius:5px; background:#6A1B9A; }
+  .loc-bar-count { flex:0 0 20px; font-size:12.5px; font-weight:bold; color:#666; }
+  .idf-issue-list { display:grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap:12px; align-items:start; }
+  .idf-issue-card { padding:12px 14px; border-radius:8px; background:#fff; border-left:4px solid #e6a100; box-shadow:0 1px 3px rgba(0,0,0,0.08); }
+  .idf-issue-card .issue-head { display:flex; align-items:center; gap:8px; margin-bottom:8px; }
+  .idf-issue-card .issue-no { flex-shrink:0; width:22px; height:22px; border-radius:50%; background:#e6a100; color:#fff; display:flex; align-items:center; justify-content:center; font-weight:bold; font-size:11px; }
+  .idf-issue-card .issue-title { font-weight:bold; font-size:13.5px; color:#1a1a1a; line-height:1.3; }
+  .idf-issue-card .issue-notes { font-size:12px; color:#8a6100; margin-top:7px; font-style:italic; }
+  .loc-chips { display:flex; flex-wrap:wrap; gap:5px; }
+  .loc-chip { display:inline-block; background:#eef2f5; color:#444; font-size:11px; font-weight:600; padding:3px 9px; border-radius:11px; }
   .loc-chip-empty { background:#f5f5f5; color:#999; font-weight:normal; font-style:italic; }
   .idf-evidence-cell:empty { display:none; }
-  .idf-evidence-cell { margin-top:10px; display:flex; gap:8px; flex-wrap:wrap; }
-  .idf-evidence-cell img { max-width:90px; max-height:90px; border-radius:4px; box-shadow:0 1px 3px rgba(0,0,0,0.3); cursor:zoom-in; }
+  .idf-evidence-cell { margin-top:8px; display:flex; gap:6px; flex-wrap:wrap; }
+  .idf-evidence-cell img { max-width:70px; max-height:70px; border-radius:4px; box-shadow:0 1px 3px rgba(0,0,0,0.3); cursor:zoom-in; }
 
   /* Rack Health - one card per rack */
   .rack-grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap:14px; }
@@ -856,15 +886,16 @@ $actionPlanBody
   .rack-card .rack-stats { font-size:12.5px; color:#555; display:flex; flex-direction:column; gap:4px; padding-top:10px; border-top:1px solid #f0f0f0; }
   .rack-card .rack-comment { font-size:12.5px; color:#8a6100; margin-top:10px; font-style:italic; }
 
-  /* Action Plan - one card per item */
-  .action-grid { display:flex; flex-direction:column; gap:12px; }
-  .action-card { display:flex; gap:14px; padding:16px 18px; border-radius:8px; background:#fff; border:1px solid #eee; border-left:5px solid #c62828; box-shadow:0 1px 3px rgba(0,0,0,0.08); align-items:flex-start; }
+  /* Action Plan - one card per item, adjacent boxes like Rack Health */
+  .action-grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap:14px; align-items:start; }
+  .action-card { padding:14px 16px; border-radius:8px; background:#fff; border:1px solid #eee; border-left:5px solid #c62828; box-shadow:0 1px 3px rgba(0,0,0,0.08); }
   .action-card.med { border-left-color:#e6a100; }
-  .action-card .sev-badge { flex-shrink:0; padding:5px 12px; border-radius:6px; font-size:12px; font-weight:bold; white-space:nowrap; background:#fdecea; color:#c62828; }
+  .action-card .ac-head { margin-bottom:8px; }
+  .action-card .sev-badge { padding:4px 11px; border-radius:6px; font-size:11.5px; font-weight:bold; white-space:nowrap; background:#fdecea; color:#c62828; }
   .action-card .sev-badge.med { background:#fff6e0; color:#8a6100; }
-  .action-card .ac-body { flex:1; min-width:0; }
-  .action-card .ac-title { font-weight:bold; font-size:15px; color:#1a1a1a; margin-bottom:4px; }
-  .action-card .ac-sub { font-size:13.5px; color:#666; }
+  .action-card .ac-title { font-weight:bold; font-size:14px; color:#1a1a1a; margin-bottom:5px; line-height:1.3; }
+  .action-card .ac-sub { font-size:12.5px; color:#666; }
+  .action-card .ac-notes { font-size:12px; color:#8a6100; margin-top:6px; font-style:italic; }
 </style>
 </head>
 <body>
