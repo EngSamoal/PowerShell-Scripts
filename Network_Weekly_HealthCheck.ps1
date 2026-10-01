@@ -990,8 +990,12 @@ $actionPlanBody
   .loc-chip { display:inline-block; background:#eef2f5; color:#444; font-size:11px; font-weight:600; padding:3px 9px; border-radius:11px; }
   .loc-chip-empty { background:#f5f5f5; color:#999; font-weight:normal; font-style:italic; }
   .idf-evidence-cell:empty { display:none; }
-  .idf-evidence-cell { margin-top:8px; display:flex; gap:6px; flex-wrap:wrap; }
-  .idf-evidence-cell img { max-width:70px; max-height:70px; border-radius:4px; box-shadow:0 1px 3px rgba(0,0,0,0.3); cursor:zoom-in; }
+  .idf-evidence-cell { margin-top:8px; }
+  .evidence-toggle-btn { display:inline-flex; align-items:center; gap:5px; padding:4px 11px; border-radius:12px; border:1px solid #d8c3e3; background:#f3eaf7; color:#6A1B9A; font-size:11px; font-weight:700; font-family:inherit; cursor:pointer; }
+  .evidence-toggle-btn:hover { background:#e9d6f0; }
+  .evidence-photos { display:none; gap:6px; flex-wrap:wrap; margin-top:8px; }
+  .evidence-photos.show { display:flex; }
+  .evidence-photos img { max-width:70px; max-height:70px; border-radius:4px; box-shadow:0 1px 3px rgba(0,0,0,0.3); cursor:zoom-in; }
 
   /* No-data placeholder page (template site with no workbook paths supplied yet) */
   .nodata-panel { text-align:center; padding:48px 24px; }
@@ -1056,6 +1060,10 @@ function showPage(slug) {
   if (page) { page.classList.add('active'); }
   if (tab) { tab.classList.add('active'); }
   window.scrollTo(0, 0);
+}
+function toggleEvidence(id) {
+  var el = document.getElementById(id);
+  if (el) { el.classList.toggle('show'); }
 }
 </script>
 </body>

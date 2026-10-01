@@ -17,8 +17,9 @@
          png/gif/bmp).
       4. Embeds each matching photo (as a base64 data URI, so the dashboard stays a single
          portable .html file with no separate image files to keep alongside it) into that row's
-         evidence cell, scoped to the correct site so a "row 10" picture for SixFlags can never
-         land on AquaArabia's row 10 (or vice versa).
+         evidence cell behind a "View Evidence" toggle button - photos stay hidden until that
+         button (or a shown photo itself, to open it full-size) is clicked - scoped to the
+         correct site so a "row 10" picture for SixFlags can never land on AquaArabia's row 10.
       5. Writes the result to a new file (never overwrites the original dashboard) and reports
          which rows got photos, which picture files didn't match any row, and which rows with
          issues have no photos supplied.
@@ -80,9 +81,19 @@ function Get-RowPhotoMap {
     return [pscustomobject]@{ Map = $map; Unmatched = $unmatched }
 }
 
-function ConvertTo-ImgTagsHtml {
-    param([object[]]$Photos)
-    $tags = foreach ($p in $Photos) {
+function ConvertTo-Slug {
+    param([string]$Text)
+    $slug = ($Text -replace '[^a-zA-Z0-9]+', '-').Trim('-').ToLower()
+    if (-not $slug) { return 'x' }
+    return $slug
+}
+
+# Builds a toggle button + hidden photo strip (collapsed by default - the dashboard's own
+# toggleEvidence() JS, already in Network_Weekly_HealthCheck.ps1's template, shows/hides it on
+# click) rather than embedding the photos directly inline and always visible.
+function ConvertTo-EvidenceHtml {
+    param([object[]]$Photos, [string]$ToggleId)
+    $imgTags = foreach ($p in $Photos) {
         $mime = $MimeByExt[$p.Ext]
         if (-not $mime) { continue }
         $bytes = [System.IO.File]::ReadAllBytes($p.Path)
@@ -90,7 +101,9 @@ function ConvertTo-ImgTagsHtml {
         $dataUri = "data:$mime;base64,$b64"
         "<a href=`"$dataUri`" target=`"_blank`"><img src=`"$dataUri`" alt=`"Evidence photo`"></a>"
     }
-    return ($tags -join ' ')
+    $imgHtml = $imgTags -join ' '
+    $label = if ($Photos.Count -eq 1) { '1 photo' } else { "$($Photos.Count) photos" }
+    return "<button type=`"button`" class=`"evidence-toggle-btn`" onclick=`"toggleEvidence('$ToggleId')`">&#128247; View Evidence ($label)</button><div class=`"evidence-photos`" id=`"$ToggleId`">$imgHtml</div>"
 }
 
 Write-Host "Network_Evidence_Photos.ps1" -ForegroundColor Magenta
@@ -133,9 +146,10 @@ foreach ($siteFolder in $siteFolders) {
 
     foreach ($rowNum in $dashboardRows) {
         if ($rowPhotoMap.ContainsKey($rowNum)) {
-            $imgHtml = ConvertTo-ImgTagsHtml -Photos $rowPhotoMap[$rowNum]
+            $toggleId = "evidence-$(ConvertTo-Slug $siteName)-$(ConvertTo-Slug $rowNum)"
+            $evidenceHtml = ConvertTo-EvidenceHtml -Photos $rowPhotoMap[$rowNum] -ToggleId $toggleId
             $rowPattern = '(?s)(<div class="idf-issue-card" data-idf-row="' + [regex]::Escape($rowNum) + '"[^>]*>.*?<div class="idf-evidence-cell">)(</div>)'
-            $newSectionBody = [regex]::Replace($sectionBody, $rowPattern, { param($m) $m.Groups[1].Value + $imgHtml + $m.Groups[2].Value }, 1)
+            $newSectionBody = [regex]::Replace($sectionBody, $rowPattern, { param($m) $m.Groups[1].Value + $evidenceHtml + $m.Groups[2].Value }, 1)
             if ($newSectionBody -eq $sectionBody) {
                 Write-Warning "Row $rowNum - found photo(s) but could not locate its table row in the HTML (unexpected)."
             } else {
