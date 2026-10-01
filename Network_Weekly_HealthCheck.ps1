@@ -602,6 +602,13 @@ function Write-DashboardHtml {
         Warning  = @($summaries | Where-Object { $_.OverallHealth -eq 'Warning' }).Count
         Critical = @($summaries | Where-Object { $_.OverallHealth -eq 'Critical' }).Count
     }
+    # "Healthy" requires a site to have zero flagged items at all (no IDF issues, every rack/
+    # device check passing) - a strict bar that's genuinely rare across 15-20 racks per site in
+    # a real week, so a 0 here isn't a scoring error. Shown directly under the tile when it's 0
+    # so the number doesn't read as unexplained or alarming.
+    $healthyNoteHtml = if ($healthCounts.Healthy -eq 0) {
+        '<div class="stat-note">0 is expected here - "Healthy" requires zero flagged items anywhere; see Warning below for sites with only minor issues</div>'
+    } else { '' }
     $totalHigh      = ($summaries | Measure-Object -Property HighRisk -Sum).Sum
     $totalMedium    = ($summaries | Measure-Object -Property MediumRisk -Sum).Sum
     $totalIdfIssues = ($summaries | Measure-Object -Property IdfIssueCount -Sum).Sum
@@ -807,6 +814,7 @@ $actionPlanBody
   .stat { border-radius:10px; padding:18px 20px; text-align:center; box-shadow:0 1px 4px rgba(0,0,0,0.14); }
   .stat .num { font-size:32px; font-weight:bold; display:block; color:#fff; }
   .stat .label { font-size:14px; margin-top:4px; display:block; color:#fff; }
+  .stat .stat-note { font-size:11px; margin-top:8px; color:rgba(255,255,255,0.85); line-height:1.4; }
 
   .ov-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap:24px; }
   .ov-card { background:#fff; border-radius:10px; padding:24px 26px; box-shadow:0 1px 4px rgba(0,0,0,0.14); border-top:6px solid; cursor:pointer; }
@@ -908,7 +916,7 @@ $actionPlanBody
 
   <section class="page active" id="page-overview">
     <div class="stat-row">
-      <div class="stat" style="background:#2e7d32"><span class="num">$($healthCounts.Healthy)</span><span class="label">Healthy Sites</span></div>
+      <div class="stat" style="background:#2e7d32"><span class="num">$($healthCounts.Healthy)</span><span class="label">Healthy Sites</span>$healthyNoteHtml</div>
       <div class="stat" style="background:#e6a100"><span class="num">$($healthCounts.Warning)</span><span class="label">Sites with Warnings</span></div>
       <div class="stat" style="background:#c62828"><span class="num">$($healthCounts.Critical)</span><span class="label">Sites Critical</span></div>
       <div class="stat" style="background:#4F46E5"><span class="num">$totalMedium</span><span class="label">Total Medium Risk Issues</span></div>
