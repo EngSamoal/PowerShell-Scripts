@@ -45,7 +45,7 @@
         <SiteMap>
           <Site vCenter="tb-dhci-vc01.seventb.local" Name="Tabuk" />
           <Site vCenter="sf-vc.sixflags.local" Name="SF" />
-          <Site vCenter="amc-vc.amc.local" Name="AMC" />
+          <Site vCenter="amc-vc.amc.local" Name="SceneCinema" />
         </SiteMap>
     "vCenter" must match the server name exactly as it appears when connected (the same string
     shown in "Connected vCenter sessions: ..." when the script starts). Missing/unreadable file is
@@ -77,7 +77,7 @@ param(
     # ---- Data NOT available from vCenter - keyed by Site label (see .NOTES) ---------------
     # Appliance/Schedule/Retention/Status per site, plus an optional Notes reason shown when
     # Status is Warning/Critical (e.g. an expired license) - defaults reflect the current real
-    # backup setup: Cohesity nightly at 2:00 AM for every site except AMC, which runs Veeam at
+    # backup setup: Cohesity nightly at 2:00 AM for every site except SceneCinema, which runs Veeam at
     # 5:00 AM and is flagged Critical because its license has expired. SEVEN ALhamra is a newly
     # handed-over site whose backup management hasn't been handed over to this team yet - Status
     # 'Manual/External Required' (with a Notes reason) renders it as a distinct "not yet ours"
@@ -87,7 +87,7 @@ param(
         'SEVEN Tabuk'   = @{ Appliance = 'Cohesity'; Schedule = '2:00 AM'; Retention = '15 Day - 4 Weeks - 1 Month'; Status = 'Healthy' }
         'SEVEN ABHA'    = @{ Appliance = 'Cohesity'; Schedule = '2:00 AM'; Retention = '15 Day - 4 Weeks - 1 Month'; Status = 'Healthy' }
         'SEVEN ALhamra' = @{ Status = 'Manual/External Required'; Notes = 'Site recently handed over - backup management not yet handed over to this team.' }
-        'AMC'           = @{ Appliance = 'Veeam'; Schedule = '5:00 AM'; Retention = '15 Day - 4 Weeks - 1 Month'; Status = 'Critical'; Notes = 'Veeam license expired' }
+        'SceneCinema'   = @{ Appliance = 'Veeam'; Schedule = '5:00 AM'; Retention = '15 Day - 4 Weeks - 1 Month'; Status = 'Critical'; Notes = 'Veeam license expired' }
     },
 
     # Local ESXi accounts considered normal/expected; anything extra found on a host is flagged.
@@ -103,7 +103,7 @@ param(
     # Display order for site tabs/rows in the HTML dashboard (Overview always comes first,
     # regardless of this list). Any connected site NOT in this list is appended afterward,
     # alphabetically, so a new/unlisted site still appears rather than being dropped.
-    [string[]]$DashboardSiteOrder = @('SF-AQ','SEVEN Tabuk','SEVEN ABHA','SEVEN ALhamra','AMC'),
+    [string[]]$DashboardSiteOrder = @('SF-AQ','SEVEN Tabuk','SEVEN ABHA','SEVEN ALhamra','SceneCinema'),
 
     # Configurable thresholds - NOT vendor/company-defined standards. Raw values are always
     # shown regardless of these; these only drive the Warning/Critical flag shown alongside them.
@@ -320,7 +320,7 @@ foreach ($VC in $Connections) {
     $Clusters = Invoke-SafeCheck -CheckName 'Cluster discovery' -VCenter $VCName -Site $Site -ObjectName $VCName -Script {
         $allClusters = Get-Cluster -Server $VC
         # Substring match rather than exact equality - a trailing space, prefix, or suffix in the
-        # real cluster name (e.g. "RGL-01" or "AMC_RGL") would silently defeat an exact match, and
+        # real cluster name (e.g. "RGL-01" or "SceneCinema_RGL") would silently defeat an exact match, and
         # exclusion failing SILENTLY is worse than it matching a little too broadly.
         $kept = $allClusters | Where-Object {
             $clusterName = $_.Name
