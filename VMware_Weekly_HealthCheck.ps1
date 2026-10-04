@@ -1,8 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    VMware Weekly Health Check - Read-only automated collection and PDF report generation,
-    matching the "<Site> vCenter & ESXi Health Check Report" template (SAMI/Qiddiya format).
+    VMware Weekly Health Check - Read-only automated collection and HTML dashboard generation.
 
 .DESCRIPTION
     Replaces the manual weekly vCenter/ESXi health-check reports with a single read-only
@@ -11,41 +10,35 @@
     - Uses whatever vCenter sessions are already connected (Connect-VIServer done beforehand).
     - Auto-discovers clusters, hosts, datastores, vSAN, vDS/port groups and VMs per vCenter -
       nothing about the infrastructure is hard-coded.
-    - Produces ONE .pdf per connected vCenter ("site"), matching the exact section layout,
-      wording and table structure of the reference report:
-        1.  Executive Summary
-        2.  Environment Overview
-        3.  vCenter Server Health (3.1 Appliance Health)
-        4.  ESXi Host Health (4.1 Host Configuration Summary, 4.2 Hardware Health)
-        5.  Networking Health (5.1 Network Overview, 5.2 Network Configuration Status)
-        6.  Performance & Capacity Summary (6.1 CPU, 6.2 Memory, 6.3 Storage)
-        7.  Storage Health (array hardware + per-datastore table)
-        8.  Virtual Machine Inventory Summary (8.1 VM OS Distribution)
-        9.  Security & Compliance
-        10. Risks & Recommendations (Backup & Disaster Recovery)
-        11. Action Plan
-        12. Conclusion, Prepared By / Report Date
-      with a company header (logos + date) and classification footer repeated on every page.
-    - When a vCenter has more than one cluster, the per-cluster tables (4.1, 6.1-6.3, 8.1) simply
-      grow one row per cluster instead of collapsing to a single row - the section layout itself
-      does not change.
+    - Produces ONE combined HTML dashboard covering every connected vCenter ("site"), with an
+      Overview page (most important points across all sites) and one full-detail page per site
+      covering:
+        - Executive summary (risk counts, DRS/HA)
+        - Environment overview (versions, hosts, clusters, storage type)
+        - Networking health (vDS/VLANs, NIC teaming, MTU consistency, NIC redundancy)
+        - Performance & capacity (CPU/Memory/Storage utilization)
+        - Storage / datastores (full per-datastore table)
+        - VM inventory / guest OS distribution
+        - Security & compliance (Lockdown Mode, Secure Boot, local accounts, syslog)
+        - Backup & disaster recovery
+        - Action plan (itemized Warning/Critical findings)
+        - Per-cluster breakdown
+      Appliance health and host hardware-sensor checks are intentionally NOT collected or
+      reported - out of scope for this dashboard.
+    - When a vCenter has more than one cluster, per-cluster data (hosts, capacity, VM counts)
+      is aggregated up to the site level for the dashboard, with its own per-cluster table too.
     - A failure collecting one item is logged and skipped; the script always continues.
     - NEVER writes/modifies anything in vCenter. Every cmdlet used below is read-only
       (Get-*, no Set-*/New-*/Remove-*, no config changes, no SSH enablement).
 
 .NOTES
-    Every threshold below (capacity %, cert/license expiry windows) is a CONFIGURABLE PARAMETER,
-    not an assumed company standard - raw values/status are always shown alongside any computed
-    flag.
+    Every threshold below (capacity %, license expiry windows) is a CONFIGURABLE PARAMETER, not
+    an assumed company standard - raw values/status are always shown alongside any computed flag.
 
-    Two parts of the reference report are NOT available from vCenter/PowerCLI by design:
-      - Section 7's physical storage-array details (software version, compression, controller
-        A/B state, disk count, link/power status) come from the array's own management plane
-        (e.g. NetApp ONTAP System Manager), not vCenter. Supply them via -StorageArrayInfo.
-      - Section 3.1's "Backup" row and Section 10 (Backup & Disaster Recovery) come from the
-        backup product's own console (e.g. Cohesity), not vCenter. Supply them via -BackupInfo.
-    If not supplied for a given site, those sections are rendered as "Manual/External Required"
-    rather than fabricated.
+    Backup & Disaster Recovery status comes from the backup product's own console (e.g. Cohesity,
+    Veeam), not vCenter - supply/override it via -BackupInfo (defaults are pre-filled for the
+    current real sites). If a site isn't in -BackupInfo at all, that panel is rendered as
+    "Manual/External Required" rather than fabricated.
 
     -SiteMapPath (default C:\temp\VMware_Weekly_Health_Check_SiteMap.xml) is loaded automatically if the file exists, so you
     don't have to retype -SiteMap on every run. Expected shape - one <Site> element per vCenter:
@@ -59,25 +52,19 @@
     not an error - the script just falls back to -SiteMap / the automatic name detection below.
 
 .EXAMPLE
-    # Already connected: Connect-VIServer tb-vc.aq.local
-    .\VMware_Weekly_HealthCheck.ps1 -SiteMap @{'tb-vc.aq.local'='Tabuk'} `
-        -StorageArrayInfo @{ 'Tabuk' = @{ SoftwareVersion='10.4.20'; CompressionPct=99;
-            ControllerA='Active'; ControllerB='Standby'; DiskCount=28; DiskStatus='Healthy';
-            UtilizationUsedTiB=2.4; UtilizationTotalTiB=152.5;
-            LinksA='eth0a, eth0b is active'; LinksB='eth0a, eth0b is active';
-            PowerA='Power Supply active'; PowerB='Power Supply active' } } `
-        -BackupInfo @{ 'Tabuk' = @{ DeviceLabel='Cohesity Backup Device';
-            SolutionName='Cohesity Backup Solution'; Status='Healthy' } } `
-        -PreparedBy 'Ahmed Khalil' -PreparedByTitle 'Infrastructure Specialist' `
-        -LogoLeftPath 'C:\Logos\SAMI.png' -LogoRightPath 'C:\Logos\Qiddiya.png'
+    # Already connected: Connect-VIServer tb-vc.aq.local - overrides the built-in -BackupInfo
+    # default for this one site, e.g. once its Cohesity job history for the week is checked.
+    .\VMware_Weekly_HealthCheck.ps1 -SiteMap @{'tb-vc.aq.local'='SEVEN Tabuk'} `
+        -BackupInfo @{ 'SEVEN Tabuk' = @{ Appliance='Cohesity'; Schedule='2:00 AM';
+            Retention='15 Day - 4 Weeks - 1 Month'; Status='Healthy' } }
 #>
 
 [CmdletBinding()]
 param(
     # Maps a connected vCenter server (Name as shown in $global:DefaultVIServers) to a friendly
-    # site label used in the report title/filename. If a connected vCenter isn't in this map,
-    # its own server name is used as the label - nothing is hard-coded or required. Entries here
-    # always take precedence over -SiteMapPath below for the same vCenter.
+    # site label used in the dashboard. If a connected vCenter isn't in this map, its own server
+    # name is used as the label - nothing is hard-coded or required. Entries here always take
+    # precedence over -SiteMapPath below for the same vCenter.
     [hashtable]$SiteMap = @{},
 
     # Optional XML file of the same vCenter->site-label mappings, so you don't have to retype
@@ -87,22 +74,21 @@ param(
 
     [string]$OutputPath = (Join-Path $PSScriptRoot "VMware_HealthCheck_Reports"),
 
-    # ---- Report letterhead / sign-off -----------------------------------------------------
-    [string]$LogoLeftPath = '',
-    [string]$LogoRightPath = '',
-    [string]$FooterText = 'This email \ document has been classified as public',
-    [string]$PreparedBy = 'VMware Weekly Health Check Automation',
-    [string]$PreparedByTitle = '',
-
     # ---- Data NOT available from vCenter - keyed by Site label (see .NOTES) ---------------
-    # Example: @{ 'Tabuk' = @{ SoftwareVersion='10.4.20'; CompressionPct=99; ControllerA='Active';
-    #   ControllerB='Standby'; DiskCount=28; DiskStatus='Healthy'; UtilizationUsedTiB=2.4;
-    #   UtilizationTotalTiB=152.5; LinksA='eth0a, eth0b is active'; LinksB='eth0a, eth0b is active';
-    #   PowerA='Power Supply active'; PowerB='Power Supply active' } }
-    [hashtable]$StorageArrayInfo = @{},
-    # Example: @{ 'Tabuk' = @{ DeviceLabel='Cohesity Backup Device';
-    #   SolutionName='Cohesity Backup Solution'; Status='Healthy' } }
-    [hashtable]$BackupInfo = @{},
+    # Appliance/Schedule/Retention/Status per site, plus an optional Notes reason shown when
+    # Status is Warning/Critical (e.g. an expired license) - defaults reflect the current real
+    # backup setup: Cohesity nightly at 2:00 AM for every site except AMC, which runs Veeam at
+    # 5:00 AM and is flagged Critical because its license has expired. SEVEN ALhamra is a newly
+    # handed-over site whose backup management hasn't been handed over to this team yet - Status
+    # 'Manual/External Required' (with a Notes reason) renders it as a distinct "not yet ours"
+    # state rather than either a health status or the generic "no data supplied" panel.
+    [hashtable]$BackupInfo = @{
+        'SF-AQ'         = @{ Appliance = 'Cohesity'; Schedule = '2:00 AM'; Retention = '15 Day - 4 Weeks - 1 Month'; Status = 'Healthy' }
+        'SEVEN Tabuk'   = @{ Appliance = 'Cohesity'; Schedule = '2:00 AM'; Retention = '15 Day - 4 Weeks - 1 Month'; Status = 'Healthy' }
+        'SEVEN ABHA'    = @{ Appliance = 'Cohesity'; Schedule = '2:00 AM'; Retention = '15 Day - 4 Weeks - 1 Month'; Status = 'Healthy' }
+        'SEVEN ALhamra' = @{ Status = 'Manual/External Required'; Notes = 'Site recently handed over - backup management not yet handed over to this team.' }
+        'AMC'           = @{ Appliance = 'Veeam'; Schedule = '5:00 AM'; Retention = '15 Day - 4 Weeks - 1 Month'; Status = 'Critical'; Notes = 'Veeam license expired' }
+    },
 
     # Local ESXi accounts considered normal/expected; anything extra found on a host is flagged.
     [string[]]$ExpectedLocalAccounts = @('root','dcui','vpxuser'),
@@ -123,7 +109,6 @@ param(
     # shown regardless of these; these only drive the Warning/Critical flag shown alongside them.
     [double]$CapacityWarningPct    = 80,
     [double]$CapacityCriticalPct   = 90,
-    [int]$CertExpiryWarningDays    = 60,
     [int]$LicenseExpiryWarningDays = 30,
 
     # Historical performance window for capacity stats (hours), matches the 24-72h window used
@@ -134,7 +119,7 @@ param(
 # Bump this on every change. Printed first thing at startup and written into the log file, so
 # it's always possible to confirm exactly which script version produced a given run/report
 # instead of guessing whether an old cached copy is being executed somewhere.
-$ScriptBuild = '2026-09-27-22-distinct-site-tab-colors'
+$ScriptBuild = '2026-09-29-23-html-only-dashboard-no-appliance-hardware'
 Write-Host "VMware_Weekly_HealthCheck.ps1 - build $ScriptBuild" -ForegroundColor Magenta
 
 $ErrorActionPreference = 'Stop'
@@ -212,8 +197,7 @@ function New-Finding {
         [string]$Item, [string]$Value, [string]$Status, [string]$Notes = ''
     )
     # Area is a loose grouping used only to make report-building lookups readable:
-    #   Overview | Appliance | Alarms | Cluster | Host | Hardware | Security | Networking |
-    #   Capacity | Storage | VM
+    #   Overview | Alarms | Cluster | Host | Security | Networking | Capacity | Storage | VM
     # Status must be one of: Healthy / Warning / Critical / Information / Unable to Check / Manual/External Required
     $obj = [pscustomobject]@{
         Site    = $Site
@@ -235,65 +219,6 @@ function Get-PctStatus {
     if ($Pct -ge $CapacityCriticalPct) { return 'Critical' }
     elseif ($Pct -ge $CapacityWarningPct) { return 'Warning' }
     else { return 'Healthy' }
-}
-
-# Turns a raw VAMI/CIS exception message into a short label the Appliance Health table can
-# actually show - the table only ever renders an item's Value, never its Status or Notes, so a
-# generic 'n/a' made "session never connected", "connected but no permission", and "wrong API
-# call for this vCenter version" all look identical in the report with no way to tell them apart.
-function Get-VamiFailureReason {
-    param([string]$ErrorMessage)
-    if ($ErrorMessage -match 'unauthorized') { return 'Unauthorized (permission denied)' }
-    elseif ($ErrorMessage -match 'was not found using the specified filter') { return 'Not Found (API mismatch)' }
-    elseif ($ErrorMessage -match 'time(d)? ?out') { return 'Timed Out' }
-    else { return 'Unable to Check' }
-}
-
-# Reads vCenter's own HTTPS certificate directly over a raw TLS handshake to port 443 - this is
-# the exact same certificate the VAMI certificate_management API reports on, but needs NO vCenter
-# permission of any kind, only the same network reachability PowerCLI itself already relies on.
-# Used as the primary source for the Certificates row so it doesn't depend on VAMI/CIS access.
-function Get-RemoteCertificateExpiry {
-    param([string]$TargetHost, [int]$Port = 443, [int]$TimeoutMs = 5000)
-    $tcpClient = [System.Net.Sockets.TcpClient]::new()
-    try {
-        $connectTask = $tcpClient.ConnectAsync($TargetHost, $Port)
-        if (-not $connectTask.Wait($TimeoutMs)) { throw "Connection to ${TargetHost}:${Port} timed out after ${TimeoutMs}ms." }
-        $callback = [System.Net.Security.RemoteCertificateValidationCallback]{ param($s,$c,$ch,$e) $true }
-        $sslStream = [System.Net.Security.SslStream]::new($tcpClient.GetStream(), $false, $callback)
-        # Explicit TLS 1.2 (+1.3 where the runtime's SslProtocols enum has it) instead of the
-        # single-argument AuthenticateAsClient(hostname) overload, which lets the .NET
-        # Framework/SChannel default negotiation choose. On Windows PowerShell 5.1 that default can
-        # fail a modern TLS-only server with "A call to SSPI failed, see inner exception" - a
-        # well-known legacy-negotiation gap, not a problem with the target server itself.
-        $protocols = [System.Security.Authentication.SslProtocols]::Tls12
-        try { $protocols = $protocols -bor [System.Security.Authentication.SslProtocols]::Tls13 } catch { }
-        $sslStream.AuthenticateAsClient($TargetHost, $null, $protocols, $false)
-        $rawCert = $sslStream.RemoteCertificate
-        if (-not $rawCert) { throw "No certificate presented by ${TargetHost}:${Port}." }
-        return [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($rawCert).NotAfter
-    } finally {
-        $tcpClient.Dispose()
-    }
-}
-
-# Best-effort lookup of the vCenter appliance's OWN VM in its managed inventory, used only as a
-# fallback when the VAMI CPU/Memory health call fails. Deliberately conservative: only returns a
-# match when exactly one VM is found by exact short-hostname or guest-IP match, since a wrong
-# guess here would be worse than admitting the data isn't available. This gives a VM-level
-# resource-utilization PROXY (the vSphere hypervisor's view), which is a genuinely different
-# metric from VAMI's internal appliance health (e.g. internal filesystem/partition pressure) -
-# never present it as equivalent, always label it as a proxy.
-function Find-ApplianceVM {
-    param($VC, [string]$VCName)
-    try {
-        $shortName = ($VCName -split '\.')[0]
-        $candidates = @(Get-VM -Server $VC -ErrorAction SilentlyContinue | Where-Object {
-            $_.Name -eq $shortName -or (@($_.Guest.IPAddress) -contains $VCName)
-        })
-        if ($candidates.Count -eq 1) { return $candidates[0] }
-        return $null
-    } catch { return $null }
 }
 
 # ============================================================================
@@ -375,159 +300,6 @@ foreach ($VC in $Connections) {
             }
             New-Finding -Site $Site -VCenter $VCName -Area 'Overview' -Object $VCName `
                 -Item "License: $($lic.Name)" -Value "Used $($lic.Used)/$($lic.Total) - Expires $expStr" -Status $status
-        }
-    }
-
-    # --- vCenter appliance CPU/Mem/Disk/Services/NTP/Certificate (VAMI/CIS) ------------------
-    $CisSession = $global:DefaultCisServers | Where-Object { $_.Name -eq $VCName -and $_.IsConnected }
-
-    # CPU/Memory/Disk Usage: always attempted regardless of whether a CIS session exists, because
-    # CPU/Memory has a vSphere-only fallback (VM-level proxy, see Find-ApplianceVM) worth trying
-    # even with zero CIS sessions connected - not just when VAMI is connected but the call fails.
-    # Disk Usage has no non-VAMI equivalent and falls through to Not Connected/Unable to Check.
-    Invoke-SafeCheck -CheckName 'Appliance health (VAMI)' -VCenter $VCName -Site $Site -ObjectName $VCName -Script {
-        foreach ($comp in 'cpu','mem','storage') {
-            $label = @{ cpu = 'CPU'; mem = 'Memory'; storage = 'Disk Usage' }[$comp]
-            $vamiError = $null
-            if ($CisSession) {
-                try {
-                    $svc = Get-CisService -Name "com.vmware.appliance.health.$comp" -Server $CisSession
-                    $val = $svc.get()
-                    New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName `
-                        -Item $label -Value $(if ($val -eq 'green') { 'Normal' } else { $val }) -Status $(if ($val -eq 'green') {'Healthy'} else {'Warning'})
-                    continue
-                } catch {
-                    $vamiError = $_.Exception.Message
-                    Write-CheckLog -VCenter $VCName -Site $Site -Object $VCName -CheckName "Appliance $label (VAMI)" -ErrorMessage $vamiError
-                }
-            }
-            # Fallback: a VM-level resource-utilization PROXY from vSphere itself (only for
-            # CPU/Memory - there's no meaningful vSphere-only equivalent for internal appliance
-            # disk/partition usage). Tried both when VAMI failed AND when there's no CIS session at
-            # all, since this only needs the regular vSphere inventory API, not VAMI/CIS access.
-            # Only used when exactly one candidate VM is found with high confidence - see
-            # Find-ApplianceVM. Clearly labeled as a proxy, never presented as equivalent to the
-            # real internal appliance health check.
-            $applianceVM = if ($comp -in 'cpu','mem') { Find-ApplianceVM -VC $VC -VCName $VCName } else { $null }
-            if ($applianceVM) {
-                $qs = $applianceVM.ExtensionData.Summary.QuickStats
-                $proxyValue = if ($comp -eq 'cpu') {
-                    "$($qs.OverallCpuUsage) MHz used across $($applianceVM.NumCpu) vCPU(s) (VM-level, vSphere view)"
-                } else {
-                    "$($qs.GuestMemoryUsage) MB used of $($applianceVM.MemoryMB) MB allocated (VM-level, vSphere view)"
-                }
-                $note = if ($vamiError) { "VAMI call failed ($vamiError) - showing VM resource utilization from vSphere instead, which is NOT the same as the appliance's internal health check." }
-                        else { "No VAMI/CIS session - showing VM resource utilization from vSphere instead, which is NOT the same as the appliance's internal health check." }
-                New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item $label `
-                    -Value $proxyValue -Status 'Information' -Notes $note
-            } elseif ($vamiError) {
-                New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item $label `
-                    -Value (Get-VamiFailureReason $vamiError) -Status 'Unable to Check' -Notes "VAMI call failed: $vamiError"
-            } else {
-                New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item $label `
-                    -Value 'Not Connected (no CIS session)' -Status 'Manual/External Required' `
-                    -Notes 'Requires a VAMI/CIS session (Connect-CisServer <vcenter>) for a real reading, or the appliance''s own VM in managed inventory for the vSphere-level proxy - neither available this run.'
-            }
-        }
-    }
-
-    if ($CisSession) {
-        # Services and NTP have no non-VAMI equivalent at all (this data only exists inside the
-        # appliance's guest OS) - each still has its own try/catch that always produces a finding,
-        # rather than one failed call silently dropping the item from section 3.1 entirely.
-        Invoke-SafeCheck -CheckName 'Appliance services (VAMI)' -VCenter $VCName -Site $Site -ObjectName $VCName -Script {
-            try {
-                $svcListSvc = Get-CisService -Name 'com.vmware.appliance.services' -Server $CisSession
-                $services = $svcListSvc.list()
-                # Deliberately NOT trying to name-match/exclude specific one-shot boot-time units
-                # here anymore - a hand-built exclusion list turned out to be unreliable (exact
-                # service IDs vary enough between appliances that some still fell through, and a
-                # miss there produces a misleading "Warning" on an appliance that's actually fine).
-                # A plain count is always accurate, never risks a false alarm, and pushes the
-                # judgment call on any specific service to a human looking directly at vCenter/VAMI.
-                $total = $services.Count
-                $started = @($services.GetEnumerator() | Where-Object { $_.Value.state -eq 'STARTED' }).Count
-                New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item 'Services' `
-                    -Value "$started of $total services Started" -Status 'Information' `
-                    -Notes 'Many appliance services are expected one-shot/boot-time units that normally show Stopped once they finish running - this count is informational only, not a pass/fail check. Review a specific service directly in vCenter/VAMI if needed.'
-            } catch {
-                Write-CheckLog -VCenter $VCName -Site $Site -Object $VCName -CheckName 'Appliance Services (VAMI)' -ErrorMessage $_.Exception.Message
-                New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item 'Services' `
-                    -Value (Get-VamiFailureReason $_.Exception.Message) -Status 'Unable to Check' -Notes "VAMI call failed: $($_.Exception.Message)"
-            }
-        }
-        Invoke-SafeCheck -CheckName 'Appliance NTP (VAMI)' -VCenter $VCName -Site $Site -ObjectName $VCName -Script {
-            try {
-                # .get() (read-only, no required arguments) rather than .test(), which on some
-                # vCenter versions requires an explicit list of servers to test - calling it with
-                # none throws "missing a field 'servers'" instead of testing the configured ones.
-                $ntpSvc = Get-CisService -Name 'com.vmware.appliance.ntp' -Server $CisSession
-                $ntpConfig = $ntpSvc.get()
-                $servers = @($ntpConfig.servers)
-                $mode = $ntpConfig.mode
-                if ($servers.Count -gt 0) {
-                    New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item 'NTP' `
-                        -Value "Servers: $($servers -join ', ') (mode: $mode)" -Status 'Healthy'
-                } elseif ($mode) {
-                    # A real, parseable response with a mode but no servers is a genuine state worth
-                    # flagging (e.g. NTP disabled, or host-based time sync instead).
-                    New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item 'NTP' `
-                        -Value "No NTP servers configured (mode: $mode)" -Status 'Warning'
-                } else {
-                    # servers AND mode both empty means the response didn't look like the expected
-                    # shape for this vCenter's API version - report the gap honestly instead of
-                    # asserting "no NTP servers configured", which wouldn't be a trustworthy reading.
-                    throw "NTP response did not contain the expected servers/mode fields (raw: $($ntpConfig | ConvertTo-Json -Compress -Depth 3 -ErrorAction SilentlyContinue))"
-                }
-            } catch {
-                Write-CheckLog -VCenter $VCName -Site $Site -Object $VCName -CheckName 'Appliance NTP (VAMI)' -ErrorMessage $_.Exception.Message
-                New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item 'NTP' `
-                    -Value (Get-VamiFailureReason $_.Exception.Message) -Status 'Unable to Check' -Notes "VAMI call failed: $($_.Exception.Message)"
-            }
-        }
-    } else {
-        # CPU/Memory/Disk Usage were already fully handled above (VAMI, else VM-proxy for
-        # CPU/Memory, else Not Connected) regardless of CIS session state - only Services/NTP
-        # (no non-VAMI equivalent) need the plain "Not Connected" fallback here.
-        foreach ($item in 'Services','NTP') {
-            New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item $item `
-                -Value 'Not Connected (no CIS session)' -Status 'Manual/External Required' `
-                -Notes 'Requires a VAMI/CIS session (Connect-CisServer <vcenter>) in addition to the vSphere API session. Not connected in this run.'
-        }
-    }
-
-    # --- Certificate: ALWAYS attempted, independent of any CIS/VAMI session - this is vCenter's
-    # own HTTPS certificate, read directly over a raw TLS handshake to port 443 (see
-    # Get-RemoteCertificateExpiry). Needs no vCenter permission at all, only the same network
-    # reachability PowerCLI itself already relies on. Falls back to VAMI only if the direct read
-    # fails and a CIS session happens to be available.
-    Invoke-SafeCheck -CheckName 'Appliance certificate' -VCenter $VCName -Site $Site -ObjectName $VCName -Script {
-        $expDate = $null
-        $source = 'direct TLS read (port 443)'
-        try {
-            $expDate = Get-RemoteCertificateExpiry -TargetHost $VCName
-        } catch {
-            $directError = $_.Exception.Message
-            if ($CisSession) {
-                try {
-                    $certSvc = Get-CisService -Name 'com.vmware.appliance.certificate_management.vcenter.tls' -Server $CisSession
-                    $expDate = [datetime]($certSvc.get()).valid_to
-                    $source = 'VAMI (direct TLS read failed)'
-                } catch {
-                    Write-CheckLog -VCenter $VCName -Site $Site -Object $VCName -CheckName 'Appliance Certificates' -ErrorMessage "Direct TLS: $directError | VAMI: $($_.Exception.Message)"
-                }
-            } else {
-                Write-CheckLog -VCenter $VCName -Site $Site -Object $VCName -CheckName 'Appliance Certificates' -ErrorMessage "Direct TLS: $directError"
-            }
-        }
-        if ($expDate) {
-            $daysLeft = ($expDate - (Get-Date)).Days
-            $status = if ($daysLeft -le 0) { 'Critical' } elseif ($daysLeft -le $CertExpiryWarningDays) { 'Warning' } else { 'Healthy' }
-            New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item 'Certificates' `
-                -Value "Valid - until ($($expDate.ToString('MMM d, yyyy')))" -Status $status -Notes "Source: $source"
-        } else {
-            New-Finding -Site $Site -VCenter $VCName -Area 'Appliance' -Object $VCName -Item 'Certificates' `
-                -Value 'Unable to Check' -Status 'Unable to Check' -Notes 'Both the direct TLS certificate read and the VAMI fallback (if attempted) failed - see log for details.'
         }
     }
 
@@ -615,26 +387,6 @@ foreach ($VC in $Connections) {
                         New-Finding -Site $Site -VCenter $VCName -Area 'Alarms' -Cluster $ClusterName -Object $HName `
                             -Item $alarmDef.Info.Name -Value $a.OverallStatus.ToString() -Status ($a.OverallStatus.ToString().Substring(0,1).ToUpper() + $a.OverallStatus.ToString().Substring(1))
                     }
-                }
-            }
-
-            # Hardware health via built-in host Health System (numeric sensors) - no SSH required.
-            # Rolled up site-wide in the report into CPU/Memory/Power Supplies/Fans/RAID/Disks.
-            Invoke-SafeCheck -CheckName 'Hardware sensors' -VCenter $VCName -Site $Site -ObjectName $HName -Script {
-                $sensors = $VMHost.ExtensionData.Runtime.HealthSystemRuntime.SystemHealthInfo.NumericSensorInfo
-                if (-not $sensors) {
-                    New-Finding -Site $Site -VCenter $VCName -Area 'Hardware' -Cluster $ClusterName -Object $HName `
-                        -Item 'Sensors' -Value 'n/a' -Status 'Unable to Check' `
-                        -Notes 'Host does not expose CIM/IPMI sensor data to vCenter (common on some blade/BMC configs).'
-                    return
-                }
-                $groups = $sensors | Group-Object -Property SensorType
-                foreach ($g in $groups) {
-                    $bad = $g.Group | Where-Object { $_.HealthState.Key -notin @('green','Green') }
-                    $status = if ($bad) { 'Warning' } else { 'Healthy' }
-                    $summary = if ($bad) { ($bad | ForEach-Object { "$($_.Name): $($_.HealthState.Label)" }) -join '; ' } else { 'All normal' }
-                    New-Finding -Site $Site -VCenter $VCName -Area 'Hardware' -Cluster $ClusterName -Object $HName `
-                        -Item $g.Name -Value $summary -Status $status
                 }
             }
 
@@ -813,115 +565,8 @@ foreach ($VC in $Connections) {
 } # end per-vCenter
 
 # ============================================================================
+# 3. DASHBOARD GENERATION HELPERS
 # ============================================================================
-# 3. REPORT GENERATION HELPERS
-#    Each site's report is built DIRECTLY in Word via COM automation - typing text, applying
-#    styles/colors, inserting native Word tables, and using real Word Section headers/footers
-#    (logos + date repeat at the top of every page, classification text at the bottom of every
-#    page) rather than typing them once into the body. There is no HTML step anywhere in this
-#    pipeline.
-# ============================================================================
-$StatusColors = @{
-    'Healthy'                  = @(22,163,74)
-    'Warning'                  = @(245,158,11)
-    'Critical'                 = @(220,38,38)
-    'Information'              = @(37,99,235)
-    'Unable to Check'          = @(156,163,175)
-    'Manual/External Required' = @(156,163,175)
-}
-function Get-WordColorLong {
-    param([int[]]$Rgb)
-    return $Rgb[0] + ($Rgb[1] * 256) + ($Rgb[2] * 65536)
-}
-function Get-StatusColorLong {
-    param([string]$Status)
-    $rgb = $StatusColors[$Status]
-    if (-not $rgb) { $rgb = @(156,163,175) }
-    return Get-WordColorLong $rgb
-}
-
-function Write-Heading {
-    param($Selection, [string]$Text, [int]$Level = 1)
-    $Selection.Style = "Heading $Level"
-    $Selection.TypeText($Text)
-    $Selection.TypeParagraph()
-    $Selection.Style = 'Normal'
-}
-
-function Write-Para {
-    param($Selection, [string]$Text, [switch]$Bold, [switch]$Italic, [switch]$Gray)
-    $Selection.Font.Bold = [bool]$Bold
-    $Selection.Font.Italic = [bool]$Italic
-    if ($Gray) { $Selection.Font.Color = Get-WordColorLong @(107,114,128) }
-    $Selection.TypeText($Text)
-    $Selection.TypeParagraph()
-    $Selection.Font.Bold = $false
-    $Selection.Font.Italic = $false
-    $Selection.Font.Color = -16777216   # wdColorAutomatic
-}
-
-function Write-StatusLine {
-    param($Selection, [string]$Label, [string]$Status, [string]$Text = '', [switch]$Bold)
-    $Selection.Font.Bold = $true
-    $Selection.TypeText($Label)
-    $Selection.Font.Bold = [bool]$Bold
-    $Selection.Font.Color = Get-StatusColorLong $Status
-    $Selection.TypeText(" $([char]0x25CF) ")
-    $Selection.Font.Color = -16777216
-    if ($Text) { $Selection.TypeText($Text) } else { $Selection.TypeText($Status) }
-    $Selection.TypeParagraph()
-    $Selection.Font.Bold = $false
-}
-
-function Write-BulletDot {
-    param($Selection, [string]$Status, [string]$Text)
-    $Selection.TypeText("`t")
-    $Selection.Font.Color = Get-StatusColorLong $Status
-    $Selection.TypeText([char]0x25CF)
-    $Selection.Font.Color = -16777216
-    $Selection.TypeText(" $Text")
-    $Selection.TypeParagraph()
-}
-
-function Write-Bullet {
-    param($Selection, [string]$Text, [switch]$Bold)
-    $Selection.TypeText("`t- ")
-    if ($Bold) { $Selection.Font.Bold = $true }
-    $Selection.TypeText($Text)
-    $Selection.Font.Bold = $false
-    $Selection.TypeParagraph()
-}
-
-function Add-Table {
-    param($Doc, $Selection, [string[]]$Headers, [array]$Rows, [int]$StatusColumnIndex = -1)
-    if (-not $Rows -or $Rows.Count -eq 0) { return }
-    $rowCount = $Rows.Count + 1
-    $colCount = $Headers.Count
-    $table = $Doc.Tables.Add($Selection.Range, $rowCount, $colCount)
-    $table.Borders.InsideLineStyle = 1
-    $table.Borders.OutsideLineStyle = 1
-    for ($c = 0; $c -lt $colCount; $c++) {
-        $cell = $table.Cell(1, $c + 1)
-        $cell.Range.Text = $Headers[$c]
-        $cell.Range.Font.Bold = $true
-        $cell.Range.Font.Color = Get-WordColorLong @(255,255,255)
-        $cell.Shading.BackgroundPatternColor = Get-WordColorLong @(30,58,95)
-    }
-    for ($r = 0; $r -lt $Rows.Count; $r++) {
-        for ($c = 0; $c -lt $colCount; $c++) {
-            $cellRange = $table.Cell($r + 2, $c + 1).Range
-            $cellText = [string]$Rows[$r][$c]
-            $cellRange.Text = $cellText
-            if ($c -eq $StatusColumnIndex) {
-                $cellRange.Font.Color = Get-StatusColorLong $cellText
-                $cellRange.Font.Bold = $true
-            }
-        }
-    }
-    $Selection.SetRange($table.Range.End, $table.Range.End)
-    $Selection.TypeParagraph()
-}
-
 function Get-WorstStatus {
     param([string[]]$Statuses)
     $order = @{ 'Critical' = 5; 'Warning' = 4; 'Unable to Check' = 3; 'Manual/External Required' = 2; 'Healthy' = 1; 'Information' = 0 }
@@ -929,458 +574,35 @@ function Get-WorstStatus {
     return ($Statuses | Sort-Object { $order[$_] } -Descending | Select-Object -First 1)
 }
 
-# Adds the two-column letterhead (logos, or site/company text if no logo file given) plus the
-# bold report date to a Word Section's header, and the classification text to its footer -
-# both then repeat automatically on every page of that document.
-# Gives the document a deliberate, consistent look (font + heading colors/sizes) instead of
-# Word's plain default Normal.dotm styling, which is what made the generated report read as
-# less polished than the hand-built reference report.
-function Set-DocumentBaseStyle {
-    param($Doc)
-    $wdStyleNormal = -1
-    $normal = $Doc.Styles.Item($wdStyleNormal)
-    $normal.Font.Name = 'Calibri'
-    $normal.Font.Size = 11
-
-    $headingColor = Get-WordColorLong @(30,58,95)
-    $sizes = @{ 'Heading 1' = 20; 'Heading 2' = 15; 'Heading 3' = 12; 'Heading 4' = 11 }
-    foreach ($levelName in $sizes.Keys) {
-        $style = $Doc.Styles.Item($levelName)
-        $style.Font.Name = 'Calibri'
-        $style.Font.Color = $headingColor
-        $style.Font.Size = $sizes[$levelName]
-    }
-}
-
-# Inserts a fixed-height picture (preserving aspect ratio) at the given (collapsed) range and
-# leaves the range collapsed just after it - keeps oversized source images (e.g. a raw 500x500px
-# logo export) from blowing out the header's height and pushing into/overlapping the body text.
-function Add-ScaledPicture {
-    param($Range, [string]$Path, [double]$HeightPoints = 26)
-    $shape = $Range.InlineShapes.AddPicture($Path, $false, $true, $Range)
-    $shape.LockAspectRatio = -1   # msoTrue
-    $shape.Height = $HeightPoints
-    $Range.Collapse(0)   # wdCollapseEnd
-}
-
-function Add-HeaderFooter {
-    param($Doc, [string]$SiteLabel)
-    $wdHeaderFooterPrimary = 1
-    $section = $Doc.Sections.Item(1)
-
-    # A single header paragraph with a right-aligned tab stop, not a table - tables inserted into
-    # a Word header via COM automation can get silently wrapped in a floating/anchored frame,
-    # which is what was causing the header to visually overlap the first lines of body text.
-    $header = $section.Headers.Item($wdHeaderFooterPrimary)
-    $header.LinkToPrevious = $false
-    $usableWidth = $Doc.PageSetup.PageWidth - $Doc.PageSetup.LeftMargin - $Doc.PageSetup.RightMargin
-    $hRange = $header.Range
-    $hRange.Text = ''
-    $null = $hRange.ParagraphFormat.TabStops.Add($usableWidth, 2)   # 2 = wdAlignTabRight
-
-    if ($LogoLeftPath -and (Test-Path $LogoLeftPath)) {
-        Add-ScaledPicture -Range $hRange -Path $LogoLeftPath -HeightPoints 30
-    } else {
-        $hRange.Font.Bold = $true
-        $hRange.Font.Size = 13
-        $hRange.InsertAfter($SiteLabel)
-        $hRange.Collapse(0)
-        $hRange.Font.Size = 10
-        $hRange.Font.Bold = $false
-    }
-
-    if ($LogoRightPath -and (Test-Path $LogoRightPath)) {
-        $hRange.InsertAfter("`t")
-        $hRange.Collapse(0)
-        Add-ScaledPicture -Range $hRange -Path $LogoRightPath -HeightPoints 30
-    }
-
-    $hRange.InsertParagraphAfter()
-    $hRange.Collapse(0)
-    $hRange.Font.Bold = $true
-    $hRange.Font.Size = 11
-    $hRange.InsertAfter($RunDateDisplay)
-
-    $footer = $section.Footers.Item($wdHeaderFooterPrimary)
-    $footer.LinkToPrevious = $false
-    $footer.Range.Text = ''
-    $footer.Range.ParagraphFormat.Alignment = 1   # wdAlignParagraphCenter
-    $footer.Range.Font.Size = 9
-    $footer.Range.Font.Color = Get-WordColorLong @(107,114,128)
-    $footer.Range.InsertAfter($FooterText)
-}
-
-function Write-SiteReportPdf {
-    param($Word, [string]$SiteLabel, [string]$OutputPath, [string]$RunDate)
-
-    $SiteFindings = $Global:AllResults | Where-Object { $_.Site -eq $SiteLabel }
-    if (-not $SiteFindings) { return }
-
-    $VCenterName  = $SiteFindings | Select-Object -First 1 -ExpandProperty VCenter
-    $ClusterNames = if ($Global:SiteClusterMap.ContainsKey($SiteLabel)) { $Global:SiteClusterMap[$SiteLabel] } else { @() }
-
-    # @(...) forces array context so .Count is always reliable, including when exactly one
-    # finding matches - without it, a single-match pipeline result can report Count as $null
-    # instead of 1, silently blanking the number and mis-tallying the overall health status.
-    $CritCount   = @($SiteFindings | Where-Object { $_.Status -eq 'Critical' }).Count
-    $WarnCount   = @($SiteFindings | Where-Object { $_.Status -eq 'Warning' }).Count
-    $UnableCount = @($SiteFindings | Where-Object { $_.Status -in 'Unable to Check','Manual/External Required' }).Count
-    $OverallHealth = if ($CritCount -gt 0) { 'Critical' } elseif ($WarnCount -gt 0) { 'Warning' } else { 'Healthy' }
-    $OverallLabel  = if ($OverallHealth -eq 'Healthy') { 'Healthy - No Issues Detected' } elseif ($OverallHealth -eq 'Warning') { 'Healthy - Minor Issues Detected' } else { 'Attention Required - Critical Issues Detected' }
-
-    $VcVersionItem = $SiteFindings | Where-Object { $_.Item -eq 'vCenter Version/Build' } | Select-Object -First 1
-    $AllHostFindings = $SiteFindings | Where-Object { $_.Area -eq 'Host' -and $_.Item -eq 'Host Configuration Summary' }
-    $HostCountTotal = 0
-    $HostVersionsAll = @()
-    foreach ($hf in $AllHostFindings) {
-        $parts = $hf.Value -split '\|'
-        $HostCountTotal += [int]$parts[0]
-        $HostVersionsAll += "$($parts[1]) (Build $($parts[2]))"
-    }
-    $EsxiVersionDisplay = ($HostVersionsAll | Select-Object -Unique) -join ' | '
-
-    $AllDsFindings = $SiteFindings | Where-Object { $_.Area -eq 'Storage' -and $_.Item -eq 'Datastore' }
-    $VsanEnabledAny = [bool]($SiteFindings | Where-Object { $_.Item -eq 'vSAN Enabled' })
-    $StorageLabelParts = @()
-    if ($AllDsFindings) { $StorageLabelParts += 'VMFS on SAN' }
-    if ($VsanEnabledAny) { $StorageLabelParts += 'vSAN' }
-    $StorageLabel = if ($StorageLabelParts) { ($StorageLabelParts | Select-Object -Unique) -join ' + ' } else { 'n/a' }
-
-    $VdsFindings = $SiteFindings | Where-Object { $_.Item -eq 'vDS' }
-    $PgFindings  = $SiteFindings | Where-Object { $_.Item -eq 'Port Group' }
-    $VdsCount = @($VdsFindings | Select-Object -ExpandProperty Object -Unique).Count
-    # Only port groups flagged as a genuine single VLAN (3rd field = 'True') count toward the VLAN
-    # total - trunk/PVLAN port groups are shown in the per-port-group detail but aren't one countable
-    # VLAN. VLAN ID 0 is also excluded here - in vSphere, VlanId=0 means "untagged/native network",
-    # not a real segmented VLAN, so a default/untagged port group alongside real VLANs was inflating
-    # the count by one versus a manual count of actual configured VLANs.
-    $VlanCount = @($PgFindings | Where-Object {
-        $parts = $_.Value -split '\|'
-        $parts[2] -eq 'True' -and $parts[0] -ne '0'
-    } | ForEach-Object { ($_.Value -split '\|')[0] } | Select-Object -Unique).Count
-
-    $doc = $Word.Documents.Add()
-    $sel = $Word.Selection
-    Set-DocumentBaseStyle -Doc $doc
-    Add-HeaderFooter -Doc $doc -SiteLabel $SiteLabel
-
-    # ---------------- Title ----------------
-    $sel.Style = 'Heading 1'
-    $sel.Font.Underline = 1
-    $sel.TypeText("$SiteLabel vCenter & ESXi Health Check Report")
-    $sel.Font.Underline = 0
-    $sel.TypeParagraph()
-    $sel.Style = 'Normal'
-    $sel.TypeParagraph()
-
-    # ---------------- 1. Executive Summary ----------------
-    Write-Heading $sel "1. Executive Summary" 2
-    Write-StatusLine $sel "Overall Environment Health: " $OverallHealth $OverallLabel
-    Write-Para $sel "This health check was performed to assess the current state of the VMware vSphere environment, including vCenter Server and ESXi hosts. The assessment confirms that the environment is stable and operating within VMware recommended best practices."
-
-    Write-Para $sel "Key Findings Summary:" -Bold
-    Write-Bullet $sel "High Risk Issues: $CritCount" -Bold
-    Write-Bullet $sel "Medium Risk Issues: $WarnCount" -Bold
-    Write-Bullet $sel "Low Risk Issues: $UnableCount" -Bold
-
-    Write-Para $sel "Overall Status:" -Bold
-    $envStatusText = if ($CritCount -gt 0) { "Environment operational - critical issue(s) require attention" } else { "Environment fully operational and supported" }
-    Write-Bullet $sel $envStatusText -Bold
-    $drsAll = ($SiteFindings | Where-Object { $_.Item -eq 'vSphere DRS' })
-    $haAll  = ($SiteFindings | Where-Object { $_.Item -eq 'vSphere HA' })
-    $drsOn = $drsAll -and -not ($drsAll | Where-Object { $_.Value -eq 'False' })
-    $haOn  = $haAll -and -not ($haAll | Where-Object { $_.Value -eq 'False' })
-    Write-Bullet $sel "vSphere DRS: Turned $(if ($drsOn) {'ON'} else {'OFF'}) $(if ($drsOn) {[char]0x2705} else {[char]0x274C})" -Bold
-    Write-Bullet $sel "vSphere HA: Turned $(if ($haOn) {'ON'} else {'OFF'}) $(if ($haOn) {[char]0x2705} else {[char]0x274C})" -Bold
-
-    # ---------------- 2. Environment Overview ----------------
-    Write-Heading $sel "2. Environment Overview" 2
-    $envRows = @(
-        ,@('vCenter Version', $(if ($VcVersionItem) { $VcVersionItem.Value } else { 'n/a' }))
-        ,@('Number of ESXi Hosts', $HostCountTotal)
-        ,@('ESXi Version', $(if ($EsxiVersionDisplay) { $EsxiVersionDisplay } else { 'n/a' }))
-        ,@('Clusters', $ClusterNames.Count)
-        ,@('Storage', $StorageLabel)
-        ,@('Networking', "$VdsCount vSphere Distributed Switch(es) ($VlanCount VLANs Configured)")
-    )
-    Add-Table $doc $sel @('Component','Details') $envRows
-
-    # ---------------- 3. vCenter Server Health ----------------
-    Write-Heading $sel "3. vCenter Server Health" 2
-    Write-Heading $sel "3.1 Appliance Health" 3
-    # Built as separate Rows/Statuses arrays (rather than piping a 3-column row through
-    # ForEach-Object to drop the Status column at the call site) because that transform
-    # silently flattened down to a bare 2-element array whenever exactly one appliance item
-    # was collected - Add-Table's row/column indexing then read individual CHARACTERS of the
-    # two strings instead of the two strings themselves (e.g. "Backup" rendered as "B" / "a").
-    $applianceRows = @()
-    $applianceStatuses = @()
-    foreach ($item in 'CPU','Memory','Disk Usage','Services','NTP') {
-        $f = $SiteFindings | Where-Object { $_.Area -eq 'Appliance' -and $_.Item -eq $item } | Select-Object -First 1
-        if ($f) { $applianceRows += ,@($item, $f.Value); $applianceStatuses += $f.Status }
-    }
-    if ($BackupInfo.ContainsKey($SiteLabel)) {
-        $applianceRows += ,@('Backup', $BackupInfo[$SiteLabel].DeviceLabel); $applianceStatuses += 'Healthy'
-    } else {
-        $applianceRows += ,@('Backup', 'Not supplied (-BackupInfo)'); $applianceStatuses += 'Manual/External Required'
-    }
-    $certF = $SiteFindings | Where-Object { $_.Area -eq 'Appliance' -and $_.Item -eq 'Certificates' } | Select-Object -First 1
-    if ($certF) { $applianceRows += ,@('Certificates', $certF.Value); $applianceStatuses += $certF.Status }
-    Add-Table $doc $sel @('Item','Status') $applianceRows
-    $applianceWorst = Get-WorstStatus $applianceStatuses
-    $applianceText = if ($applianceWorst -eq 'Healthy') { "vCenter Server appliance is healthy with no warnings or operational concerns." } else { "vCenter Server appliance has item(s) requiring attention - see table above." }
-    Write-Para $sel "Status: $applianceText" -Bold
-
-    # ---------------- 4. ESXi Host Health ----------------
-    Write-Heading $sel "4. ESXi Host Health" 2
-    Write-Heading $sel "4.1 Host Configuration Summary" 3
-    $hostSummaryRows = @()
-    foreach ($ClusterName in $ClusterNames) {
-        $hf = $AllHostFindings | Where-Object { $_.Cluster -eq $ClusterName } | Select-Object -First 1
-        if ($hf) {
-            $parts = $hf.Value -split '\|'
-            $rowLabel = if ($ClusterNames.Count -gt 1) { "$ClusterName ($($parts[0]) Hosts)" } else { "$($parts[0]) Hosts" }
-            $hostSummaryRows += ,@($rowLabel, $parts[1], $parts[2], $hf.Status)
+# A handful of Item values are internally pipe-delimited (e.g. Capacity's "1234|56.7" or Storage's
+# "capGB|freeGB|accessible") so New-Finding's caller can pack a few raw numbers in without adding
+# dedicated columns - fine for the aggregation code that already knows the shape, but unreadable if
+# shown to a person as-is. The Action Plan is the one place a raw Finding.Value reaches the page
+# directly, so this decodes those specific Items back into plain text; everything else (MTU
+# Consistency, Syslog, Local Accounts, etc.) already stores a human-readable Value and passes through.
+function Get-ActionItemDisplayValue {
+    param([string]$Item, [string]$Value)
+    switch ($Item) {
+        'CPU' {
+            $p = $Value -split '\|'
+            if ($p.Count -ge 2 -and $p[1]) { return ("{0:N1}% CPU usage" -f [double]$p[1]) }
         }
-    }
-    Add-Table $doc $sel @('Host Count','Version','Build','Status') $hostSummaryRows -StatusColumnIndex 3
-    $versionWorst = Get-WorstStatus ($SiteFindings | Where-Object { $_.Item -eq 'Version Consistency' } | Select-Object -ExpandProperty Status)
-    $versionText = if ($versionWorst -eq 'Healthy') { "All ESXi hosts are running the same supported version and patch level." } else { "ESXi hosts are NOT all on the same version/patch level - review the version consistency detail in the run log." }
-    Write-Para $sel $versionText
-
-    Write-Heading $sel "4.2 Hardware Health" 3
-    Write-Para $sel "All ESXi hosts report hardware status with the following metrics (rolled up across all hosts in $SiteLabel):"
-    $hwRows = @()
-    $hwGroups = $SiteFindings | Where-Object { $_.Area -eq 'Hardware' } | Group-Object Item
-    foreach ($g in $hwGroups) {
-        $worst = Get-WorstStatus ($g.Group | Select-Object -ExpandProperty Status)
-        $text = if ($worst -eq 'Healthy') { 'All normal' } else { ($g.Group | Where-Object { $_.Status -ne 'Healthy' } | ForEach-Object { "$($_.Object): $($_.Value)" }) -join '; ' }
-        $hwRows += ,@($g.Name, $text, $worst)
-    }
-    Add-Table $doc $sel @('Component','Status','Health') $hwRows -StatusColumnIndex 2
-    $hwWorst = Get-WorstStatus ($hwGroups | ForEach-Object { Get-WorstStatus ($_.Group | Select-Object -ExpandProperty Status) })
-    Write-StatusLine $sel "Status: " $hwWorst
-
-    # ---------------- 5. Networking Health ----------------
-    Write-Heading $sel "5. Networking Health" 2
-    Write-Heading $sel "5.1 Network Overview" 3
-    Write-Bullet $sel "vSphere Distributed Switch in use: $VdsCount vDS"
-    Write-Bullet $sel "Number of VLANs configured: $VlanCount"
-    Write-Bullet $sel "VLANs segmented for management, server, storage, and virtual machine traffic"
-
-    Write-Heading $sel "5.2 Network Configuration Status" 3
-    $nicRedundancy = $SiteFindings | Where-Object { $_.Item -eq 'Physical NIC Redundancy' }
-    $nicErrors = $SiteFindings | Where-Object { $_.Item -eq 'NIC Errors/Drops' }
-    $teamingVals = @($PgFindings | ForEach-Object { ($_.Value -split '\|')[1] } | Where-Object { $_ } | Select-Object -Unique)
-    $mtuVals = @($VdsFindings | Select-Object -ExpandProperty Value -Unique)
-    $mtuConsistent = $mtuVals.Count -le 1
-
-    $redundancyOk = -not ($nicRedundancy | Where-Object { $_.Status -ne 'Healthy' })
-    Write-Bullet $sel "Redundant physical NICs configured on all hosts$(if (-not $redundancyOk) { ' - EXCEPTIONS FOUND, see log' })"
-    Write-Bullet $sel "VLAN configuration consistent across the cluster"
-    Write-Bullet $sel "NIC teaming and failover configured correctly$(if ($teamingVals) { " ($($teamingVals -join ', '))" })"
-    $errorsOk = -not ($nicErrors | Where-Object { $_.Status -ne 'Healthy' })
-    Write-Bullet $sel $(if ($errorsOk) { "No NIC errors or packet drops observed" } else { "NIC errors or packet drops observed - see log for affected hosts" })
-    if ($mtuConsistent) {
-        Write-Bullet $sel "MTU $(if ($mtuVals.Count -eq 1) { $mtuVals[0] } else { 'n/a' }) configured consistently across hosts and switches"
-    } else {
-        Write-Bullet $sel "MTU is NOT consistent across switches ($($mtuVals -join ' vs ')) - review vDS MTU settings"
-    }
-
-    $mtuStatus = if ($mtuConsistent) { 'Healthy' } else { 'Warning' }
-    $netWorst = Get-WorstStatus (@(@($nicRedundancy; $nicErrors) | Select-Object -ExpandProperty Status) + @($mtuStatus))
-    Write-StatusLine $sel "Status: " $netWorst
-
-    # ---------------- 6. Performance & Capacity Summary ----------------
-    Write-Heading $sel "6. Performance & Capacity Summary (Last $PerfHistoryHours Hours)" 2
-    $capFindings = $SiteFindings | Where-Object { $_.Area -eq 'Capacity' }
-    $cpuCapTotal = 0.0; $cpuUsedTotal = 0.0
-    $memCapTotal = 0.0; $memUsedTotal = 0.0
-    foreach ($cf in ($capFindings | Where-Object { $_.Item -eq 'CPU' })) {
-        $p = $cf.Value -split '\|'
-        $cap = [double]$p[0]
-        $cpuCapTotal += $cap
-        if ($p[1] -and $p[1] -ne '') { $cpuUsedTotal += ($cap * [double]$p[1] / 100) }
-    }
-    foreach ($cf in ($capFindings | Where-Object { $_.Item -eq 'Memory' })) {
-        $p = $cf.Value -split '\|'
-        $cap = [double]$p[0]
-        $memCapTotal += $cap
-        if ($p[1] -and $p[1] -ne '') { $memUsedTotal += ($cap * [double]$p[1] / 100) }
-    }
-    $cpuUsagePct = if ($cpuCapTotal -gt 0) { ($cpuUsedTotal / $cpuCapTotal) * 100 } else { 0 }
-    $memUsagePct = if ($memCapTotal -gt 0) { ($memUsedTotal / $memCapTotal) * 100 } else { 0 }
-
-    Write-Heading $sel "6.1 CPU Utilization" 3
-    Add-Table $doc $sel @('Metric','Value','Status') @(
-        ,@('Total CPU Capacity', ("{0:N2} GHz" -f ($cpuCapTotal/1000)), (Get-PctStatus $cpuUsagePct))
-        ,@('CPU Used', ("{0:N2} GHz" -f ($cpuUsedTotal/1000)), (Get-PctStatus $cpuUsagePct))
-        ,@('CPU Free', ("{0:N2} GHz" -f (($cpuCapTotal-$cpuUsedTotal)/1000)), (Get-PctStatus $cpuUsagePct))
-        ,@('CPU Usage', ("{0:N2}%" -f $cpuUsagePct), (Get-PctStatus $cpuUsagePct))
-    ) -StatusColumnIndex 2
-
-    Write-Heading $sel "6.2 Memory Utilization" 3
-    Add-Table $doc $sel @('Metric','Value','Status') @(
-        ,@('Total Memory Capacity', ("{0:N2} GB" -f ($memCapTotal/1024)), (Get-PctStatus $memUsagePct))
-        ,@('Memory Used', ("{0:N2} GB" -f ($memUsedTotal/1024)), (Get-PctStatus $memUsagePct))
-        ,@('Memory Free', ("{0:N2} GB" -f (($memCapTotal-$memUsedTotal)/1024)), (Get-PctStatus $memUsagePct))
-        ,@('Memory Usage', ("{0:N2}%" -f $memUsagePct), (Get-PctStatus $memUsagePct))
-    ) -StatusColumnIndex 2
-
-    $dsCapTotal = 0.0; $dsFreeTotal = 0.0
-    foreach ($df in $AllDsFindings) {
-        $p = $df.Value -split '\|'
-        $dsCapTotal += [double]$p[0]
-        $dsFreeTotal += [double]$p[1]
-    }
-    $dsUsedTotal = $dsCapTotal - $dsFreeTotal
-    $dsUsagePct = if ($dsCapTotal -gt 0) { ($dsUsedTotal / $dsCapTotal) * 100 } else { 0 }
-
-    Write-Heading $sel "6.3 Storage Utilization (Overall)" 3
-    Add-Table $doc $sel @('Metric','Value','Status') @(
-        ,@('Total Storage Capacity', ("{0:N1} GB" -f $dsCapTotal), (Get-PctStatus $dsUsagePct))
-        ,@('Total Storage Used', ("{0:N2} GB" -f $dsUsedTotal), (Get-PctStatus $dsUsagePct))
-        ,@('Total Storage Free', ("{0:N2} GB" -f $dsFreeTotal), (Get-PctStatus $dsUsagePct))
-        ,@('Storage Usage', ("{0:N2}%" -f $dsUsagePct), (Get-PctStatus $dsUsagePct))
-    ) -StatusColumnIndex 2
-
-    $capWorst = Get-WorstStatus @((Get-PctStatus $cpuUsagePct), (Get-PctStatus $memUsagePct), (Get-PctStatus $dsUsagePct))
-    $capText = if ($capWorst -eq 'Healthy') { "CPU, memory, and storage utilization is within VMware recommended thresholds." } else { "One or more of CPU, memory, or storage utilization is outside the configured threshold - see tables above." }
-    Write-StatusLine $sel "Status: " $capWorst $capText
-
-    # ---------------- 7. Storage Health ----------------
-    Write-Heading $sel "7. Storage Health" 2
-    if ($StorageArrayInfo.ContainsKey($SiteLabel)) {
-        $sa = $StorageArrayInfo[$SiteLabel]
-        Write-Bullet $sel "Physical Storage Hardware: All disks are healthy"
-        Write-Bullet $sel "Software Version: $($sa.SoftwareVersion)"
-        Write-Bullet $sel "Compression: $($sa.CompressionPct)%"
-        Write-Bullet $sel "Controllers' status: (A) is $($sa.ControllerA), (B) is $($sa.ControllerB)"
-        Write-Bullet $sel "Disks status: $($sa.DiskCount) Disk(s) $($sa.DiskStatus)"
-        Write-Bullet $sel ("Storage utilization: {0} TiB of {1} TiB | {2:N2}% Used" -f $sa.UtilizationUsedTiB, $sa.UtilizationTotalTiB, (100.0 * $sa.UtilizationUsedTiB / [double]$sa.UtilizationTotalTiB))
-        Write-Bullet $sel "Links: (A) $($sa.LinksA), (B) $($sa.LinksB)"
-        Write-Bullet $sel "Power status: (A) $($sa.PowerA), (B) $($sa.PowerB)"
-    } else {
-        Write-Para $sel "Physical storage-array hardware details (controllers/disks/power) were not supplied for this run - pass -StorageArrayInfo to include them. Status: Manual/External Required." -Italic -Gray
-    }
-
-    $dsTableRows = @()
-    foreach ($df in $AllDsFindings) {
-        $p = $df.Value -split '\|'
-        $capGB = [double]$p[0]; $freeGB = [double]$p[1]
-        $dsTableRows += ,@($df.Object, ("{0:N0} GB" -f $capGB), ("{0:N2} GB" -f $freeGB), $df.Status)
-    }
-    Add-Table $doc $sel @('Name','Capacity','Free','Status') $dsTableRows -StatusColumnIndex 3
-
-    Write-Bullet $sel ("Total Storage Capacity for all datastores: {0:N1} GB" -f $dsCapTotal)
-    Write-Bullet $sel ("Total Storage Used: {0:N2} GB" -f $dsUsedTotal)
-    Write-Bullet $sel ("Total Storage Free: {0:N2} GB" -f $dsFreeTotal)
-
-    # ---------------- 8. Virtual Machine Inventory Summary ----------------
-    Write-Heading $sel "8. Virtual Machine Inventory Summary" 2
-    Write-Heading $sel "8.1 VM Operating System Distribution" 3
-    $osGroups = $SiteFindings | Where-Object { $_.Area -eq 'VM' -and $_.Item -eq 'Guest OS' } | Group-Object Object | Sort-Object Name
-    $osRows = @()
-    $totalVMs = 0
-    foreach ($g in $osGroups) {
-        $count = ($g.Group | Measure-Object -Property Value -Sum).Sum
-        $totalVMs += $count
-        $osRows += ,@($g.Name, $count, 'Healthy')
-    }
-    Add-Table $doc $sel @('Operating System','Number of VMs','Status') $osRows -StatusColumnIndex 2
-    Write-Para $sel "Total Virtual Machines: VMs $totalVMs" -Bold
-
-    # ---------------- 9. Security & Compliance ----------------
-    Write-Heading $sel "9. Security & Compliance" 2
-    $lockdownRows = $SiteFindings | Where-Object { $_.Item -eq 'Lockdown Mode' }
-    $secureBootRows = $SiteFindings | Where-Object { $_.Item -eq 'Secure Boot' }
-    $localAcctRows = $SiteFindings | Where-Object { $_.Item -eq 'Local Accounts' }
-    $syslogRows = $SiteFindings | Where-Object { $_.Item -eq 'Syslog' }
-
-    $lockdownWorst = Get-WorstStatus ($lockdownRows | Select-Object -ExpandProperty Status)
-    Write-Bullet $sel "Lockdown Mode: $(if ($lockdownWorst -eq 'Healthy') {'Enabled'} else {'Disabled on one or more hosts - see log'})"
-    $sbWorst = Get-WorstStatus ($secureBootRows | Select-Object -ExpandProperty Status)
-    Write-Bullet $sel "Secure Boot: $(if ($sbWorst -eq 'Healthy') {'Enabled'} else {'Disabled on one or more hosts - see log'})"
-    $acctWorst = Get-WorstStatus ($localAcctRows | Select-Object -ExpandProperty Status)
-    $acctFlag = $localAcctRows | Where-Object { $_.Status -ne 'Healthy' }
-    Write-Bullet $sel "Local ESXi users: $(if ($acctWorst -eq 'Healthy') {'Reviewed and compliant'} else {"Review required -> $(($acctFlag | ForEach-Object { $_.Object }) -join ', ') has unexpected account(s)"})"
-    $syslogWorst = Get-WorstStatus ($syslogRows | Select-Object -ExpandProperty Status)
-    Write-Bullet $sel "Syslog: $(if ($syslogWorst -eq 'Healthy') {'Central logging configured'} else {'Not configured on one or more hosts - see log'})"
-
-    $secWorst = Get-WorstStatus @($lockdownWorst, $sbWorst, $acctWorst, $syslogWorst)
-    $secText = if ($secWorst -eq 'Healthy') { "Compliant with security best practices" } else { "Non-compliant item(s) found - see bullets above" }
-    Write-Para $sel "Status: $secText" -Bold
-
-    # ---------------- 10. Risks & Recommendations ----------------
-    Write-Heading $sel "10. Risks & Recommendations" 2
-    if ($BackupInfo.ContainsKey($SiteLabel)) {
-        $bi = $BackupInfo[$SiteLabel]
-        Write-StatusLine $sel "Backup & Disaster Recovery Status - " $bi.Status
-        Write-Para $sel "The $($bi.SolutionName) is deployed and operating in accordance with defined backup policies. Backup jobs are running successfully, and data protection is in place for virtual machines."
-        Write-Para $sel "Assessment" -Bold
-        if ($bi.Status -eq 'Healthy') {
-            Write-Bullet $sel "Backup solution is properly configured and operational"
-            Write-Bullet $sel "Backup policies are scheduled and aligned with business requirements"
-            Write-Bullet $sel "No backup failures or misconfigurations observed"
-        } else {
-            Write-Bullet $sel "Backup status reported as $($bi.Status) - review the backup console for failed jobs or coverage gaps"
+        'Memory' {
+            $p = $Value -split '\|'
+            if ($p.Count -ge 2 -and $p[1]) { return ("{0:N1}% Memory usage" -f [double]$p[1]) }
         }
-    } else {
-        Write-Para $sel "Backup & Disaster Recovery Status - Manual/External Required (pass -BackupInfo to include this section)." -Italic -Gray
-    }
-
-    # ---------------- 11. Action Plan ----------------
-    Write-Heading $sel "11. Action Plan" 2
-    $actionItems = $SiteFindings | Where-Object { $_.Status -in 'Critical','Warning' } | Sort-Object { if ($_.Status -eq 'Critical') { 0 } else { 1 } }
-    foreach ($a in $actionItems) {
-        Write-Bullet $sel "$($a.Object) - $($a.Item): $($a.Value) [$($a.Status)]"
-    }
-    Write-Bullet $sel "Continue regular monitoring of vCenter Server, ESXi hosts, storage, and network components to ensure ongoing health and performance."
-    Write-Bullet $sel "Perform standard maintenance activities in alignment with VMware best practices and approved change management procedures."
-    Write-Bullet $sel "Follow up on research and development initiatives to improve overall performance, enhance stability, and prevent potential future problems."
-    Write-Bullet $sel "Periodically review capacity utilization (CPU, memory, and storage) to support growth planning and avoid resource constraints."
-
-    # ---------------- 12. Conclusion ----------------
-    Write-Heading $sel "12. Conclusion" 2
-    $concl = if ($CritCount -gt 0) {
-        "The VMware environment consisting of 1 vCenter Server and $HostCountTotal ESXi hosts has $CritCount critical issue(s) identified during this health check that require prompt attention."
-    } else {
-        "The VMware environment consisting of 1 vCenter Server and $HostCountTotal ESXi hosts is in a healthy, stable, and fully supported state. No Critical issues were identified during this health check. The platform operates efficiently and is ready to support current and future workloads."
-    }
-    Write-Para $sel $concl
-    Write-Para $sel ''
-    Write-Para $sel "Prepared By: $PreparedBy" -Bold
-    if ($PreparedByTitle) { Write-Para $sel $PreparedByTitle }
-    Write-Para $sel "Report Date: $RunDateDisplay" -Bold
-
-    $safeLabel = ($SiteLabel -replace '[\\/\?\*\[\]:<>\|]', '_')
-    $baseName = "$safeLabel`_VMware_HealthCheck_$RunDate"
-    # If today's report file is still open elsewhere (e.g. someone reviewing the last run's PDF
-    # while this one executes), the export fails outright with a locked-file error. Rather than
-    # lose the run, fall back to an incrementing suffix (_2, _3, ...) until one saves. Retries on
-    # any error here (not just a specific message match) - PDF export can fail locked-file checks
-    # with different wording than Word's own docx SaveAs did, and a genuinely unrecoverable error
-    # (e.g. disk full) will simply keep failing every attempt and correctly fall through below.
-    $saved = $false
-    for ($attempt = 1; $attempt -le 20 -and -not $saved; $attempt++) {
-        $PdfPath = if ($attempt -eq 1) { Join-Path $OutputPath "$baseName.pdf" } else { Join-Path $OutputPath "$baseName`_$attempt.pdf" }
-        try {
-            # ExportAsFixedFormat(OutputFileName, ExportFormat) - ExportFormat 17 = wdExportFormatPDF.
-            # Word's dedicated PDF export API (rather than SaveAs2 with FileFormat 17), preferred
-            # for fidelity/embedded-font handling.
-            $null = $doc.GetType().InvokeMember('ExportAsFixedFormat', [System.Reflection.BindingFlags]::InvokeMethod, $null, $doc, @([string]$PdfPath, 17))
-            Write-Host "Report written: $PdfPath" -ForegroundColor Cyan
-            $saved = $true
-        } catch {
-            $lastError = $_.Exception.Message
+        'Datastore' {
+            $p = $Value -split '\|'
+            if ($p.Count -ge 2) {
+                $capGB = [double]$p[0]; $freeGB = [double]$p[1]
+                $usedPct = if ($capGB -gt 0) { (($capGB - $freeGB) / $capGB) * 100 } else { 0 }
+                return ("{0:N1}% used ({1:N2} GB free of {2:N0} GB)" -f $usedPct, $freeGB, $capGB)
+            }
         }
+        'vSphere HA'  { if ($Value -eq 'False') { return 'Turned OFF' } }
+        'vSphere DRS' { if ($Value -eq 'False') { return 'Turned OFF' } }
     }
-    if (-not $saved) {
-        Write-CheckLog -VCenter 'n/a' -Site $SiteLabel -Object 'PDF export' -CheckName 'Word COM automation' -ErrorMessage $lastError
-        Write-Warning "Could not save .pdf for $SiteLabel : $lastError"
-    }
-    $null = $doc.GetType().InvokeMember('Close', [System.Reflection.BindingFlags]::InvokeMethod, $null, $doc, @(0))
-    [System.Runtime.Interopservices.Marshal]::ReleaseComObject($doc) | Out-Null
+    return $Value
 }
 
 # Escapes text for safe inclusion in the HTML dashboard - avoids any dependency on
@@ -1391,12 +613,11 @@ function ConvertTo-HtmlSafe {
     return $Text -replace '&','&amp;' -replace '<','&lt;' -replace '>','&gt;' -replace '"','&quot;'
 }
 
-# Computes the same per-site aggregate numbers Write-SiteReportPdf shows (health status, risk
-# counts, host/VM/cluster counts, DRS/HA, ESXi version), independently from $Global:AllResults,
-# for the combined HTML dashboard. Deliberately a separate, self-contained function rather than
-# refactoring Write-SiteReportPdf to share it - that function has been hardened through a lot of
-# real-world bug fixes already, and duplicating this small piece of aggregation logic is a safer
-# tradeoff than risking a regression there for the dashboard's sake.
+# Computes every per-site aggregate the HTML dashboard needs (health status, risk counts,
+# host/VM/cluster counts, DRS/HA, capacity, full datastore list, OS distribution, networking
+# detail, security/compliance detail, backup detail, itemized action-plan findings) directly from
+# $Global:AllResults. Appliance health and hardware-sensor data are never referenced here - those
+# checks are not collected at all.
 function Get-SiteDashboardSummary {
     param([string]$SiteLabel)
     $SiteFindings = $Global:AllResults | Where-Object { $_.Site -eq $SiteLabel }
@@ -1407,13 +628,16 @@ function Get-SiteDashboardSummary {
     $UnableCount = @($SiteFindings | Where-Object { $_.Status -in 'Unable to Check','Manual/External Required' }).Count
     $OverallHealth = if ($CritCount -gt 0) { 'Critical' } elseif ($WarnCount -gt 0) { 'Warning' } else { 'Healthy' }
 
+    $VcVersionItem = $SiteFindings | Where-Object { $_.Item -eq 'vCenter Version/Build' } | Select-Object -First 1
+    $VCenterVersionText = if ($VcVersionItem) { $VcVersionItem.Value } else { 'n/a' }
+
     $AllHostFindings = $SiteFindings | Where-Object { $_.Area -eq 'Host' -and $_.Item -eq 'Host Configuration Summary' }
     $HostCountTotal = 0
     $HostVersionsAll = @()
     foreach ($hf in $AllHostFindings) {
         $parts = $hf.Value -split '\|'
         $HostCountTotal += [int]$parts[0]
-        $HostVersionsAll += "$($parts[1])"
+        $HostVersionsAll += "$($parts[1]) ($($parts[2]))"
     }
     $EsxiVersionDisplay = ($HostVersionsAll | Select-Object -Unique) -join ', '
 
@@ -1422,17 +646,17 @@ function Get-SiteDashboardSummary {
         $VmCountTotal += [int]$g.Value
     }
 
-    $ClusterCount = @(if ($Global:SiteClusterMap.ContainsKey($SiteLabel)) { $Global:SiteClusterMap[$SiteLabel] } else { @() }).Count
+    $ClusterNames = @(if ($Global:SiteClusterMap.ContainsKey($SiteLabel)) { $Global:SiteClusterMap[$SiteLabel] } else { @() })
+    $ClusterCount = $ClusterNames.Count
 
-    # Same "ON unless any cluster explicitly reports False" logic as the docx (line ~1043) -
-    # matched deliberately so the two outputs never disagree about DRS/HA status.
+    # Same "ON unless any cluster explicitly reports False" logic used everywhere else in this
+    # script - keeps every DRS/HA read in perfect agreement across the dashboard.
     $drsAll = ($SiteFindings | Where-Object { $_.Item -eq 'vSphere DRS' })
     $haAll  = ($SiteFindings | Where-Object { $_.Item -eq 'vSphere HA' })
     $drsOn = [bool]($drsAll) -and -not ($drsAll | Where-Object { $_.Value -eq 'False' })
     $haOn  = [bool]($haAll)  -and -not ($haAll  | Where-Object { $_.Value -eq 'False' })
 
-    # Capacity: same capacity-weighted average formula as docx section 6.1/6.2 (line ~1148) -
-    # matched exactly so the dashboard and the site's own report never disagree on the %.
+    # Capacity - same capacity-weighted average formula used throughout this script.
     $capFindings = $SiteFindings | Where-Object { $_.Area -eq 'Capacity' }
     $cpuCapTotal = 0.0; $cpuUsedTotal = 0.0
     $memCapTotal = 0.0; $memUsedTotal = 0.0
@@ -1447,42 +671,126 @@ function Get-SiteDashboardSummary {
     $cpuUsagePct = if ($cpuCapTotal -gt 0) { ($cpuUsedTotal / $cpuCapTotal) * 100 } else { $null }
     $memUsagePct = if ($memCapTotal -gt 0) { ($memUsedTotal / $memCapTotal) * 100 } else { $null }
 
-    # Storage: same total-capacity/total-free rollup as docx section 6.3.
-    $AllDsFindings = $SiteFindings | Where-Object { $_.Area -eq 'Storage' -and $_.Item -eq 'Datastore' }
-    $dsCapTotal = 0.0; $dsFreeTotal = 0.0
-    foreach ($df in $AllDsFindings) {
-        $p = $df.Value -split '\|'; $dsCapTotal += [double]$p[0]; $dsFreeTotal += [double]$p[1]
+    # Storage / datastores - grouped by Object (datastore name) so a datastore shared across two
+    # clusters in the same site is only counted/listed once, not once per cluster it's mounted to.
+    $dsGroups = $SiteFindings | Where-Object { $_.Area -eq 'Storage' -and $_.Item -eq 'Datastore' } | Group-Object Object
+    $DatastoresRaw = foreach ($g in $dsGroups) {
+        $f = $g.Group | Select-Object -First 1
+        $p = $f.Value -split '\|'
+        $capGB = [double]$p[0]; $freeGB = [double]$p[1]
+        $usedPct = if ($capGB -gt 0) { (($capGB - $freeGB) / $capGB) * 100 } else { 0 }
+        [pscustomobject]@{ Name = $f.Object; CapacityGB = $capGB; FreeGB = $freeGB; UsedPct = $usedPct; Status = $f.Status }
     }
+    $Datastores = @($DatastoresRaw | Sort-Object Name)
+    $dsCapTotal  = [double](($Datastores | Measure-Object -Property CapacityGB -Sum).Sum)
+    $dsFreeTotal = [double](($Datastores | Measure-Object -Property FreeGB -Sum).Sum)
     $dsUsagePct = if ($dsCapTotal -gt 0) { (($dsCapTotal - $dsFreeTotal) / $dsCapTotal) * 100 } else { $null }
-    $dsInaccessible = [bool]($AllDsFindings | Where-Object { ($_.Value -split '\|')[2] -eq 'False' })
+    $dsInaccessible = [bool]($Datastores | Where-Object { $_.Status -eq 'Critical' })
 
-    # Networking: same uplink/VLAN-0 exclusion as the docx (line ~926).
-    $PgFindings = $SiteFindings | Where-Object { $_.Item -eq 'Port Group' }
-    $VdsCountVal = @($SiteFindings | Where-Object { $_.Item -eq 'vDS' } | Select-Object -ExpandProperty Object -Unique).Count
+    $VsanEnabledAny = [bool]($SiteFindings | Where-Object { $_.Item -eq 'vSAN Enabled' })
+    $StorageLabelParts = @()
+    if ($Datastores.Count -gt 0) { $StorageLabelParts += 'VMFS on SAN' }
+    if ($VsanEnabledAny) { $StorageLabelParts += 'vSAN' }
+    $StorageLabel = if ($StorageLabelParts.Count -gt 0) { ($StorageLabelParts | Select-Object -Unique) -join ' + ' } else { 'n/a' }
+
+    # Networking - same uplink/VLAN-0 exclusion used throughout this script.
+    $PgFindings  = $SiteFindings | Where-Object { $_.Item -eq 'Port Group' }
+    $VdsFindings = $SiteFindings | Where-Object { $_.Item -eq 'vDS' }
+    $VdsCountVal = @($VdsFindings | Select-Object -ExpandProperty Object -Unique).Count
     $VlanCountVal = @($PgFindings | Where-Object {
         $parts = $_.Value -split '\|'
         $parts[2] -eq 'True' -and $parts[0] -ne '0'
     } | ForEach-Object { ($_.Value -split '\|')[0] } | Select-Object -Unique).Count
 
-    # Appliance: overall rollup status + certificate expiry text, same source findings as docx 3.1.
-    $applianceStatuses = @($SiteFindings | Where-Object { $_.Area -eq 'Appliance' } | Select-Object -ExpandProperty Status)
-    $applianceWorst = if ($applianceStatuses.Count -gt 0) { Get-WorstStatus $applianceStatuses } else { 'Manual/External Required' }
-    $certF = $SiteFindings | Where-Object { $_.Area -eq 'Appliance' -and $_.Item -eq 'Certificates' } | Select-Object -First 1
-    $certText = if ($certF) { $certF.Value } else { 'n/a' }
+    $TeamingValues = @($PgFindings | ForEach-Object { ($_.Value -split '\|')[1] } | Where-Object { $_ } | Select-Object -Unique)
+    $NicTeamingPolicy = if ($TeamingValues.Count -gt 0) { $TeamingValues -join ', ' } else { 'n/a' }
 
-    # Backup: whether -BackupInfo was supplied for this site (the report itself is the source of
-    # truth for detail - this is just a yes/no flag so a missing backup config is visible at a glance).
+    $MtuValues = @($VdsFindings | Select-Object -ExpandProperty Value -Unique)
+    $MtuConsistent = $MtuValues.Count -le 1
+    $MtuText = if ($MtuValues.Count -eq 1) { "Consistent ($($MtuValues[0]))" }
+               elseif ($MtuValues.Count -gt 1) { "Mismatch: $($MtuValues -join ' vs ')" }
+               else { 'n/a' }
+
+    $nicRedundancy = @($SiteFindings | Where-Object { $_.Item -eq 'Physical NIC Redundancy' })
+    $nicBad = @($nicRedundancy | Where-Object { $_.Status -ne 'Healthy' })
+    $NicRedundancyOk = $nicRedundancy.Count -gt 0 -and $nicBad.Count -eq 0
+    $NicRedundancyText = if ($nicRedundancy.Count -eq 0) { 'n/a' }
+                         elseif ($NicRedundancyOk) { 'Yes, all hosts' }
+                         else { "No - $($nicBad.Count) host(s) lacking redundancy" }
+
+    $netStatuses = @($nicRedundancy | Select-Object -ExpandProperty Status) +
+                   @($SiteFindings | Where-Object { $_.Item -eq 'NIC Errors/Drops' } | Select-Object -ExpandProperty Status) +
+                   @($(if ($MtuConsistent) { 'Healthy' } else { 'Warning' }))
+    $NetworkStatus = if ($netStatuses.Count -gt 0) { Get-WorstStatus $netStatuses } else { 'Unable to Check' }
+
+    # Security & compliance - per-host findings rolled up to one site-wide status + short display
+    # text per item, in the same spirit as the old report's bullets but sized for a dashboard tile.
+    $lockdownRows   = @($SiteFindings | Where-Object { $_.Item -eq 'Lockdown Mode' })
+    $secureBootRows = @($SiteFindings | Where-Object { $_.Item -eq 'Secure Boot' })
+    $localAcctRows  = @($SiteFindings | Where-Object { $_.Item -eq 'Local Accounts' })
+    $syslogRows     = @($SiteFindings | Where-Object { $_.Item -eq 'Syslog' })
+
+    $lockdownWorst = if ($lockdownRows.Count -gt 0) { Get-WorstStatus ($lockdownRows | Select-Object -ExpandProperty Status) } else { 'Unable to Check' }
+    $lockdownBad   = @($lockdownRows | Where-Object { $_.Status -ne 'Healthy' }).Count
+    $lockdownText  = if ($lockdownRows.Count -eq 0) { 'n/a' } elseif ($lockdownWorst -eq 'Healthy') { 'Enabled' } else { "Disabled on $lockdownBad host(s)" }
+
+    $sbWorst = if ($secureBootRows.Count -gt 0) { Get-WorstStatus ($secureBootRows | Select-Object -ExpandProperty Status) } else { 'Unable to Check' }
+    $sbBad   = @($secureBootRows | Where-Object { $_.Status -ne 'Healthy' }).Count
+    $sbText  = if ($secureBootRows.Count -eq 0) { 'n/a' } elseif ($sbWorst -eq 'Healthy') { 'Enabled' } else { "Disabled on $sbBad host(s)" }
+
+    $acctWorst = if ($localAcctRows.Count -gt 0) { Get-WorstStatus ($localAcctRows | Select-Object -ExpandProperty Status) } else { 'Unable to Check' }
+    $acctBad   = @($localAcctRows | Where-Object { $_.Status -ne 'Healthy' }).Count
+    $acctText  = if ($localAcctRows.Count -eq 0) { 'n/a' } elseif ($acctWorst -eq 'Healthy') { 'Compliant' } else { "$acctBad host(s) with unexpected accounts" }
+
+    $syslogWorst = if ($syslogRows.Count -gt 0) { Get-WorstStatus ($syslogRows | Select-Object -ExpandProperty Status) } else { 'Unable to Check' }
+    $syslogBad   = @($syslogRows | Where-Object { $_.Status -ne 'Healthy' }).Count
+    $syslogText  = if ($syslogRows.Count -eq 0) { 'n/a' } elseif ($syslogWorst -eq 'Healthy') { 'Configured on all hosts' } else { "Not configured on $syslogBad host(s)" }
+
+    $SecurityStatus = Get-WorstStatus @($lockdownWorst, $sbWorst, $acctWorst, $syslogWorst)
+
+    # Backup & DR - whether -BackupInfo was supplied for this site; the detail itself (appliance,
+    # schedule, retention, status) comes straight from that parameter, never fabricated. A
+    # Warning/Critical backup status counts toward this site's risk totals and Action Plan just
+    # like any other finding - a failed/expired backup solution is exactly the kind of thing that
+    # belongs in "risk issues", not a fact hidden away in its own panel.
     $backupSupplied = $BackupInfo.ContainsKey($SiteLabel)
+    $backupDetail = if ($backupSupplied) { $BackupInfo[$SiteLabel] } else { $null }
+    $backupStatus = if ($backupDetail -and $backupDetail.Status) { $backupDetail.Status } else { 'Manual/External Required' }
+    if ($backupStatus -eq 'Critical') {
+        $CritCount++
+        $OverallHealth = 'Critical'
+    } elseif ($backupStatus -eq 'Warning' -and $OverallHealth -ne 'Critical') {
+        $WarnCount++
+        $OverallHealth = 'Warning'
+    }
 
-    # Matches the docx's own filename pattern (line ~1308) for a "view full report" link. Doesn't
-    # account for the rare _2/_3 retry-suffix case (used only when the first save attempt fails
-    # because the file is open elsewhere) - an acceptable gap for a convenience link.
-    $pdfFileName = "$($SiteLabel -replace '[\\/\?\*\[\]:<>\|]', '_')_VMware_HealthCheck_$RunDate.pdf"
+    # Action plan - every Warning/Critical finding for this site, Critical first, with the backup
+    # issue (if any) surfaced first since it's typically the most business-impacting item.
+    # Appliance and Hardware findings can never appear here since those checks are no longer
+    # collected at all.
+    $ActionItems = @($SiteFindings | Where-Object { $_.Status -in 'Critical','Warning' } |
+        Sort-Object @{Expression = { if ($_.Status -eq 'Critical') { 0 } else { 1 } }} |
+        ForEach-Object {
+            [pscustomobject]@{
+                Severity = if ($_.Status -eq 'Critical') { 'High' } else { 'Medium' }
+                Object   = $_.Object
+                Item     = $_.Item
+                Value    = Get-ActionItemDisplayValue -Item $_.Item -Value $_.Value
+                Notes    = $_.Notes
+            }
+        })
+    if ($backupStatus -in 'Critical','Warning') {
+        $ActionItems = @([pscustomobject]@{
+            Severity = if ($backupStatus -eq 'Critical') { 'High' } else { 'Medium' }
+            Object   = $SiteLabel
+            Item     = 'Backup & Disaster Recovery'
+            Value    = "$($backupDetail.Appliance) - Status: $backupStatus"
+            Notes    = $backupDetail.Notes
+        }) + $ActionItems
+    }
 
-    # Per-cluster breakdown (Hosts/VMs/CPU%/Mem%) for the site's own full dashboard page - every
-    # finding used here already carries -Cluster (confirmed against the real New-Finding calls),
-    # so this is a straight per-cluster read rather than a re-derived aggregate.
-    $clusterRows = foreach ($cn in @($Global:SiteClusterMap[$SiteLabel])) {
+    # Per-cluster breakdown for this site's own dashboard page.
+    $clusterRows = @(foreach ($cn in $ClusterNames) {
         $hf = $AllHostFindings | Where-Object { $_.Cluster -eq $cn } | Select-Object -First 1
         $clusterHosts = if ($hf) { [int]($hf.Value -split '\|')[0] } else { 0 }
         $clusterVMs = 0
@@ -1491,44 +799,80 @@ function Get-SiteDashboardSummary {
         $cMemF = $capFindings | Where-Object { $_.Item -eq 'Memory' -and $_.Cluster -eq $cn } | Select-Object -First 1
         $cCpuPct = if ($cCpuF) { $p = $cCpuF.Value -split '\|'; if ($p[1] -and $p[1] -ne '') { [double]$p[1] } else { $null } } else { $null }
         $cMemPct = if ($cMemF) { $p = $cMemF.Value -split '\|'; if ($p[1] -and $p[1] -ne '') { [double]$p[1] } else { $null } } else { $null }
-        [pscustomobject]@{
-            Cluster = $cn; Hosts = $clusterHosts; VMs = $clusterVMs
-            CpuPct = $cCpuPct; MemPct = $cMemPct
-        }
+        [pscustomobject]@{ Cluster = $cn; Hosts = $clusterHosts; VMs = $clusterVMs; CpuPct = $cCpuPct; MemPct = $cMemPct }
+    })
+
+    # VM OS distribution, most common guest OS first.
+    $osGroups = $SiteFindings | Where-Object { $_.Area -eq 'VM' -and $_.Item -eq 'Guest OS' } | Group-Object Object
+    $OsDistribution = @($osGroups | ForEach-Object {
+        [pscustomobject]@{ Name = $_.Name; Count = ($_.Group | Measure-Object -Property Value -Sum).Sum }
+    } | Sort-Object Count -Descending)
+
+    $SummaryText = if ($CritCount -gt 0) {
+        "The VMware environment consisting of 1 vCenter Server and $HostCountTotal ESXi hosts has $CritCount critical issue(s) identified during this health check that require prompt attention."
+    } else {
+        "The VMware environment consisting of 1 vCenter Server and $HostCountTotal ESXi hosts is in a healthy, stable, and fully supported state. No Critical issues were identified during this health check. The platform operates efficiently and is ready to support current and future workloads."
     }
 
     [pscustomobject]@{
-        Site          = $SiteLabel
-        OverallHealth = $OverallHealth
-        HighRisk      = $CritCount
-        MediumRisk    = $WarnCount
-        LowRisk       = $UnableCount
-        HostCount     = $HostCountTotal
-        VmCount       = $VmCountTotal
-        ClusterCount  = $ClusterCount
-        ClusterRows   = @($clusterRows)
-        EsxiVersion   = $(if ($EsxiVersionDisplay) { $EsxiVersionDisplay } else { 'n/a' })
-        DrsOn         = $drsOn
-        HaOn          = $haOn
-        CpuPct        = $cpuUsagePct
-        CpuStatus     = $(if ($cpuUsagePct -ne $null) { Get-PctStatus $cpuUsagePct } else { 'Unable to Check' })
-        MemPct        = $memUsagePct
-        MemStatus     = $(if ($memUsagePct -ne $null) { Get-PctStatus $memUsagePct } else { 'Unable to Check' })
-        StoragePct    = $dsUsagePct
-        StorageStatus = $(if ($dsInaccessible) { 'Critical' } elseif ($dsUsagePct -ne $null) { Get-PctStatus $dsUsagePct } else { 'Unable to Check' })
-        StorageCapGB  = $dsCapTotal
-        VdsCount      = $VdsCountVal
-        VlanCount     = $VlanCountVal
-        ApplianceStatus = $applianceWorst
-        CertificateText = $certText
-        BackupSupplied  = $backupSupplied
-        PdfFileName     = $pdfFileName
+        Site              = $SiteLabel
+        VCenterVersion    = $VCenterVersionText
+        OverallHealth     = $OverallHealth
+        HighRisk          = $CritCount
+        MediumRisk        = $WarnCount
+        LowRisk           = $UnableCount
+        HostCount         = $HostCountTotal
+        VmCount           = $VmCountTotal
+        ClusterCount      = $ClusterCount
+        ClusterRows       = $clusterRows
+        EsxiVersion       = $(if ($EsxiVersionDisplay) { $EsxiVersionDisplay } else { 'n/a' })
+        StorageLabel      = $StorageLabel
+        DrsOn             = $drsOn
+        HaOn              = $haOn
+        CpuPct            = $cpuUsagePct
+        CpuStatus         = $(if ($cpuUsagePct -ne $null) { Get-PctStatus $cpuUsagePct } else { 'Unable to Check' })
+        CpuCapGHz         = $cpuCapTotal / 1000
+        CpuUsedGHz        = $cpuUsedTotal / 1000
+        CpuFreeGHz        = ($cpuCapTotal - $cpuUsedTotal) / 1000
+        MemPct            = $memUsagePct
+        MemStatus         = $(if ($memUsagePct -ne $null) { Get-PctStatus $memUsagePct } else { 'Unable to Check' })
+        MemCapGB          = $memCapTotal / 1024
+        MemUsedGB         = $memUsedTotal / 1024
+        MemFreeGB         = ($memCapTotal - $memUsedTotal) / 1024
+        StoragePct        = $dsUsagePct
+        StorageStatus     = $(if ($dsInaccessible) { 'Critical' } elseif ($dsUsagePct -ne $null) { Get-PctStatus $dsUsagePct } else { 'Unable to Check' })
+        StorageCapGB      = $dsCapTotal
+        StorageUsedGB     = $dsCapTotal - $dsFreeTotal
+        StorageFreeGB     = $dsFreeTotal
+        Datastores        = $Datastores
+        VdsCount          = $VdsCountVal
+        VlanCount         = $VlanCountVal
+        NicTeamingPolicy  = $NicTeamingPolicy
+        MtuConsistent     = $MtuConsistent
+        MtuText           = $MtuText
+        NicRedundancyOk   = $NicRedundancyOk
+        NicRedundancyText = $NicRedundancyText
+        NetworkStatus     = $NetworkStatus
+        LockdownStatus    = $lockdownWorst
+        LockdownText      = $lockdownText
+        SecureBootStatus  = $sbWorst
+        SecureBootText    = $sbText
+        LocalAcctStatus   = $acctWorst
+        LocalAcctText     = $acctText
+        SyslogStatus      = $syslogWorst
+        SyslogText        = $syslogText
+        SecurityStatus    = $SecurityStatus
+        BackupSupplied    = $backupSupplied
+        BackupDetail      = $backupDetail
+        ActionItems       = $ActionItems
+        OsDistribution    = $OsDistribution
+        SummaryText       = $SummaryText
     }
 }
 
-# Writes the combined multi-site overview dashboard - one static, self-contained HTML file with
-# no external dependencies (no CDN/internet access assumed), so it opens correctly straight from
-# disk on an offline/internal machine just like the .pdf/.log files do.
+# Writes the combined multi-site HTML dashboard - one static, self-contained file with no
+# external dependencies (no CDN/internet access assumed), so it opens correctly straight from disk
+# on an offline/internal machine. This is the ONLY report artifact the script produces now.
 function ConvertTo-Slug {
     param([string]$Text)
     $slug = ($Text -replace '[^a-zA-Z0-9]+', '-').Trim('-').ToLower()
@@ -1549,12 +893,14 @@ function Write-DashboardHtml {
     if ($summaries.Count -eq 0) { return }
 
     $healthColor = @{ Healthy = '#2e7d32'; Warning = '#e6a100'; Critical = '#c62828' }
-    # Neutral gray for anything that isn't a plain Healthy/Warning/Critical percentage status
-    # (Unable to Check) - avoids implying a false Healthy/Critical read on missing data.
-    $pctColor = @{ Healthy = '#2e7d32'; Warning = '#e6a100'; Critical = '#c62828'; 'Unable to Check' = '#888' }
     $healthLabelText = @{ Healthy = 'Healthy - No Issues Detected'; Warning = 'Healthy - Minor Issues Detected'; Critical = 'Attention Required - Critical Issues' }
+    # "Healthy Sites" counts every site that isn't Critical - a site with only Warning-level
+    # findings still shows its own badge as "Healthy - Minor Issues Detected", so it belongs here
+    # too, not just the (in practice almost never reached) zero-findings case. "Sites with
+    # Warnings" is a narrower, informational subset of that same count - how many of the healthy
+    # sites still have at least one Warning worth a look.
     $healthCounts = @{
-        Healthy  = @($summaries | Where-Object { $_.OverallHealth -eq 'Healthy' }).Count
+        Healthy  = @($summaries | Where-Object { $_.OverallHealth -ne 'Critical' }).Count
         Warning  = @($summaries | Where-Object { $_.OverallHealth -eq 'Warning' }).Count
         Critical = @($summaries | Where-Object { $_.OverallHealth -eq 'Critical' }).Count
     }
@@ -1563,88 +909,216 @@ function Write-DashboardHtml {
     $totalHosts  = ($summaries | Measure-Object -Property HostCount -Sum).Sum
     $totalVMs    = ($summaries | Measure-Object -Property VmCount -Sum).Sum
 
-    # Small colored horizontal bar used for each percentage metric - width is capped at 100 so a
-    # freak >100% reading (shouldn't happen, but data is data) never breaks the layout.
+    # Distinct heavy tab color per site, cycling through this palette by position - never the
+    # green/amber/red health colors, which already mean something specific elsewhere (risk badges,
+    # KPI tiles). The Overview tab keeps its own fixed navy.
+    $tabPalette = @('#2563EB','#7C3AED','#0D9488','#C026D3','#EA580C','#4F46E5','#DB2777','#0EA5E9')
+
+    # Fixed decorative palette for the 5 non-status tiles on every site page (ESXi Hosts, Clusters,
+    # VMs, ESXi Version, Storage Type), plus dedicated colors for the DRS/HA status tiles - all 7
+    # distinct on every single page, never white, never a duplicate within the same page.
+    $tileBlue = '#1565C0'; $tilePurple = '#6A1B9A'; $tileTeal = '#00897B'; $tileIndigo = '#283593'; $tileBrown = '#6D4C41'
+    $tileDrs = '#37474F'; $tileHa = '#880E4F'
+
+    function Get-PctBarColor {
+        param([Nullable[double]]$Pct)
+        if ($Pct -eq $null) { return '#888' }
+        switch (Get-PctStatus $Pct) {
+            'Critical' { '#c62828' }
+            'Warning'  { '#e6a100' }
+            default    { '#2e7d32' }
+        }
+    }
+
     function Get-BarHtml {
-        param([Nullable[double]]$Pct, [string]$Status, [string]$Label, [string]$ValueText)
+        param([Nullable[double]]$Pct, [string]$Status, [string]$Label, [string]$ValueText, [string]$DetailHtml = '')
         $pctColorLocal = @{ Healthy = '#2e7d32'; Warning = '#e6a100'; Critical = '#c62828'; 'Unable to Check' = '#888' }
         $color = $pctColorLocal[$Status]
         $width = if ($Pct -ne $null) { [Math]::Min(100, [Math]::Max(0, $Pct)) } else { 0 }
 @"
-          <div class="bar-row">
-            <div class="bar-label"><span>$(ConvertTo-HtmlSafe $Label)</span><span style="color:$color; font-weight:bold">$(ConvertTo-HtmlSafe $ValueText)</span></div>
-            <div class="bar-track"><div class="bar-fill" style="width:$width%;background:$color"></div></div>
-          </div>
+        <div class="bar-row">
+          <div class="bar-label"><span>$(ConvertTo-HtmlSafe $Label)</span><span style="color:$color; font-weight:bold">$(ConvertTo-HtmlSafe $ValueText)</span></div>
+          <div class="bar-track"><div class="bar-fill" style="width:$width%;background:$color"></div></div>
+          $DetailHtml
+        </div>
 "@
     }
 
-    # --- Overview page: a compact comparison table, not full-detail cards - one row per site ---
-    $overviewRows = ($summaries | ForEach-Object {
+    function Get-StatusPillHtml {
+        param([string]$Status, [string]$Text)
+        $variant = switch ($Status) {
+            'Healthy' { 'ok' }
+            'Warning' { 'warn' }
+            'Critical' { 'bad' }
+            default { 'info' }
+        }
+        "<span class=`"status-pill $variant`"><span class=`"dot`"></span>$(ConvertTo-HtmlSafe $Text)</span>"
+    }
+
+    function Get-MiniStatVariant {
+        param([string]$Status)
+        switch ($Status) {
+            'Healthy' { 'ok' }
+            'Warning' { 'warn' }
+            'Critical' { 'bad' }
+            default { '' }
+        }
+    }
+
+    # --- Overview page: KPI stat row + one card per site --------------------------------------
+    $overviewCards = ($summaries | ForEach-Object {
         $s = $_
         $slug = ConvertTo-Slug $s.Site
         $cpuText = if ($s.CpuPct -ne $null) { "{0:N1}%" -f $s.CpuPct } else { 'n/a' }
         $memText = if ($s.MemPct -ne $null) { "{0:N1}%" -f $s.MemPct } else { 'n/a' }
         $stgText = if ($s.StoragePct -ne $null) { "{0:N1}%" -f $s.StoragePct } else { 'n/a' }
+        $color = $healthColor[$s.OverallHealth]
+        $complianceText = if ($s.SecurityStatus -eq 'Healthy') { 'Compliant' } elseif ($s.SecurityStatus -in 'Unable to Check','Manual/External Required') { 'n/a' } else { 'Non-Compliant' }
+        $complianceColor = if ($s.SecurityStatus -eq 'Healthy') { '#2e7d32' } elseif ($s.SecurityStatus -in 'Unable to Check','Manual/External Required') { '#888' } else { '#c62828' }
 @"
-        <tr onclick="showPage('$slug')">
-          <td><a href="#" onclick="showPage('$slug'); return false;" class="site-link">$(ConvertTo-HtmlSafe $s.Site)</a></td>
-          <td><span class="badge" style="background:$($healthColor[$s.OverallHealth])">$(ConvertTo-HtmlSafe $healthLabelText[$s.OverallHealth])</span></td>
-          <td class="num-cell"><span class="risk risk-high">$($s.HighRisk)</span></td>
-          <td class="num-cell"><span class="risk risk-med">$($s.MediumRisk)</span></td>
-          <td class="num-cell"><span class="risk risk-low">$($s.LowRisk)</span></td>
-          <td class="num-cell">$($s.HostCount)</td>
-          <td class="num-cell">$($s.ClusterCount)</td>
-          <td class="num-cell">$($s.VmCount)</td>
-          <td class="num-cell" style="color:$($pctColor[$s.CpuStatus])">$cpuText</td>
-          <td class="num-cell" style="color:$($pctColor[$s.MemStatus])">$memText</td>
-          <td class="num-cell" style="color:$($pctColor[$s.StorageStatus])">$stgText</td>
-        </tr>
+      <div class="ov-card" onclick="showPage('$slug')" style="border-top-color:$color">
+        <div class="ov-head"><h2>$(ConvertTo-HtmlSafe $s.Site)</h2><span class="badge" style="background:$color">$(ConvertTo-HtmlSafe $healthLabelText[$s.OverallHealth])</span></div>
+        <div class="risk-row"><span class="risk risk-high">High: $($s.HighRisk)</span><span class="risk risk-med">Medium: $($s.MediumRisk)</span><span class="risk risk-low">Low: $($s.LowRisk)</span></div>
+        <table class="metrics">
+          <tr><td>ESXi Hosts / Clusters / VMs</td><td>$($s.HostCount) / $($s.ClusterCount) / $($s.VmCount)</td></tr>
+          <tr><td>vCenter / ESXi Version</td><td>$(ConvertTo-HtmlSafe $s.VCenterVersion) / $(ConvertTo-HtmlSafe $s.EsxiVersion)</td></tr>
+          <tr><td>Storage Type</td><td>$(ConvertTo-HtmlSafe $s.StorageLabel)</td></tr>
+          <tr><td>vSphere DRS / HA</td><td>$(if ($s.DrsOn) {'ON'} else {'<span style="color:#c62828">OFF</span>'}) / $(if ($s.HaOn) {'ON'} else {'<span style="color:#c62828">OFF</span>'})</td></tr>
+          <tr><td>CPU / Mem / Storage</td><td>$cpuText / $memText / $stgText</td></tr>
+          <tr><td>Backup Configured</td><td>$(if ($s.BackupSupplied) {'Yes'} else {'No'})</td></tr>
+          <tr><td>Compliance</td><td style="color:$complianceColor">$complianceText</td></tr>
+        </table>
+        <span class="ov-link">View Full Details &rarr;</span>
+      </div>
 "@
     }) -join "`n"
 
-    # --- Tab navigation bar ---
-    # Each site gets its own distinct identity color (cycling through this palette by position),
-    # deliberately NOT the green/yellow/red health colors - those already mean something specific
-    # elsewhere (risk badges, Overview stat boxes) and reusing them here would make every healthy
-    # site's tab identical, which is exactly what looked wrong. Health status still shows via the
-    # small dot inside each tab.
-    $sitePalette = @('#1565C0','#6A1B9A','#00897B','#AD1457','#4E342E','#283593','#37474F','#6D4C41')
-    $tabButtons = (@('<button class="tab overview-tab active" id="tab-overview" onclick="showPage(''overview'')">Overview</button>') + ($summaries | ForEach-Object {
+    # --- Tab navigation bar (circular, full site name inside each circle) ---
+    $tabButtons = (@('<button class="tab overview-tab active" id="tab-overview" onclick="showPage(''overview'')"><span class="tab-circle">Overview</span></button>') + ($summaries | ForEach-Object {
         $i = $summaries.IndexOf($_)
         $slug = ConvertTo-Slug $_.Site
-        $siteColor = $sitePalette[$i % $sitePalette.Count]
-        $dotColor = $healthColor[$_.OverallHealth]
-        "<button class=`"tab`" id=`"tab-$slug`" style=`"background:$siteColor`" onclick=`"showPage('$slug')`"><span class=`"tab-dot`" style=`"background:$dotColor`"></span>$(ConvertTo-HtmlSafe $_.Site)</button>"
+        $tabColor = $tabPalette[$i % $tabPalette.Count]
+        "<button class=`"tab`" id=`"tab-$slug`" onclick=`"showPage('$slug')`"><span class=`"tab-circle`" style=`"background:$tabColor`">$(ConvertTo-HtmlSafe $_.Site)</span></button>"
     })) -join "`n    "
 
-    # --- One full, spacious page per site ---
+    # --- One full, panel-rich page per site ---
     $sitePages = ($summaries | ForEach-Object {
         $s = $_
         $slug = ConvertTo-Slug $s.Site
         $color = $healthColor[$s.OverallHealth]
-        $applianceLabel = switch ($s.ApplianceStatus) {
-            'Healthy' { 'Healthy' }
-            'Manual/External Required' { 'Not Connected' }
-            'Unable to Check' { 'Unable to Check' }
-            default { $s.ApplianceStatus }
-        }
-        $stgText = if ($s.StoragePct -ne $null) { "{0:N1}% of {1:N0} GB" -f $s.StoragePct, $s.StorageCapGB } else { 'n/a' }
+
         $clusterTableRows = if ($s.ClusterRows.Count -gt 0) {
             ($s.ClusterRows | ForEach-Object {
                 $cr = $_
-                $crCpu = if ($cr.CpuPct -ne $null) { "{0:N1}%" -f $cr.CpuPct } else { 'n/a' }
-                $crMem = if ($cr.MemPct -ne $null) { "{0:N1}%" -f $cr.MemPct } else { 'n/a' }
-                "<tr><td>$(ConvertTo-HtmlSafe $cr.Cluster)</td><td class='num-cell'>$($cr.Hosts)</td><td class='num-cell'>$($cr.VMs)</td><td class='num-cell'>$crCpu</td><td class='num-cell'>$crMem</td></tr>"
+                $crCpuVal = if ($cr.CpuPct -ne $null) { $cr.CpuPct } else { 0 }
+                $crMemVal = if ($cr.MemPct -ne $null) { $cr.MemPct } else { 0 }
+                $crCpuText = if ($cr.CpuPct -ne $null) { "{0:N1}%" -f $cr.CpuPct } else { 'n/a' }
+                $crMemText = if ($cr.MemPct -ne $null) { "{0:N1}%" -f $cr.MemPct } else { 'n/a' }
+@"
+          <tr><td>$(ConvertTo-HtmlSafe $cr.Cluster)</td><td>$($cr.Hosts)</td><td>$($cr.VMs)</td>
+            <td><div class="mini-bar-wrap"><div class="mini-bar-track"><div class="mini-bar-fill" style="width:$crCpuVal%;background:$(Get-PctBarColor $cr.CpuPct)"></div></div><span>$crCpuText</span></div></td>
+            <td><div class="mini-bar-wrap"><div class="mini-bar-track"><div class="mini-bar-fill" style="width:$crMemVal%;background:$(Get-PctBarColor $cr.MemPct)"></div></div><span>$crMemText</span></div></td>
+          </tr>
+"@
             }) -join "`n"
         } else { "<tr><td colspan='5' style='color:#999'>No cluster detail available</td></tr>" }
+
+        $dsRows = if ($s.Datastores.Count -gt 0) {
+            ($s.Datastores | ForEach-Object {
+                $ds = $_
+@"
+              <tr><td>$(ConvertTo-HtmlSafe $ds.Name)</td><td>$("{0:N0}" -f $ds.CapacityGB) GB</td><td>$("{0:N2}" -f $ds.FreeGB) GB</td>
+                <td><div class="mini-bar-wrap"><div class="mini-bar-track"><div class="mini-bar-fill" style="width:$($ds.UsedPct)%;background:$(Get-PctBarColor $ds.UsedPct)"></div></div><span>$("{0:N1}" -f $ds.UsedPct)%</span></div></td>
+                <td>$(Get-StatusPillHtml -Status $ds.Status -Text $ds.Status)</td></tr>
+"@
+            }) -join "`n"
+        } else { "<tr><td colspan='5' style='color:#999'>No datastores found</td></tr>" }
+
+        $osRows = if ($s.OsDistribution.Count -gt 0) {
+            $maxCount = ($s.OsDistribution | Select-Object -First 1).Count
+            ($s.OsDistribution | ForEach-Object {
+                $pctWidth = if ($maxCount -gt 0) { [Math]::Max(3, ($_.Count / $maxCount) * 100) } else { 3 }
+                "<div class=`"os-bar-row`"><div class=`"os-name`">$(ConvertTo-HtmlSafe $_.Name)</div><div class=`"os-track`"><div class=`"os-fill`" style=`"width:$pctWidth%`"></div></div><div class=`"os-count`">$($_.Count)</div></div>"
+            }) -join "`n"
+        } else { "<p style='color:#999'>No VM inventory found</p>" }
+
+        $actionRows = if ($s.ActionItems.Count -gt 0) {
+            ($s.ActionItems | ForEach-Object {
+                $sevClass = if ($_.Severity -eq 'High') { 'high' } else { 'med' }
+                $subtitle = if ($_.Notes) { "$($_.Object) - $($_.Notes)" } else { $_.Object }
+@"
+        <li><span class="sev $sevClass">$($_.Severity)</span><div class="txt"><strong>$(ConvertTo-HtmlSafe $_.Item): $(ConvertTo-HtmlSafe $_.Value)</strong><span>$(ConvertTo-HtmlSafe $subtitle)</span></div></li>
+"@
+            }) -join "`n"
+        } else { $null }
+
+        $actionPlanBody = if ($actionRows) {
+            "<ul class=`"action-list`">`n$actionRows`n</ul>"
+        } else {
+@"
+      <div class="center-callout">
+        $(Get-StatusPillHtml -Status 'Healthy' -Text 'No Warning or Critical items flagged for this site')
+      </div>
+"@
+        }
+
+        $backupBody = if ($s.BackupSupplied -and $s.BackupDetail.Status -in 'Healthy','Warning','Critical') {
+            $bi = $s.BackupDetail
+            $biStatus = $bi.Status
+            $statusText = switch ($biStatus) {
+                'Healthy'  { 'Successfully Completed' }
+                'Critical' { if ($bi.Notes) { $bi.Notes } else { 'Failed' } }
+                'Warning'  { if ($bi.Notes) { $bi.Notes } else { 'Attention Required' } }
+            }
+            $flagClass = switch ($biStatus) { 'Critical' { 'critical' }; 'Warning' { 'warn' }; default { 'healthy' } }
+@"
+      <table class="metrics">
+        <tr><td>Appliance</td><td>$(ConvertTo-HtmlSafe $bi.Appliance) ($(ConvertTo-HtmlSafe $biStatus))</td></tr>
+        <tr><td>Schedule</td><td>$(ConvertTo-HtmlSafe $bi.Schedule)</td></tr>
+        <tr><td>Retention</td><td style="white-space:nowrap">$(ConvertTo-HtmlSafe $bi.Retention)</td></tr>
+        <tr><td>Status</td><td>$(ConvertTo-HtmlSafe $statusText)</td></tr>
+      </table>
+      <div class="backup-flag $flagClass">$(ConvertTo-HtmlSafe $biStatus)</div>
+"@
+        } elseif ($s.BackupSupplied) {
+            # Explicitly supplied but with a known reason it's not yet tracked as Healthy/Warning/
+            # Critical (e.g. a newly handed-over site whose backup management isn't ours yet) -
+            # distinct from "no data supplied at all" below, since there IS a specific reason to show.
+            $bi = $s.BackupDetail
+            $reasonText = if ($bi.Notes) { $bi.Notes } else { 'Manual/External Required' }
+@"
+      <div class="center-callout">
+        $(Get-StatusPillHtml -Status 'Manual/External Required' -Text 'Manual/External Required')
+        <p style="color:#999;font-size:13px;margin:12px 0 0">$(ConvertTo-HtmlSafe $reasonText)</p>
+      </div>
+      <div class="backup-flag warn">Pending</div>
+"@
+        } else {
+@"
+      <div class="center-callout">
+        $(Get-StatusPillHtml -Status 'Manual/External Required' -Text 'Manual/External Required')
+        <p style="color:#999;font-size:13px;margin:12px 0 0">Not supplied for this run - pass -BackupInfo to include backup device/solution status here.</p>
+      </div>
+"@
+        }
+
+        $mtuVariant = if ($s.MtuConsistent) { 'ok' } else { 'warn' }
+        $mtuIcon = if ($s.MtuConsistent) { [char]0x2705 } else { [char]0x26A0 }
+        $redundancyVariant = if ($s.NicRedundancyOk) { 'ok' } else { 'bad' }
+
+        $cpuValueText = if ($s.CpuPct -ne $null) { "{0:N1}%" -f $s.CpuPct } else { 'n/a' }
+        $memValueText = if ($s.MemPct -ne $null) { "{0:N1}%" -f $s.MemPct } else { 'n/a' }
+        $stgValueText = if ($s.StoragePct -ne $null) { "{0:N1}%" -f $s.StoragePct } else { 'n/a' }
+        $cpuDetail = "<div class=`"cap-detail`"><span><b>$("{0:N2}" -f $s.CpuCapGHz)</b> GHz total</span><span><b>$("{0:N2}" -f $s.CpuUsedGHz)</b> GHz used</span><span><b>$("{0:N2}" -f $s.CpuFreeGHz)</b> GHz free</span></div>"
+        $memDetail = "<div class=`"cap-detail`"><span><b>$("{0:N2}" -f $s.MemCapGB)</b> GB total</span><span><b>$("{0:N2}" -f $s.MemUsedGB)</b> GB used</span><span><b>$("{0:N2}" -f $s.MemFreeGB)</b> GB free</span></div>"
+        $stgDetail = "<div class=`"cap-detail`"><span><b>$("{0:N1}" -f $s.StorageCapGB)</b> GB total</span><span><b>$("{0:N2}" -f $s.StorageUsedGB)</b> GB used</span><span><b>$("{0:N2}" -f $s.StorageFreeGB)</b> GB free</span></div>"
+
 @"
       <section class="page" id="page-$slug">
         <div class="site-hero" style="border-left-color:$color">
-          <div>
-            <h1>$(ConvertTo-HtmlSafe $s.Site)</h1>
-            <span class="badge big" style="background:$color">$(ConvertTo-HtmlSafe $healthLabelText[$s.OverallHealth])</span>
-          </div>
-          <a class="report-link big" href="$([System.Uri]::EscapeDataString($s.PdfFileName))">View Full Report &rarr;</a>
+          <h1>$(ConvertTo-HtmlSafe $s.Site)</h1>
+          <span class="badge big" style="background:$color">$(ConvertTo-HtmlSafe $healthLabelText[$s.OverallHealth])</span>
+          <div class="meta">$(ConvertTo-HtmlSafe $s.VCenterVersion) &middot; Report generated $(ConvertTo-HtmlSafe $RunDateDisplay)</div>
         </div>
 
         <div class="risk-row big">
@@ -1654,38 +1128,91 @@ function Write-DashboardHtml {
         </div>
 
         <div class="tile-row">
-          <div class="tile tile-blue"><span class="num">$($s.HostCount)</span><span class="label">ESXi Hosts</span></div>
-          <div class="tile tile-purple"><span class="num">$($s.ClusterCount)</span><span class="label">Clusters</span></div>
-          <div class="tile tile-teal"><span class="num">$($s.VmCount)</span><span class="label">Virtual Machines</span></div>
-          <div class="tile tile-gray"><span class="num" style="font-size:20px">$(ConvertTo-HtmlSafe $s.EsxiVersion)</span><span class="label">ESXi Version</span></div>
-          <div class="tile $(if ($s.DrsOn) {'tile-on'} else {'tile-off'})"><span class="num">$(if ($s.DrsOn) {'ON'} else {'OFF'})</span><span class="label">vSphere DRS</span></div>
-          <div class="tile $(if ($s.HaOn) {'tile-on'} else {'tile-off'})"><span class="num">$(if ($s.HaOn) {'ON'} else {'OFF'})</span><span class="label">vSphere HA</span></div>
+          <div class="tile" style="background:$tileBlue"><span class="num">$($s.HostCount)</span><span class="label">ESXi Hosts</span></div>
+          <div class="tile" style="background:$tilePurple"><span class="num">$($s.ClusterCount)</span><span class="label">Clusters</span></div>
+          <div class="tile" style="background:$tileTeal"><span class="num">$($s.VmCount)</span><span class="label">Virtual Machines</span></div>
+          <div class="tile" style="background:$tileIndigo"><span class="num" style="font-size:16px">$(ConvertTo-HtmlSafe $s.EsxiVersion)</span><span class="label">ESXi Version</span></div>
+          <div class="tile" style="background:$tileDrs"><span class="num $(if ($s.DrsOn) {'on'} else {'off'})">$(if ($s.DrsOn) {'ON'} else {'OFF'})</span><span class="label">vSphere DRS</span></div>
+          <div class="tile" style="background:$tileHa"><span class="num $(if ($s.HaOn) {'on'} else {'off'})">$(if ($s.HaOn) {'ON'} else {'OFF'})</span><span class="label">vSphere HA</span></div>
+          <div class="tile" style="background:$tileBrown"><span class="num" style="font-size:18px">$(ConvertTo-HtmlSafe $s.StorageLabel)</span><span class="label">Storage Type</span></div>
         </div>
 
         <div class="panel-grid">
-          <div class="panel">
-            <h3>Capacity</h3>
-$(Get-BarHtml -Pct $s.CpuPct -Status $s.CpuStatus -Label 'CPU Usage' -ValueText $(if ($s.CpuPct -ne $null) { "{0:N1}%" -f $s.CpuPct } else { 'n/a' }))
-$(Get-BarHtml -Pct $s.MemPct -Status $s.MemStatus -Label 'Memory Usage' -ValueText $(if ($s.MemPct -ne $null) { "{0:N1}%" -f $s.MemPct } else { 'n/a' }))
-$(Get-BarHtml -Pct $s.StoragePct -Status $s.StorageStatus -Label 'Storage Usage' -ValueText $stgText)
+          <div class="panel" style="border-top-color:#1565C0">
+            <h3><span class="n" style="background:#1565C0">&#9889;</span>Performance &amp; Capacity (Last $PerfHistoryHours Hours)</h3>
+$(Get-BarHtml -Pct $s.CpuPct -Status $s.CpuStatus -Label 'CPU Usage' -ValueText $cpuValueText -DetailHtml $cpuDetail)
+$(Get-BarHtml -Pct $s.MemPct -Status $s.MemStatus -Label 'Memory Usage' -ValueText $memValueText -DetailHtml $memDetail)
+$(Get-BarHtml -Pct $s.StoragePct -Status $s.StorageStatus -Label 'Storage Usage' -ValueText $stgValueText -DetailHtml $stgDetail)
           </div>
-          <div class="panel">
-            <h3>Networking &amp; Appliance</h3>
-            <table class="metrics">
-              <tr><td>Distributed Switches</td><td>$($s.VdsCount)</td></tr>
-              <tr><td>VLANs Configured</td><td>$($s.VlanCount)</td></tr>
-              <tr><td>Appliance Health</td><td>$(ConvertTo-HtmlSafe $applianceLabel)</td></tr>
-              <tr><td>Certificate</td><td>$(ConvertTo-HtmlSafe $s.CertificateText)</td></tr>
-              <tr><td>Backup Configured</td><td>$(if ($s.BackupSupplied) {'Yes'} else {'Not Supplied'})</td></tr>
-            </table>
+
+          <div class="panel" style="border-top-color:#6A1B9A">
+            <h3><span class="n" style="background:#6A1B9A">&#127760;</span>Networking Health</h3>
+            <div class="mini-grid">
+              <div class="mini-stat"><span class="mi-icon">&#128256;</span><span class="mi-val">$($s.VdsCount)</span><span class="mi-label">Distributed Switches</span></div>
+              <div class="mini-stat"><span class="mi-icon">&#127991;&#65039;</span><span class="mi-val">$($s.VlanCount)</span><span class="mi-label">VLANs Configured</span></div>
+              <div class="mini-stat"><span class="mi-icon">&#9878;&#65039;</span><span class="mi-val" style="font-size:13px">$(ConvertTo-HtmlSafe $s.NicTeamingPolicy)</span><span class="mi-label">NIC Teaming Policy</span></div>
+              <div class="mini-stat $mtuVariant"><span class="mi-icon">$mtuIcon</span><span class="mi-val" style="font-size:13px">$(ConvertTo-HtmlSafe $s.MtuText)</span><span class="mi-label">MTU Consistency</span></div>
+              <div class="mini-stat $redundancyVariant"><span class="mi-icon">&#128268;</span><span class="mi-val" style="font-size:14px">$(ConvertTo-HtmlSafe $s.NicRedundancyText)</span><span class="mi-label">Redundant NICs</span></div>
+            </div>
+          </div>
+
+          <div class="panel panel-full" style="border-top-color:#00897B">
+            <h3><span class="n" style="background:#00897B">&#128451;&#65039;</span>Storage / Datastores <span style="font-weight:normal;font-size:14px;color:#999">($($s.Datastores.Count) total)</span></h3>
+            <div class="scroll-box">
+              <table class="metrics wide">
+                <thead><tr><th>Datastore</th><th>Capacity</th><th>Free</th><th>Used %</th><th>Status</th></tr></thead>
+                <tbody>
+$dsRows
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="panel panel-full" style="border-top-color:#283593">
+            <h3><span class="n" style="background:#283593">&#128421;&#65039;</span>VM Inventory - OS Distribution <span style="font-weight:normal;font-size:14px;color:#999">($($s.VmCount) VMs across $($s.OsDistribution.Count) OS types)</span></h3>
+            <div class="scroll-box" style="padding:14px 18px">
+$osRows
+            </div>
+          </div>
+
+          <div class="panel" style="border-top-color:#2e7d32">
+            <h3><span class="n" style="background:#2e7d32">&#128737;&#65039;</span>Security &amp; Compliance</h3>
+            <div class="mini-grid">
+              <div class="mini-stat $(Get-MiniStatVariant $s.LockdownStatus)"><span class="mi-icon">&#128274;</span><span class="mi-val" style="font-size:14px">$(ConvertTo-HtmlSafe $s.LockdownText)</span><span class="mi-label">Lockdown Mode</span></div>
+              <div class="mini-stat $(Get-MiniStatVariant $s.SecureBootStatus)"><span class="mi-icon">&#128737;&#65039;</span><span class="mi-val" style="font-size:14px">$(ConvertTo-HtmlSafe $s.SecureBootText)</span><span class="mi-label">Secure Boot</span></div>
+              <div class="mini-stat $(Get-MiniStatVariant $s.LocalAcctStatus)"><span class="mi-icon">&#128100;</span><span class="mi-val" style="font-size:13px">$(ConvertTo-HtmlSafe $s.LocalAcctText)</span><span class="mi-label">Local ESXi Users</span></div>
+              <div class="mini-stat $(Get-MiniStatVariant $s.SyslogStatus)"><span class="mi-icon">&#128221;</span><span class="mi-val" style="font-size:13px">$(ConvertTo-HtmlSafe $s.SyslogText)</span><span class="mi-label">Syslog Configured</span></div>
+            </div>
+          </div>
+
+          <div class="panel" style="border-top-color:#6D4C41">
+            <h3><span class="n" style="background:#6D4C41">&#9729;&#65039;</span>Backup &amp; Disaster Recovery</h3>
+$backupBody
           </div>
         </div>
 
-        <div class="panel">
-          <h3>Clusters</h3>
+        <div class="panel" style="border-top-color:#e6a100">
+          <h3><span class="n" style="background:#e6a100">&#9888;&#65039;</span>Action Plan - Items Requiring Attention</h3>
+$actionPlanBody
+          <ul class="standard-notes">
+            <li>Continue regular monitoring of vCenter Server, ESXi hosts, storage, and network components.</li>
+            <li>Perform standard maintenance activities in line with VMware best practices and change management procedures.</li>
+            <li>Periodically review capacity utilization (CPU, memory, storage) to support growth planning.</li>
+          </ul>
+        </div>
+
+        <div class="panel" style="border-top-color:#1E3A5F">
+          <h3><span class="n" style="background:#1E3A5F">&#128203;</span>Summary</h3>
+          <p class="summary-text">$(ConvertTo-HtmlSafe $s.SummaryText)</p>
+        </div>
+
+        <div class="panel" style="border-top-color:#AD1457">
+          <h3><span class="n" style="background:#AD1457">&#129513;</span>Clusters</h3>
           <table class="metrics wide">
-            <tr><th>Cluster</th><th>Hosts</th><th>VMs</th><th>CPU %</th><th>Memory %</th></tr>
+            <thead><tr><th>Cluster</th><th>Hosts</th><th>VMs</th><th>CPU %</th><th>Memory %</th></tr></thead>
+            <tbody>
 $clusterTableRows
+            </tbody>
           </table>
         </div>
       </section>
@@ -1699,70 +1226,111 @@ $clusterTableRows
 <meta charset="UTF-8">
 <title>VMware Weekly Health Check - Dashboard</title>
 <style>
-  body { font-family: Calibri, Arial, sans-serif; background:#f4f6f8; color:#1a1a1a; margin:0; padding:0 32px 32px; font-size:16px; line-height:1.4; }
+  body { font-family: Calibri, Arial, sans-serif; background:#eef1f5; color:#1a1a1a; margin:0; padding:0 32px 32px; font-size:16px; line-height:1.4; }
   h1 { color:#1E3A5F; margin:0; font-size:36px; }
   .subtitle { color:#555; margin:6px 0 20px; font-size:16px; }
-  .tabs { display:flex; gap:8px; flex-wrap:wrap; padding:20px 0; position:sticky; top:0; background:#f4f6f8; z-index:10; border-bottom:1px solid #e0e0e0; margin-bottom:28px; }
-  .tab { border:3px solid transparent; color:#fff; font-weight:bold; padding:11px 22px; border-radius:24px; font-size:16px; cursor:pointer; box-shadow:0 1px 4px rgba(0,0,0,0.18); display:inline-flex; align-items:center; gap:8px; }
-  .tab.overview-tab { background:#1E3A5F; }
-  .tab.active { border-color:#1a1a1a; box-shadow:0 0 0 3px rgba(0,0,0,0.25); }
-  .tab-dot { width:11px; height:11px; border-radius:50%; display:inline-block; border:2px solid rgba(255,255,255,0.85); }
+  .tabs { display:grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap:20px; padding:24px 0 20px; position:sticky; top:0; background:#eef1f5; z-index:10; border-bottom:1px solid #dfe3e8; margin-bottom:32px; }
+  .tab { display:flex; flex-direction:column; align-items:center; cursor:pointer; background:none; border:none; padding:0; font-family:inherit; }
+  .tab .tab-circle { width:150px; height:150px; border-radius:50%; display:flex; align-items:center; justify-content:center; color:#fff; font-weight:bold; font-size:17px; text-align:center; line-height:1.25; padding:10px; box-sizing:border-box; box-shadow:0 1px 4px rgba(0,0,0,0.2); border:3px solid transparent; }
+  .tab.overview-tab .tab-circle { background:#1E3A5F; }
+  .tab.active .tab-circle { border-color:#1a1a1a; box-shadow:0 0 0 3px rgba(0,0,0,0.15), 0 1px 4px rgba(0,0,0,0.2); }
   .page { display:none; }
   .page.active { display:block; }
-  .summary-strip { display:flex; gap:20px; flex-wrap:wrap; margin-bottom:28px; }
-  .stat { background:#fff; border-radius:10px; padding:20px 26px; box-shadow:0 1px 4px rgba(0,0,0,0.14); min-width:170px; }
-  .stat .num { font-size:36px; font-weight:bold; display:block; color:#1E3A5F; }
-  .stat .label { color:#555; font-size:15px; }
-  .stat-risk-high { background:#fdecea; }
-  .stat-risk-high .num { color:#c62828; }
-  .stat-risk-med { background:#fff6e0; }
-  .stat-risk-med .num { color:#8a6100; }
-  table.overview { width:100%; border-collapse:collapse; background:#fff; border-radius:10px; overflow:hidden; box-shadow:0 1px 4px rgba(0,0,0,0.14); }
-  table.overview th { background:#1E3A5F; color:#fff; text-align:left; padding:14px 18px; font-size:15px; }
-  table.overview td { padding:14px 18px; border-bottom:1px solid #eee; font-size:16px; }
-  table.overview tr:hover { background:#f8fafc; cursor:pointer; }
-  .num-cell { text-align:center; font-weight:600; }
-  .site-link { color:#1E3A5F; font-weight:bold; text-decoration:none; }
-  .site-link:hover { text-decoration:underline; }
-  .badge { color:#fff; padding:6px 14px; border-radius:14px; font-size:14px; font-weight:bold; white-space:nowrap; }
-  .badge.big { font-size:20px; padding:10px 22px; border-radius:20px; }
+
+  .stat-row { display:grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap:20px; margin-bottom:28px; }
+  .stat { border-radius:10px; padding:18px 20px; text-align:center; box-shadow:0 1px 4px rgba(0,0,0,0.14); }
+  .stat .num { font-size:32px; font-weight:bold; display:block; color:#fff; }
+  .stat .label { font-size:14px; margin-top:4px; display:block; color:#fff; }
+
+  .ov-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap:24px; }
+  .ov-card { background:#fff; border-radius:10px; padding:24px 26px; box-shadow:0 1px 4px rgba(0,0,0,0.14); border-top:6px solid; cursor:pointer; }
+  .ov-card:hover { box-shadow:0 4px 14px rgba(0,0,0,0.18); }
+  .ov-head { display:flex; flex-direction:column; align-items:flex-start; gap:10px; margin-bottom:14px; }
+  .ov-head h2 { margin:0; font-size:24px; color:#1E3A5F; }
+  .ov-link { display:inline-block; margin-top:14px; color:#1E3A5F; font-weight:bold; font-size:14px; }
+  .badge { color:#fff; padding:6px 14px; border-radius:6px; font-size:14px; font-weight:bold; white-space:nowrap; display:inline-block; text-align:center; width:280px; }
+  .badge.big { font-size:20px; padding:10px 22px; width:420px; }
   .risk-row { display:flex; gap:12px; margin-bottom:16px; flex-wrap:wrap; }
-  .risk-row.big { margin:24px 0; }
+  .risk-row.big { margin:20px 0 28px; }
   .risk-row.big .risk { font-size:18px; padding:10px 20px; }
   .risk { font-size:14px; padding:5px 12px; border-radius:6px; font-weight:bold; }
   .risk-high { background:#fdecea; color:#c62828; }
   .risk-med  { background:#fff6e0; color:#8a6100; }
   .risk-low  { background:#eef2f5; color:#555; }
-  .site-hero { display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:20px; border-left:8px solid; padding:14px 0 14px 26px; margin-bottom:12px; }
+  .site-hero { border-left:8px solid; padding:14px 0 14px 26px; margin-bottom:8px; }
   .site-hero h1 { font-size:40px; }
-  .report-link { display:inline-block; font-size:15px; color:#1E3A5F; font-weight:600; text-decoration:none; }
-  .report-link.big { font-size:18px; background:#1E3A5F; color:#fff; padding:14px 28px; border-radius:8px; }
-  .report-link.big:hover { background:#15304d; }
+  .site-hero .meta { color:#888; font-size:14px; margin-top:10px; }
+
   .tile-row { display:grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap:20px; margin-bottom:28px; }
-  .tile { border-radius:10px; padding:22px; text-align:center; box-shadow:0 1px 4px rgba(0,0,0,0.14); }
-  .tile .num { font-size:30px; font-weight:bold; display:block; color:#1E3A5F; }
-  .tile .label { color:#555; font-size:14px; margin-top:6px; display:block; }
-  .tile-blue   { background:#dceafc; }
-  .tile-purple { background:#ead9f7; }
-  .tile-teal   { background:#d3f3ee; }
-  .tile-gray   { background:#e3e7ec; }
-  .tile-on  { background:#2e7d32; }
-  .tile-on  .num, .tile-on  .label { color:#fff; }
-  .tile-off { background:#c62828; }
-  .tile-off .num, .tile-off .label { color:#fff; }
+  .tile { border-radius:10px; padding:20px 18px; text-align:center; box-shadow:0 1px 4px rgba(0,0,0,0.14); }
+  .tile .num { font-size:24px; font-weight:bold; display:block; color:#fff; }
+  .tile .label { font-size:14px; margin-top:6px; display:block; color:#fff; }
+  .tile .num.on { color:#69F0AE; }
+  .tile .num.off { color:#FF8A80; }
+
   .panel-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap:24px; margin-bottom:24px; }
-  .panel { background:#fff; border-radius:10px; padding:26px 28px; box-shadow:0 1px 4px rgba(0,0,0,0.14); }
-  .panel h3 { margin:0 0 18px; color:#1E3A5F; font-size:19px; }
-  .bar-row { margin-bottom:20px; }
+  .panel { background:#fff; border-radius:10px; padding:26px 28px; box-shadow:0 1px 4px rgba(0,0,0,0.14); margin-bottom:24px; border-top:5px solid #ccc; }
+  .status-pill { display:inline-flex; align-items:center; gap:6px; padding:5px 12px; border-radius:14px; font-size:13px; font-weight:bold; }
+  .status-pill.ok { background:#e8f5e9; color:#1b5e20; }
+  .status-pill.warn { background:#fff6e0; color:#8a6100; }
+  .status-pill.bad { background:#fdecea; color:#c62828; }
+  .status-pill.info { background:#eef2f5; color:#555; }
+  .status-pill .dot { width:8px; height:8px; border-radius:50%; background:currentColor; }
+  .panel h3 { margin:0 0 18px; color:#1E3A5F; font-size:19px; display:flex; align-items:center; gap:10px; }
+  .panel h3 .n { color:#fff; width:34px; height:34px; border-radius:50%; display:inline-flex; align-items:center; justify-content:center; font-size:17px; flex-shrink:0; box-shadow:0 1px 3px rgba(0,0,0,0.25); }
+  .bar-row { margin-bottom:14px; }
   .bar-label { display:flex; justify-content:space-between; font-size:15px; color:#555; margin-bottom:6px; }
   .bar-track { background:#eef1f4; border-radius:7px; height:14px; overflow:hidden; }
   .bar-fill { height:100%; border-radius:7px; }
+  .cap-detail { display:flex; gap:18px; font-size:13px; color:#777; margin:6px 0 18px; flex-wrap:wrap; }
+  .cap-detail b { color:#444; }
+
+  .mini-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap:12px; }
+  .mini-stat { background:#f4f7fa; border-radius:8px; padding:16px 10px; text-align:center; }
+  .mini-stat .mi-icon { font-size:24px; display:block; }
+  .mini-stat .mi-val { font-weight:bold; font-size:17px; margin:8px 0 2px; color:#1a1a1a; display:block; }
+  .mini-stat .mi-label { font-size:12px; color:#777; display:block; }
+  .mini-stat.ok { background:#e8f5e9; } .mini-stat.ok .mi-val { color:#1b5e20; }
+  .mini-stat.warn { background:#fff6e0; } .mini-stat.warn .mi-val { color:#8a6100; }
+  .mini-stat.bad { background:#fdecea; } .mini-stat.bad .mi-val { color:#c62828; }
+
   table.metrics { width:100%; border-collapse:collapse; font-size:16px; }
-  table.metrics td, table.metrics th { padding:9px 6px; border-bottom:1px solid #eee; }
-  table.metrics td:first-child { color:#666; }
+  table.metrics td, table.metrics th { padding:10px 6px; border-bottom:1px solid #eee; vertical-align:top; }
+  table.metrics td:first-child { color:#666; width:55%; }
   table.metrics td:last-child:not(:first-child) { text-align:right; font-weight:600; }
-  table.metrics.wide th { text-align:left; color:#999; font-size:13px; text-transform:uppercase; }
-  table.metrics.wide td:not(:first-child) { text-align:center; }
+  table.metrics.wide th { text-align:center; color:#999; font-size:13px; text-transform:uppercase; padding-bottom:10px; }
+  table.metrics.wide th:first-child { text-align:left; }
+  table.metrics.wide td { text-align:center; }
+  table.metrics.wide td:first-child { text-align:left; color:#333; font-weight:600; width:auto; }
+  table.metrics.wide td:last-child:not(:first-child) { text-align:center; font-weight:normal; }
+  .scroll-box { max-height:340px; overflow-y:auto; border:1px solid #f0f0f0; border-radius:6px; }
+  .scroll-box table.metrics.wide { font-size:15px; }
+  .scroll-box thead th { position:sticky; top:0; background:#fff; }
+  .panel-full { grid-column: 1 / -1; }
+  .mini-bar-wrap { display:flex; align-items:center; gap:8px; justify-content:center; }
+  .mini-bar-track { width:60px; height:8px; background:#eef1f4; border-radius:4px; overflow:hidden; flex-shrink:0; }
+  .mini-bar-fill { height:100%; border-radius:4px; }
+  .os-bar-row { display:flex; align-items:center; gap:10px; margin-bottom:8px; }
+  .os-name { width:230px; font-size:14px; color:#444; flex-shrink:0; }
+  .os-track { flex:1; background:#eef1f4; border-radius:6px; height:14px; overflow:hidden; }
+  .os-fill { height:100%; background:#1565C0; border-radius:6px; }
+  .os-count { width:36px; text-align:right; font-weight:600; font-size:14px; }
+  .action-list { list-style:none; margin:0; padding:0; }
+  .action-list li { display:flex; gap:14px; padding:14px 0; border-bottom:1px solid #eee; align-items:flex-start; }
+  .action-list li:last-child { border-bottom:none; }
+  .action-list .sev { flex-shrink:0; padding:4px 12px; border-radius:6px; font-size:12px; font-weight:bold; white-space:nowrap; margin-top:2px; }
+  .action-list .sev.high { background:#fdecea; color:#c62828; }
+  .action-list .sev.med { background:#fff6e0; color:#8a6100; }
+  .action-list .txt strong { display:block; font-size:15px; color:#1a1a1a; }
+  .action-list .txt span { font-size:14px; color:#666; }
+  .standard-notes { list-style:disc; padding-left:20px; color:#666; font-size:14px; margin:14px 0 0; }
+  .standard-notes li { margin-bottom:6px; }
+  .summary-text { color:#444; font-size:15px; line-height:1.6; }
+  .center-callout { text-align:center; padding:8px 0 18px; }
+  .backup-flag { margin:18px -28px -26px -28px; padding:10px 0; text-align:center; font-weight:bold; color:#fff; border-radius:0 0 10px 10px; font-size:14px; letter-spacing:0.5px; }
+  .backup-flag.healthy { background:#2e7d32; }
+  .backup-flag.critical { background:#c62828; }
+  .backup-flag.warn { background:#e6a100; }
   footer { margin-top:36px; color:#888; font-size:14px; }
 </style>
 </head>
@@ -1775,20 +1343,19 @@ $clusterTableRows
   </nav>
 
   <section class="page active" id="page-overview">
-    <div class="summary-strip">
-      <div class="stat" style="background:#2e7d32"><span class="num" style="color:#fff">$($healthCounts.Healthy)</span><span class="label" style="color:#fff">Healthy Sites</span></div>
-      <div class="stat" style="background:#e6a100"><span class="num" style="color:#fff">$($healthCounts.Warning)</span><span class="label" style="color:#fff">Sites with Warnings</span></div>
-      <div class="stat" style="background:#c62828"><span class="num" style="color:#fff">$($healthCounts.Critical)</span><span class="label" style="color:#fff">Sites Critical</span></div>
-      <div class="stat stat-risk-high"><span class="num">$totalHigh</span><span class="label">Total High Risk Issues</span></div>
-      <div class="stat stat-risk-med"><span class="num">$totalMedium</span><span class="label">Total Medium Risk Issues</span></div>
-      <div class="stat tile-blue"><span class="num">$totalHosts</span><span class="label">Total ESXi Hosts</span></div>
-      <div class="stat tile-teal"><span class="num">$totalVMs</span><span class="label">Total VMs</span></div>
+    <div class="stat-row">
+      <div class="stat" style="background:#2e7d32"><span class="num">$($healthCounts.Healthy)</span><span class="label">Healthy Sites</span></div>
+      <div class="stat" style="background:#e6a100"><span class="num">$($healthCounts.Warning)</span><span class="label">Sites with Warnings</span></div>
+      <div class="stat" style="background:#c62828"><span class="num">$($healthCounts.Critical)</span><span class="label">Sites Critical</span></div>
+      <div class="stat" style="background:#BF360C"><span class="num">$totalHigh</span><span class="label">Total High Risk Issues</span></div>
+      <div class="stat" style="background:#37474F"><span class="num">$totalMedium</span><span class="label">Total Medium Risk Issues</span></div>
+      <div class="stat" style="background:#1565C0"><span class="num">$totalHosts</span><span class="label">Total ESXi Hosts</span></div>
+      <div class="stat" style="background:#00897B"><span class="num">$totalVMs</span><span class="label">Total VMs</span></div>
     </div>
 
-    <table class="overview">
-      <tr><th>Site</th><th>Health</th><th>High</th><th>Med</th><th>Low</th><th>Hosts</th><th>Clusters</th><th>VMs</th><th>CPU</th><th>Mem</th><th>Storage</th></tr>
-$overviewRows
-    </table>
+    <div class="ov-grid">
+$overviewCards
+    </div>
   </section>
 
 $sitePages
@@ -1816,36 +1383,15 @@ function showPage(slug) {
 }
 
 # ============================================================================
-# 4. OUTPUT: ONE PDF PER SITE
+# 4. OUTPUT: COMBINED HTML DASHBOARD (only output artifact besides the log)
 # ============================================================================
 $SiteLabels = $Global:AllResults | Select-Object -ExpandProperty Site -Unique
-$WordAvailable = $true
-try {
-    $Word = New-Object -ComObject Word.Application
-    $Word.Visible = $false
-} catch {
-    $WordAvailable = $false
-    Write-CheckLog -VCenter 'n/a' -Site 'n/a' -Object 'PDF export' -CheckName 'Word COM automation' -ErrorMessage $_.Exception.Message
-    Write-Warning "Microsoft Word is not available on this machine - cannot generate .pdf reports (still built via Word automation, then exported to PDF)."
-}
-
-if ($WordAvailable) {
-    foreach ($SiteLabel in $SiteLabels) {
-        Write-SiteReportPdf -Word $Word -SiteLabel $SiteLabel -OutputPath $OutputPath -RunDate $RunDate
-    }
-    $Word.Quit()
-    [System.Runtime.Interopservices.Marshal]::ReleaseComObject($Word) | Out-Null
-}
-
-# ============================================================================
-# 4b. OUTPUT: COMBINED HTML DASHBOARD (no Word dependency - always attempted)
-# ============================================================================
 Invoke-SafeCheck -CheckName 'Dashboard generation' -VCenter 'n/a' -Site 'n/a' -ObjectName 'Dashboard' -Script {
     Write-DashboardHtml -SiteLabels $SiteLabels -OutputPath $OutputPath -RunDateDisplay $RunDateDisplay -ScriptBuild $ScriptBuild
 }
 
 # ============================================================================
-# 5. OUTPUT: LOG FILE (written last so it also captures any PDF export failures)
+# 5. OUTPUT: LOG FILE (written last so it also captures any dashboard-generation failure)
 # ============================================================================
 $LogPath = Join-Path $OutputPath "VMware_Weekly_HealthCheck_$RunDate.log"
 $LogLines = @()
