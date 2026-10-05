@@ -626,6 +626,7 @@ $storagePanel
               <tr><td>Runs</td><td>$(ConvertTo-HtmlSafe $row.Runs)</td></tr>
               <tr><td>Objects (Success / Error)</td><td>$(ConvertTo-HtmlSafe $row.LastRunObjects)</td></tr>
               <tr><td>Data Read</td><td>$(ConvertTo-HtmlSafe $row.DataRead)</td></tr>
+              <tr><td>Last Run Status</td><td>$(ConvertTo-HtmlSafe $row.LastRunStatus)</td></tr>
               <tr><td>SLA Violation</td><td>$(ConvertTo-HtmlSafe $row.SLAViolation)</td></tr>
               <tr><td>Bandwidth</td><td>$(ConvertTo-HtmlSafe $row.Bandwidth)</td></tr>
             </table>
