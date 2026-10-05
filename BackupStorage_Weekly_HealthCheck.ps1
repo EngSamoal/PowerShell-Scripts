@@ -337,21 +337,44 @@ function ConvertTo-Slug {
     return $slug
 }
 
+$NoBackupSolutionSites = @{
+    'SceneCinema' = 'Backup solution license has expired - this environment currently has no backup solution in place. This is a known risk and has already been communicated to management.'
+}
+
 function Get-SiteDashboardSummary {
     param([string]$SiteLabel)
     $SiteFindings = @($Global:AllResults | Where-Object { $_.Site -eq $SiteLabel -and $_.Area -eq 'Backup' })
     if ($SiteFindings.Count -eq 0) {
+        if ($NoBackupSolutionSites.ContainsKey($SiteLabel)) {
+            # A deliberately different case from "no data yet": there IS no backup solution at
+            # this site at all (expired license) - a real, already-escalated risk, not a pending
+            # data-collection gap - so it counts as Critical rather than the neutral NoData bucket.
+            return [pscustomobject]@{
+                Site             = $SiteLabel
+                HasData          = $true
+                NoBackupSolution = $true
+                OverallHealth    = 'Critical'
+                CriticalCount    = 0
+                WarningCount     = 0
+                HealthyCount     = 0
+                NoRunsCount      = 0
+                TotalGroups      = 0
+                BackupRows       = @()
+                SummaryText      = $NoBackupSolutionSites[$SiteLabel]
+            }
+        }
         return [pscustomobject]@{
-            Site           = $SiteLabel
-            HasData        = $false
-            OverallHealth  = 'NoData'
-            CriticalCount  = 0
-            WarningCount   = 0
-            HealthyCount   = 0
-            NoRunsCount    = 0
-            TotalGroups    = 0
-            BackupRows     = @()
-            SummaryText    = ''
+            Site             = $SiteLabel
+            HasData          = $false
+            NoBackupSolution = $false
+            OverallHealth    = 'NoData'
+            CriticalCount    = 0
+            WarningCount     = 0
+            HealthyCount     = 0
+            NoRunsCount      = 0
+            TotalGroups      = 0
+            BackupRows       = @()
+            SummaryText      = ''
         }
     }
 
@@ -391,16 +414,17 @@ function Get-SiteDashboardSummary {
     }
 
     [pscustomobject]@{
-        Site          = $SiteLabel
-        HasData       = $true
-        OverallHealth = $OverallHealth
-        CriticalCount = $criticalCount
-        WarningCount  = $warningCount
-        HealthyCount  = $healthyCount
-        NoRunsCount   = $noRunsCount
-        TotalGroups   = $rows.Count
-        BackupRows    = $rows
-        SummaryText   = $SummaryText
+        Site             = $SiteLabel
+        HasData          = $true
+        NoBackupSolution = $false
+        OverallHealth    = $OverallHealth
+        CriticalCount    = $criticalCount
+        WarningCount     = $warningCount
+        HealthyCount     = $healthyCount
+        NoRunsCount      = $noRunsCount
+        TotalGroups      = $rows.Count
+        BackupRows       = $rows
+        SummaryText      = $SummaryText
     }
 }
 
@@ -479,6 +503,16 @@ function Write-DashboardHtml {
         $s = $_
         $slug = ConvertTo-Slug $s.Site
         $color = $healthColor[$s.OverallHealth]
+        if ($s.NoBackupSolution) {
+@"
+      <div class="ov-card" onclick="showPage('$slug')" style="border-top-color:$color">
+        <div class="ov-head"><h2>$(ConvertTo-HtmlSafe $s.Site)</h2><span class="badge" style="background:$color">No Backup Solution - Risk Communicated</span></div>
+        <p class="risk-text">$(ConvertTo-HtmlSafe $s.SummaryText)</p>
+        <span class="ov-link">View Page &rarr;</span>
+      </div>
+"@
+            return
+        }
         if (-not $s.HasData) {
 @"
       <div class="ov-card ov-card-nodata" onclick="showPage('$slug')" style="border-top-color:$color">
@@ -546,6 +580,23 @@ function Write-DashboardHtml {
 "@
         }
 
+        if ($s.NoBackupSolution) {
+@"
+      <section class="page" id="page-$slug" data-site="$(ConvertTo-HtmlSafe $s.Site)">
+        <div class="site-hero" style="border-left-color:$color">
+          <h1>$(ConvertTo-HtmlSafe $s.Site)</h1>
+          <span class="badge big" style="background:$color">No Backup Solution - Risk Communicated</span>
+          <div class="meta">Report generated $(ConvertTo-HtmlSafe $RunDateDisplay)</div>
+        </div>
+        <div class="panel panel-full risk-panel" style="border-top-color:$color">
+          <h3><span class="n" style="background:$color">&#9888;&#65039;</span>Backup</h3>
+          <p class="risk-text-big">$(ConvertTo-HtmlSafe $s.SummaryText)</p>
+        </div>
+$storagePanel
+      </section>
+"@
+            return
+        }
         if (-not $s.HasData) {
 @"
       <section class="page" id="page-$slug" data-site="$(ConvertTo-HtmlSafe $s.Site)">
@@ -654,6 +705,9 @@ $storagePanel
   .ov-link { display:inline-block; margin-top:14px; color:#1E3A5F; font-weight:bold; font-size:14px; }
   .ov-card-nodata { opacity:0.85; }
   .nodata-text { color:#999; font-style:italic; margin:4px 0 0; }
+  .risk-text { color:#c62828; font-weight:600; margin:4px 0 0; }
+  .risk-panel { text-align:center; padding:12px 24px 28px; }
+  .risk-text-big { font-size:16px; font-weight:600; color:#c62828; max-width:640px; margin:0 auto; line-height:1.6; }
   .badge { color:#fff; padding:6px 14px; border-radius:6px; font-size:14px; font-weight:bold; white-space:nowrap; display:inline-block; text-align:center; width:280px; }
   .badge.big { font-size:20px; padding:10px 22px; width:420px; }
   .risk-row { display:flex; gap:12px; margin-bottom:16px; flex-wrap:wrap; }
