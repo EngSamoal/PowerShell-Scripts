@@ -7,18 +7,20 @@
 .DESCRIPTION
     This dashboard covers Backup job health and Storage capacity.
 
-    Backup is read from a plain CSV (-BackupCsvPath), NOT an Excel workbook - the real "Backup
-    Summary" workbook from Cohesity turned out to contain only a full-page screenshot picture
-    pasted into each site's tab (confirmed by inspecting the file directly: one real cell - the
-    title - and one embedded image, nothing else), so there is no actual cell data for Excel COM
-    to read. OCR against a dashboard screenshot was deliberately ruled out for an unattended
-    weekly script - a misread digit or unit (1 vs 7, GiB vs TiB) would silently corrupt the
-    report with no way to catch it. A CSV is the reliable alternative: real text, trivial to
-    fill in by hand each week from the same Cohesity screen (or from a real Cohesity export, if
-    one becomes available later - whoever fills it in just needs to produce a CSV in this shape,
-    the source no longer matters to this script). Columns: Site, ProtectionGroup, Source, Runs,
-    LastRunObjects, DataRead, SLAViolation, LastRunStatus, Bandwidth - one row per protection
-    group, Site matching one of this dashboard's 6 canonical site names exactly.
+    Backup is read from a plain Excel workbook (-BackupWorkbookPath) with ONE sheet and a real,
+    typed table - NOT the original "Backup Summary" workbook from Cohesity, which turned out to
+    contain only a full-page screenshot picture pasted into each site's tab (confirmed by
+    inspecting that file directly: one real cell - the title - and one embedded image, nothing
+    else), so there was no actual cell data for Excel COM to read there. OCR against a dashboard
+    screenshot was deliberately ruled out for an unattended weekly script - a misread digit or
+    unit (1 vs 7, GiB vs TiB) would silently corrupt the report with no way to catch it. This
+    workbook is instead filled in by hand each week (from the same Cohesity screen, or from a
+    real Cohesity export if one becomes available later) with real cells - use the generated
+    template as a starting point. Columns: Site, ProtectionGroup, Source, Runs, LastRunObjects,
+    DataRead, SLAViolation, LastRunStatus, Bandwidth - one row per protection group, Site matching
+    one of this dashboard's 6 canonical site names exactly, read by locating that header row
+    (same resilient search as every other sheet in this script family) then every row until the
+    first blank Site cell.
 
     Storage is still read from an Excel workbook (-StorageWorkbookPath) - that one DOES contain
     real cells (confirmed from a screenshot of it showing a normal selectable Excel grid with a
@@ -50,10 +52,11 @@
 
     NEVER writes/modifies the source Storage workbook - opened read-only, closed without saving.
 
-.PARAMETER BackupCsvPath
-    Path to a CSV with columns Site, ProtectionGroup, Source, Runs, LastRunObjects, DataRead,
-    SLAViolation, LastRunStatus, Bandwidth - one row per protection group. Omit to leave every
-    site's Backup section showing "There is no data provided yet".
+.PARAMETER BackupWorkbookPath
+    Path to an Excel workbook (ONE sheet, a real typed table - not a pasted screenshot) with
+    columns Site, ProtectionGroup, Source, Runs, LastRunObjects, DataRead, SLAViolation,
+    LastRunStatus, Bandwidth - one row per protection group. Omit to leave every site's Backup
+    section showing "There is no data provided yet".
 .PARAMETER StorageWorkbookPath
     Path to the single "HPE Storage Alletra Capacity Overview - All Sites.xlsx" workbook (one
     "Storage Capacity by Site" table covering every site). Omit to leave every site's Storage
@@ -64,7 +67,7 @@
 
 [CmdletBinding()]
 param(
-    [string]$BackupCsvPath = '',
+    [string]$BackupWorkbookPath = '',
     [string]$StorageWorkbookPath = '',
 
     [string]$OutputPath = (Join-Path $PSScriptRoot "BackupStorage_HealthCheck_Reports")
@@ -154,41 +157,75 @@ function Find-HeaderRow {
 }
 
 # ============================================================================
-# 2. BACKUP CSV COLLECTION
-#    Plain CSV, not Excel - see the script's own .DESCRIPTION for why (the real Cohesity
-#    workbook turned out to contain only pasted screenshot pictures, no readable cell data).
+# 2. BACKUP WORKBOOK COLLECTION
+#    A plain, hand-maintained Excel table - NOT the original Cohesity workbook, which turned out
+#    to contain only pasted screenshot pictures, no readable cell data. See the script's own
+#    .DESCRIPTION for the full story.
 # ============================================================================
-function Read-BackupCsv {
-    param([string]$Path)
+function Read-BackupWorkbook {
+    param($Excel, [string]$Path)
     if (-not $Path -or -not (Test-Path $Path)) {
-        if ($Path) { Write-CheckLog -Site 'n/a' -Object $Path -CheckName 'Backup CSV' -ErrorMessage 'File not found.' }
+        if ($Path) { Write-CheckLog -Site 'n/a' -Object $Path -CheckName 'Backup workbook' -ErrorMessage 'File not found.' }
         return
     }
-    $rows = Invoke-SafeCheck -Site 'n/a' -ObjectName $Path -CheckName 'Backup CSV' -Script { Import-Csv -Path $Path }
-    if (-not $rows) { return }
-    foreach ($row in $rows) {
-        $site = "$($row.Site)".Trim()
-        $pgName = "$($row.ProtectionGroup)".Trim()
-        if (-not $site -or -not $pgName) { continue }
-        $source = "$($row.Source)".Trim()
-        $runsN = 0
-        [int]::TryParse("$($row.Runs)", [ref]$runsN) | Out-Null
-        $lastRunObjText = "$($row.LastRunObjects)".Trim()
-        $dataRead = "$($row.DataRead)".Trim()
-        $sla = "$($row.SLAViolation)".Trim()
-        $lastStatus = "$($row.LastRunStatus)".Trim()
-        $bandwidth = "$($row.Bandwidth)".Trim()
+    $wb = $Excel.Workbooks.Open($Path, 0, $true)
+    try {
+        $hdr = $null; $ws = $null
+        foreach ($candidate in $wb.Worksheets) {
+            $hdr = Find-HeaderRow -Worksheet $candidate -Labels @('Site', 'ProtectionGroup', 'Source', 'Runs')
+            if ($hdr) { $ws = $candidate; break }
+        }
+        if (-not $ws) {
+            Write-CheckLog -Site 'n/a' -Object $Path -CheckName 'Backup table' -ErrorMessage 'Could not locate the Site/ProtectionGroup/Source/Runs header on any tab.'
+            return
+        }
+        Invoke-SafeCheck -Site 'n/a' -ObjectName $ws.Name -CheckName 'Backup table' -Script {
+            $cols = $hdr.Columns
+            $siteCol = $cols['Site']; $pgCol = $cols['ProtectionGroup']; $sourceCol = $cols['Source']; $runsCol = $cols['Runs']
+            $colByName = @{}
+            foreach ($name in @('LastRunObjects', 'DataRead', 'SLAViolation', 'LastRunStatus', 'Bandwidth')) {
+                for ($c = 1; $c -le 20; $c++) {
+                    $v = $ws.Cells.Item($hdr.Row, $c).Value2
+                    if ($null -ne $v -and "$v".Trim() -ieq $name) { $colByName[$name] = $c; break }
+                }
+            }
 
-        # 0 runs this period (shown as "-" across every other column) is its own neutral status -
-        # not counted as Healthy, Warning or Critical, same as a template site with no data at all.
-        $status = if ($runsN -eq 0 -or -not $lastStatus -or $lastStatus -eq '-') { 'Information' }
-            elseif ($lastStatus -ieq 'Error') { 'Critical' }
-            elseif ($lastStatus -ieq 'Warning' -or $sla -ieq 'Fail') { 'Warning' }
-            elseif ($lastStatus -ieq 'Success' -and $sla -ieq 'Pass') { 'Healthy' }
-            else { 'Information' }
+            $used = $ws.UsedRange
+            $lastRow = $used.Row + $used.Rows.Count - 1
+            for ($r = $hdr.Row + 1; $r -le $lastRow; $r++) {
+                $siteVal = $ws.Cells.Item($r, $siteCol).Value2
+                if (-not $siteVal -or "$siteVal".Trim() -eq '') { continue }
+                $site = "$siteVal".Trim()
+                $pgVal = $ws.Cells.Item($r, $pgCol).Value2
+                if (-not $pgVal -or "$pgVal".Trim() -eq '') { continue }
+                $pgName = "$pgVal".Trim()
 
-        $value = "$runsN|$lastRunObjText|$dataRead|$sla|$lastStatus|$bandwidth"
-        New-Finding -Site $site -Area 'Backup' -Group $pgName -Object $source -Item 'Backup Job' -Value $value -Status $status
+                $source = "$($ws.Cells.Item($r, $sourceCol).Value2)".Trim()
+                $runsVal = $ws.Cells.Item($r, $runsCol).Value2
+                $runsN = 0
+                [int]::TryParse("$runsVal", [ref]$runsN) | Out-Null
+                $lastRunObjText = if ($colByName.LastRunObjects) { "$($ws.Cells.Item($r, $colByName.LastRunObjects).Value2)".Trim() } else { '' }
+                $dataRead       = if ($colByName.DataRead) { "$($ws.Cells.Item($r, $colByName.DataRead).Value2)".Trim() } else { '' }
+                $sla            = if ($colByName.SLAViolation) { "$($ws.Cells.Item($r, $colByName.SLAViolation).Value2)".Trim() } else { '' }
+                $lastStatus     = if ($colByName.LastRunStatus) { "$($ws.Cells.Item($r, $colByName.LastRunStatus).Value2)".Trim() } else { '' }
+                $bandwidth      = if ($colByName.Bandwidth) { "$($ws.Cells.Item($r, $colByName.Bandwidth).Value2)".Trim() } else { '' }
+
+                # 0 runs this period (shown as "-" across every other column) is its own neutral
+                # status - not counted as Healthy, Warning or Critical, same as a template site
+                # with no data at all.
+                $status = if ($runsN -eq 0 -or -not $lastStatus -or $lastStatus -eq '-') { 'Information' }
+                    elseif ($lastStatus -ieq 'Error') { 'Critical' }
+                    elseif ($lastStatus -ieq 'Warning' -or $sla -ieq 'Fail') { 'Warning' }
+                    elseif ($lastStatus -ieq 'Success' -and $sla -ieq 'Pass') { 'Healthy' }
+                    else { 'Information' }
+
+                $value = "$runsN|$lastRunObjText|$dataRead|$sla|$lastStatus|$bandwidth"
+                New-Finding -Site $site -Area 'Backup' -Group $pgName -Object $source -Item 'Backup Job' -Value $value -Status $status
+            }
+        }
+    } finally {
+        $wb.Close($false)
+        [System.Runtime.Interopservices.Marshal]::ReleaseComObject($wb) | Out-Null
     }
 }
 
@@ -289,36 +326,41 @@ function Read-StorageWorkbook {
 # ============================================================================
 # 3. RUN COLLECTION
 # ============================================================================
-# This dashboard's 6 sites, in display order - not derived from any workbook/CSV content, since
-# Backup (CSV) and Storage (Excel) each only have rows for whichever sites currently have data.
+# This dashboard's 6 sites, in display order - not derived from any workbook content, since
+# Backup and Storage each only have rows for whichever sites currently have data.
 $SiteDisplayOrder = @('AquaArabia', 'SixFlags', 'SceneCinema', 'SEVEN Tabuk', 'SEVEN ABHA', 'SEVEN Alhamra')
 
-Write-Host "`n=== Collecting Backup ===" -ForegroundColor Green
-if ($BackupCsvPath) {
-    Read-BackupCsv -Path $BackupCsvPath
-} else {
-    Write-Host "No -BackupCsvPath supplied - every site's Backup section shows 'There is no data provided yet'." -ForegroundColor Yellow
-}
-
-if ($StorageWorkbookPath -and (Test-Path $StorageWorkbookPath)) {
+if (($BackupWorkbookPath -and (Test-Path $BackupWorkbookPath)) -or ($StorageWorkbookPath -and (Test-Path $StorageWorkbookPath))) {
     $Excel = $null
     try {
         $Excel = New-Object -ComObject Excel.Application
         $Excel.Visible = $false
         $Excel.DisplayAlerts = $false
     } catch {
-        throw "Microsoft Excel is not available via COM automation on this machine - cannot read the Storage workbook. $($_.Exception.Message)"
+        throw "Microsoft Excel is not available via COM automation on this machine - cannot read the source workbooks. $($_.Exception.Message)"
     }
     try {
-        Write-Host "`n=== Collecting Storage ===" -ForegroundColor Green
-        Read-StorageWorkbook -Excel $Excel -Path $StorageWorkbookPath
+        if ($BackupWorkbookPath -and (Test-Path $BackupWorkbookPath)) {
+            Write-Host "`n=== Collecting Backup ===" -ForegroundColor Green
+            Read-BackupWorkbook -Excel $Excel -Path $BackupWorkbookPath
+        } else {
+            if ($BackupWorkbookPath) { Write-CheckLog -Site 'n/a' -Object $BackupWorkbookPath -CheckName 'Backup workbook' -ErrorMessage 'File not found.' }
+            Write-Host "No -BackupWorkbookPath supplied - every site's Backup section shows 'There is no data provided yet'." -ForegroundColor Yellow
+        }
+
+        if ($StorageWorkbookPath -and (Test-Path $StorageWorkbookPath)) {
+            Write-Host "`n=== Collecting Storage ===" -ForegroundColor Green
+            Read-StorageWorkbook -Excel $Excel -Path $StorageWorkbookPath
+        } else {
+            if ($StorageWorkbookPath) { Write-CheckLog -Site 'n/a' -Object $StorageWorkbookPath -CheckName 'Storage workbook' -ErrorMessage 'File not found.' }
+            Write-Host "No -StorageWorkbookPath supplied - every site's Storage section shows 'There is no data provided yet'." -ForegroundColor Yellow
+        }
     } finally {
         $Excel.Quit()
         [System.Runtime.Interopservices.Marshal]::ReleaseComObject($Excel) | Out-Null
     }
 } else {
-    if ($StorageWorkbookPath) { Write-CheckLog -Site 'n/a' -Object $StorageWorkbookPath -CheckName 'Storage workbook' -ErrorMessage 'File not found.' }
-    Write-Host "No -StorageWorkbookPath supplied - every site's Storage section shows 'There is no data provided yet'." -ForegroundColor Yellow
+    Write-Host "No -BackupWorkbookPath or -StorageWorkbookPath supplied - every site shows 'There is no data provided yet'." -ForegroundColor Yellow
 }
 
 # ============================================================================
