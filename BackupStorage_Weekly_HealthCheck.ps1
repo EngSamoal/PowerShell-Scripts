@@ -5,19 +5,28 @@
     single combined HTML dashboard, in the same visual style as Network_Weekly_HealthCheck.ps1.
 
 .DESCRIPTION
-    This dashboard covers Backup job health today. Storage is a separate data source that has
-    not been supplied yet - every site's Storage panel shows "There is no data provided yet"
-    until that workbook format is provided and wired in; this script only needs re-running once
-    that happens, nothing here needs to change in the meantime.
+    This dashboard covers Backup job health and Storage capacity.
 
-    Reads ONE workbook (-BackupWorkbookPath), with one tab per site - the real file seen so far
-    uses the short tab names AQ / SF / TABUK / ABHA (SceneCinema and SEVEN Alhamra don't have
-    data yet, so their tab names are a best guess below - update $SiteTabCandidates once their
-    real tab name is known, nothing else needs to change). Each site tab has a "Protection Group"
-    table (Protection Group / Source / Runs / Last Run Success-Error / Data Read / SLA Violation
-    / Last Run Status / Last Run Replication-Archival Status (icon, not read) / Bandwidth), read
-    by locating the "Protection Group" / "Source" / "Runs" header row and then every column after
-    "Runs" by fixed offset, since the real header wraps across two lines in Excel.
+    Reads TWO workbooks:
+      -BackupWorkbookPath: ONE workbook, with one tab per site - the real file seen so far uses
+        the short tab names AQ / SF / TABUK / ABHA (SceneCinema and SEVEN Alhamra don't have data
+        yet, so their tab names are a best guess below - update $SiteTabCandidates once their
+        real tab name is known, nothing else needs to change). Each site tab has a "Protection
+        Group" table (Protection Group / Source / Runs / Last Run Success-Error / Data Read / SLA
+        Violation / Last Run Status / Last Run Replication-Archival Status (icon, not read) /
+        Bandwidth), read by locating the "Protection Group" / "Source" / "Runs" header row and
+        then every column after "Runs" by fixed offset, since the real header wraps across two
+        lines in Excel.
+      -StorageWorkbookPath: ONE workbook, ONE "Storage Capacity by Site" table covering every
+        site in a single sheet (Site / Total Capacity / Used Capacity / Free Capacity / Model),
+        read by locating that header row on whichever worksheet has it, then every row until the
+        "Grand Total" row. The real file seen so far only has rows for SEVEN ABHA ("Abha"),
+        SixFlags ("Six Flags"), SEVEN Tabuk ("Tabuk") and SEVEN Alhamra ("Alhamra") - AquaArabia
+        and SceneCinema aren't in it yet, so their Storage panel shows "There is no data provided
+        yet" until a row for them appears; update $StorageSiteNameMap if a site's real label in
+        that sheet differs from what's guessed below. A site's Storage status is Critical at
+        >=90% used, Warning at >=75%, else Healthy - these thresholds are a starting assumption,
+        easy to change in Read-StorageWorkbook if a different bar is wanted.
 
     A protection group with 0 runs this period (shown as "-" across every other column in the
     source sheet) is its own neutral status - it doesn't count as Healthy, Warning or Critical,
@@ -42,6 +51,10 @@
 .PARAMETER BackupWorkbookPath
     Path to the single "Backup Summary - <Month> <Year>.xlsx" workbook (one tab per site). Omit
     to leave every site's Backup section showing "There is no data provided yet".
+.PARAMETER StorageWorkbookPath
+    Path to the single "HPE Storage Alletra Capacity Overview - All Sites.xlsx" workbook (one
+    "Storage Capacity by Site" table covering every site). Omit to leave every site's Storage
+    section showing "There is no data provided yet".
 .PARAMETER OutputPath
     Folder the dashboard + log are written to.
 #>
@@ -49,6 +62,7 @@
 [CmdletBinding()]
 param(
     [string]$BackupWorkbookPath = '',
+    [string]$StorageWorkbookPath = '',
 
     [string]$OutputPath = (Join-Path $PSScriptRoot "BackupStorage_HealthCheck_Reports")
 )
@@ -100,7 +114,7 @@ function New-Finding {
         [string]$Site, [string]$Area, [string]$Group, [string]$Object,
         [string]$Item, [string]$Value, [string]$Status, [string]$Notes = ''
     )
-    # Area is always 'Backup' today - 'Storage' is reserved for once that data source is wired in.
+    # Area is 'Backup' (one row per protection group) or 'Storage' (one row per site).
     $obj = [pscustomobject]@{
         Site = $Site; Area = $Area; Group = $Group; Object = $Object
         Item = $Item; Value = $Value; Status = $Status; Notes = $Notes
@@ -186,6 +200,100 @@ function Read-BackupSiteTab {
 }
 
 # ============================================================================
+# 2b. STORAGE CAPACITY WORKBOOK COLLECTION
+#     One sheet, one row per site (not one tab per site like the Backup workbook) - the sheet
+#     isn't assumed to be named any particular thing, every worksheet in the workbook is tried
+#     until the Site/Total Capacity/Used Capacity/Free Capacity header row is found.
+# ============================================================================
+# Maps a raw "Site" cell value from the Storage sheet (case/space-insensitive) to this
+# dashboard's canonical site name. The real sheet seen so far only has Abha/Six Flags/Tabuk/
+# Alhamra rows - AquaArabia and SceneCinema aren't in it yet, so their Storage panel stays "There
+# is no data provided yet" until a row for them appears. Add an entry here if a site's real label
+# in that sheet turns out different from what's guessed.
+$StorageSiteNameMap = @{
+    'aquaarabia'  = 'AquaArabia'
+    'aqua arabia' = 'AquaArabia'
+    'sixflags'    = 'SixFlags'
+    'six flags'   = 'SixFlags'
+    'scenecinema' = 'SceneCinema'
+    'scene cinema'= 'SceneCinema'
+    'tabuk'       = 'SEVEN Tabuk'
+    'abha'        = 'SEVEN ABHA'
+    'alhamra'     = 'SEVEN Alhamra'
+}
+
+function ConvertFrom-CapacityNumber {
+    param([string]$Text)
+    if ($Text -match '([\d.]+)') { return [double]$Matches[1] }
+    return $null
+}
+
+function Read-StorageWorkbook {
+    param($Excel, [string]$Path)
+    if (-not $Path -or -not (Test-Path $Path)) {
+        if ($Path) { Write-CheckLog -Site 'n/a' -Object $Path -CheckName 'Storage workbook' -ErrorMessage 'File not found.' }
+        return
+    }
+    $wb = $Excel.Workbooks.Open($Path, 0, $true)
+    try {
+        $hdr = $null; $ws = $null
+        foreach ($candidate in $wb.Worksheets) {
+            $hdr = Find-HeaderRow -Worksheet $candidate -Labels @('Site', 'Total Capacity', 'Used Capacity', 'Free Capacity')
+            if ($hdr) { $ws = $candidate; break }
+        }
+        if (-not $ws) {
+            Write-CheckLog -Site 'n/a' -Object $Path -CheckName 'Storage Capacity by Site table' -ErrorMessage 'Could not locate the Site/Total Capacity/Used Capacity/Free Capacity header on any tab.'
+            return
+        }
+        Invoke-SafeCheck -Site 'n/a' -ObjectName $ws.Name -CheckName 'Storage Capacity by Site table' -Script {
+            $cols = $hdr.Columns
+            $siteCol = $cols['Site']; $totalCol = $cols['Total Capacity']; $usedCol = $cols['Used Capacity']; $freeCol = $cols['Free Capacity']
+            $modelCol = $null
+            for ($c = 1; $c -le 20; $c++) {
+                $v = $ws.Cells.Item($hdr.Row, $c).Value2
+                if ($null -ne $v -and "$v".Trim() -ieq 'Model') { $modelCol = $c; break }
+            }
+
+            $used = $ws.UsedRange
+            $lastRow = $used.Row + $used.Rows.Count - 1
+            for ($r = $hdr.Row + 1; $r -le $lastRow; $r++) {
+                $siteVal = $ws.Cells.Item($r, $siteCol).Value2
+                if (-not $siteVal -or "$siteVal".Trim() -eq '') { continue }
+                $rawSite = "$siteVal".Trim()
+                if ($rawSite -ieq 'Grand Total') { continue }
+
+                $key = ($rawSite -replace '\s+', ' ').Trim().ToLower()
+                if (-not $StorageSiteNameMap.ContainsKey($key)) {
+                    Write-CheckLog -Site $rawSite -Object $Path -CheckName 'Storage site mapping' -ErrorMessage "Site label '$rawSite' on the Storage sheet doesn't match any known site - add it to `$StorageSiteNameMap."
+                    continue
+                }
+                $site = $StorageSiteNameMap[$key]
+
+                $totalText = "$($ws.Cells.Item($r, $totalCol).Value2)".Trim()
+                $usedText  = "$($ws.Cells.Item($r, $usedCol).Value2)".Trim()
+                $freeText  = "$($ws.Cells.Item($r, $freeCol).Value2)".Trim()
+                $model     = if ($modelCol) { "$($ws.Cells.Item($r, $modelCol).Value2)".Trim() } else { '' }
+
+                $totalN = ConvertFrom-CapacityNumber $totalText
+                $usedN  = ConvertFrom-CapacityNumber $usedText
+                $usedPct = if ($totalN -and $totalN -gt 0 -and $usedN -ne $null) { [Math]::Round(($usedN / $totalN) * 100, 1) } else { $null }
+
+                $status = if ($usedPct -eq $null) { 'Information' }
+                    elseif ($usedPct -ge 90) { 'Critical' }
+                    elseif ($usedPct -ge 75) { 'Warning' }
+                    else { 'Healthy' }
+
+                $value = "$totalText|$usedText|$freeText|$usedPct"
+                New-Finding -Site $site -Area 'Storage' -Group $site -Object $model -Item 'Storage Capacity' -Value $value -Status $status
+            }
+        }
+    } finally {
+        $wb.Close($false)
+        [System.Runtime.Interopservices.Marshal]::ReleaseComObject($wb) | Out-Null
+    }
+}
+
+# ============================================================================
 # 3. RUN COLLECTION
 # ============================================================================
 # Each site's candidate tab name(s) inside the single Backup Summary workbook, tried in order,
@@ -201,41 +309,55 @@ $SiteTabCandidates = [ordered]@{
     'SEVEN Alhamra' = @('ALHAMRA', 'ALH', 'Alhamra')
 }
 
-if ($BackupWorkbookPath -and (Test-Path $BackupWorkbookPath)) {
+if (($BackupWorkbookPath -and (Test-Path $BackupWorkbookPath)) -or ($StorageWorkbookPath -and (Test-Path $StorageWorkbookPath))) {
     $Excel = $null
     try {
         $Excel = New-Object -ComObject Excel.Application
         $Excel.Visible = $false
         $Excel.DisplayAlerts = $false
     } catch {
-        throw "Microsoft Excel is not available via COM automation on this machine - cannot read the source workbook. $($_.Exception.Message)"
+        throw "Microsoft Excel is not available via COM automation on this machine - cannot read the source workbooks. $($_.Exception.Message)"
     }
-    $wb = $Excel.Workbooks.Open($BackupWorkbookPath, 0, $true)
     try {
-        foreach ($site in $SiteTabCandidates.Keys) {
-            Write-Host "`n=== Collecting: $site ===" -ForegroundColor Green
-            $ws = $null
-            foreach ($candidate in $SiteTabCandidates[$site]) {
-                $ws = $wb.Worksheets | Where-Object { $_.Name.Trim() -ieq $candidate } | Select-Object -First 1
-                if ($ws) { break }
+        if ($BackupWorkbookPath -and (Test-Path $BackupWorkbookPath)) {
+            $wb = $Excel.Workbooks.Open($BackupWorkbookPath, 0, $true)
+            try {
+                foreach ($site in $SiteTabCandidates.Keys) {
+                    Write-Host "`n=== Collecting Backup: $site ===" -ForegroundColor Green
+                    $ws = $null
+                    foreach ($candidate in $SiteTabCandidates[$site]) {
+                        $ws = $wb.Worksheets | Where-Object { $_.Name.Trim() -ieq $candidate } | Select-Object -First 1
+                        if ($ws) { break }
+                    }
+                    if (-not $ws) {
+                        Write-CheckLog -Site $site -Object $BackupWorkbookPath -CheckName 'Backup tab' -ErrorMessage "No tab matching $($SiteTabCandidates[$site] -join '/') found - this site shows 'There is no data provided yet'."
+                        continue
+                    }
+                    Invoke-SafeCheck -Site $site -ObjectName $ws.Name -CheckName 'Backup Summary tab' -Script {
+                        Read-BackupSiteTab -Worksheet $ws -Site $site
+                    }
+                }
+            } finally {
+                $wb.Close($false)
+                [System.Runtime.Interopservices.Marshal]::ReleaseComObject($wb) | Out-Null
             }
-            if (-not $ws) {
-                Write-CheckLog -Site $site -Object $BackupWorkbookPath -CheckName 'Backup tab' -ErrorMessage "No tab matching $($SiteTabCandidates[$site] -join '/') found - this site shows 'There is no data provided yet'."
-                continue
-            }
-            Invoke-SafeCheck -Site $site -ObjectName $ws.Name -CheckName 'Backup Summary tab' -Script {
-                Read-BackupSiteTab -Worksheet $ws -Site $site
-            }
+        } else {
+            if ($BackupWorkbookPath) { Write-CheckLog -Site 'n/a' -Object $BackupWorkbookPath -CheckName 'Backup workbook' -ErrorMessage 'File not found.' }
+            Write-Host "No -BackupWorkbookPath supplied - every site's Backup section shows 'There is no data provided yet'." -ForegroundColor Yellow
+        }
+
+        if ($StorageWorkbookPath) {
+            Write-Host "`n=== Collecting Storage ===" -ForegroundColor Green
+            Read-StorageWorkbook -Excel $Excel -Path $StorageWorkbookPath
+        } else {
+            Write-Host "No -StorageWorkbookPath supplied - every site's Storage section shows 'There is no data provided yet'." -ForegroundColor Yellow
         }
     } finally {
-        $wb.Close($false)
-        [System.Runtime.Interopservices.Marshal]::ReleaseComObject($wb) | Out-Null
         $Excel.Quit()
         [System.Runtime.Interopservices.Marshal]::ReleaseComObject($Excel) | Out-Null
     }
 } else {
-    if ($BackupWorkbookPath) { Write-CheckLog -Site 'n/a' -Object $BackupWorkbookPath -CheckName 'Backup workbook' -ErrorMessage 'File not found.' }
-    Write-Host "No -BackupWorkbookPath supplied - every site will show 'There is no data provided yet'." -ForegroundColor Yellow
+    Write-Host "No -BackupWorkbookPath or -StorageWorkbookPath supplied - every site shows 'There is no data provided yet'." -ForegroundColor Yellow
 }
 
 # ============================================================================
@@ -321,6 +443,26 @@ function Get-SiteDashboardSummary {
     }
 }
 
+function Get-SiteStorageSummary {
+    param([string]$SiteLabel)
+    $f = $Global:AllResults | Where-Object { $_.Site -eq $SiteLabel -and $_.Area -eq 'Storage' } | Select-Object -First 1
+    if (-not $f) {
+        return [pscustomobject]@{ HasData = $false; Status = 'NoData'; TotalCapacity = ''; UsedCapacity = ''; FreeCapacity = ''; UsedPct = $null; Model = '' }
+    }
+    $p = $f.Value -split '\|'
+    $usedPctVal = $null
+    if ($p[3]) { try { $usedPctVal = [double]$p[3] } catch { } }
+    [pscustomobject]@{
+        HasData       = $true
+        Status        = $f.Status
+        TotalCapacity = $p[0]
+        UsedCapacity  = $p[1]
+        FreeCapacity  = $p[2]
+        UsedPct       = $usedPctVal
+        Model         = $f.Object
+    }
+}
+
 function Write-DashboardHtml {
     param([string[]]$SiteLabels, [string]$OutputPath, [string]$RunDateDisplay)
 
@@ -364,6 +506,12 @@ function Write-DashboardHtml {
         $variant = switch ($Status) { 'Healthy' { 'ok' }; 'Warning' { 'warn' }; 'Critical' { 'bad' }; default { 'info' } }
         "<span class=`"status-pill $variant`"><span class=`"dot`"></span>$(ConvertTo-HtmlSafe $Text)</span>"
     }
+    function Get-PctBarColor {
+        param([double]$Pct)
+        if ($Pct -ge 90) { return '#c62828' }
+        if ($Pct -ge 75) { return '#e6a100' }
+        return '#2e7d32'
+    }
 
     # --- Overview page ---
     $overviewCards = ($summaries | ForEach-Object {
@@ -406,7 +554,9 @@ function Write-DashboardHtml {
         $slug = ConvertTo-Slug $s.Site
         $color = $healthColor[$s.OverallHealth]
 
-        $storagePanel = @"
+        $storage = Get-SiteStorageSummary -SiteLabel $s.Site
+        $storagePanel = if (-not $storage.HasData) {
+@"
         <div class="panel panel-full" style="border-top-color:#8a8f98">
           <h3><span class="n" style="background:#8a8f98">&#128451;&#65039;</span>Storage</h3>
           <div class="nodata-panel">
@@ -414,6 +564,26 @@ function Write-DashboardHtml {
           </div>
         </div>
 "@
+        } else {
+            $storageColor = $healthColor[$storage.Status]
+            $pctText = if ($storage.UsedPct -ne $null) { "{0:N1}%" -f $storage.UsedPct } else { 'n/a' }
+            $barPct = if ($storage.UsedPct -ne $null) { $storage.UsedPct } else { 0 }
+@"
+        <div class="panel panel-full" style="border-top-color:$storageColor">
+          <h3><span class="n" style="background:$storageColor">&#128451;&#65039;</span>Storage <span style="font-weight:normal;font-size:14px;color:#999">($(ConvertTo-HtmlSafe $storage.Model))</span>$(Get-StatusPillHtml -Status $storage.Status -Text $storage.Status)</h3>
+          <div class="storage-card">
+            <div class="meter-track"><div class="meter-fill" style="width:$barPct%;background:$(Get-PctBarColor $barPct)"></div></div>
+            <div class="storage-pct">$pctText used</div>
+            <table class="metrics">
+              <tr><td>Total Capacity</td><td>$(ConvertTo-HtmlSafe $storage.TotalCapacity)</td></tr>
+              <tr><td>Used Capacity</td><td>$(ConvertTo-HtmlSafe $storage.UsedCapacity)</td></tr>
+              <tr><td>Free Capacity</td><td>$(ConvertTo-HtmlSafe $storage.FreeCapacity)</td></tr>
+              <tr><td>Model</td><td>$(ConvertTo-HtmlSafe $storage.Model)</td></tr>
+            </table>
+          </div>
+        </div>
+"@
+        }
 
         if (-not $s.HasData) {
 @"
@@ -564,7 +734,13 @@ $storagePanel
   .backup-card .backup-source { font-size:12px; color:#888; margin-bottom:10px; word-break:break-all; }
   .backup-card table.metrics td { font-size:13px; padding:7px 4px; }
 
-  /* No-data placeholder (template site, or the Storage panel on every site until it's wired in) */
+  /* Storage - capacity meter bar + table, one per site */
+  .storage-card { max-width:420px; }
+  .storage-card .meter-track { height:12px; border-radius:6px; overflow:hidden; background:#eef2f5; margin-bottom:8px; }
+  .storage-card .meter-fill { height:100%; border-radius:6px; }
+  .storage-card .storage-pct { font-size:13px; color:#666; font-weight:600; margin-bottom:12px; }
+
+  /* No-data placeholder (template site, or a site's Storage panel until that data is supplied) */
   .nodata-panel { text-align:center; padding:48px 24px; }
   .nodata-text-big { font-size:22px; font-weight:bold; color:#8a8f98; margin:0 0 10px; }
   .nodata-text-small { font-size:14px; color:#999; max-width:520px; margin:0 auto; line-height:1.6; }
