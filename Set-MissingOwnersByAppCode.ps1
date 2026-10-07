@@ -73,7 +73,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptBuild = 'Set-MissingOwnersByAppCode build 2026-10-07.2'
+$ScriptBuild = 'Set-MissingOwnersByAppCode build 2026-10-07.3'
 Write-Host $ScriptBuild -ForegroundColor Cyan
 
 # ------------------------------------------------------------------------------------------------
@@ -127,17 +127,42 @@ function Find-HeaderLayout($Worksheet, [int]$MaxRows, [string[]]$Headers) {
     return $null
 }
 
+function Get-ColorSignature($c) {
+    if ($null -eq $c) { return '-' }
+    return '{0}/{1}/{2}/{3}/{4}' -f $c.Rgb, $c.Theme, $c.Tint, $c.Indexed, $c.Auto
+}
+
+function Get-XfSignature($Xf) {
+    # The ACTUAL format of a cell style (font, fill colour, borders, number format, alignment).
+    # Compared instead of the StyleID number, because saving renumbers the style list (all IDs shift)
+    # while the formats themselves stay the same.
+    $f = $Xf.Font; $fl = $Xf.Fill; $b = $Xf.Border
+    $parts = @(
+        "font=$($f.Name)|$($f.Size)|$($f.Bold)|$($f.Italic)|$($f.UnderLineType)|$($f.Strike)|$($f.VerticalAlign)|$(Get-ColorSignature $f.Color)"
+        "fill=$($fl.PatternType)|$(Get-ColorSignature $fl.BackgroundColor)|$(Get-ColorSignature $fl.PatternColor)"
+        "border=$(foreach ($side in 'Left', 'Right', 'Top', 'Bottom', 'Diagonal') { '{0}:{1}:{2};' -f $side, $b.$side.Style, (Get-ColorSignature $b.$side.Color) })$($b.DiagonalUp)|$($b.DiagonalDown)"
+        "numfmt=$($Xf.Numberformat.Format)"
+        "align=$($Xf.HorizontalAlignment)|$($Xf.VerticalAlignment)|$($Xf.WrapText)|$($Xf.Indent)|$($Xf.TextRotation)|$($Xf.ShrinkToFit)"
+        "protect=$($Xf.Locked)|$($Xf.Hidden)"
+    )
+    return ($parts -join ' ')
+}
+
 function Get-WorkbookSnapshot([string]$Path) {
-    # Every existing cell of every sheet -> "value<TAB>styleId". StyleID covers fill colour, font, borders,
-    # alignment and number format, so equal snapshots = same data AND same formatting.
+    # Every existing cell of every sheet -> "value<TAB>formula<TAB>format", so equal snapshots = same data
+    # AND same formatting (colours, fonts, borders, number formats, alignment).
     $snap = @{}
     $p = Open-ExcelPackage -Path $Path
     try {
+        $xfCache = @{}      # StyleID -> format signature (computed once per style)
+        $snap['#defaultFormat'] = Get-XfSignature $p.Workbook.Styles.CellXfs[0]
         foreach ($sheet in $p.Workbook.Worksheets) {
             $snap["#sheet|$($sheet.Name)"] = "$($sheet.Index)"
             if ($null -eq $sheet.Dimension) { continue }
             foreach ($cell in $sheet.Cells[$sheet.Dimension.Address]) {
-                $snap["$($sheet.Name)|$($cell.Start.Row)|$($cell.Start.Column)"] = "{0}`t{1}`t{2}" -f [string]$cell.Value, $cell.Formula, $cell.StyleID
+                $sid = $cell.StyleID
+                if (-not $xfCache.ContainsKey($sid)) { $xfCache[$sid] = Get-XfSignature $p.Workbook.Styles.CellXfs[$sid] }
+                $snap["$($sheet.Name)|$($cell.Start.Row)|$($cell.Start.Column)"] = "{0}`t{1}`t{2}" -f [string]$cell.Value, $cell.Formula, $xfCache[$sid]
             }
         }
     }
@@ -403,20 +428,24 @@ try {
         $expected = @{}
         foreach ($ch in $changes) { $expected["$($ws.Name)|$($ch.'Excel Row')|$($ch.Column)"] = $ch.'New Value' }
         $afterSnapshot = Get-WorkbookSnapshot $tempCopy
+        $defaultFormat = $beforeSnapshot['#defaultFormat']
         $problems = New-Object System.Collections.Generic.List[string]
         $allKeys = New-Object System.Collections.Generic.HashSet[string]
         foreach ($k in $beforeSnapshot.Keys) { [void]$allKeys.Add($k) }
         foreach ($k in $afterSnapshot.Keys)  { [void]$allKeys.Add($k) }
         foreach ($k in $allKeys) {
-            $b = if ($beforeSnapshot.ContainsKey($k)) { $beforeSnapshot[$k] } else { "`t`t0" }
-            $a = if ($afterSnapshot.ContainsKey($k))  { $afterSnapshot[$k] }  else { "`t`t0" }
+            $b = if ($beforeSnapshot.ContainsKey($k)) { $beforeSnapshot[$k] } else { "`t`t$defaultFormat" }
+            $a = if ($afterSnapshot.ContainsKey($k))  { $afterSnapshot[$k] }  else { "`t`t$defaultFormat" }
             if ($expected.ContainsKey($k)) {
                 $bStyle = ($b -split "`t")[2]; $aParts = $a -split "`t"
                 if ($aParts[0] -cne $expected[$k]) { $problems.Add("$k : expected value '$($expected[$k])', found '$($aParts[0])'") }
-                if ($aParts[2] -ne $bStyle)        { $problems.Add("$k : format changed (style $bStyle -> $($aParts[2]))") }
+                if ($aParts[2] -ne $bStyle)        { $problems.Add("$k : format changed ($bStyle  ->  $($aParts[2]))") }
             }
             elseif ($a -cne $b) {
-                $problems.Add("$k : changed unexpectedly ('$($b -replace "`t", ' | ')' -> '$($a -replace "`t", ' | ')')")
+                $bp = $b -split "`t"; $ap = $a -split "`t"
+                if ($ap[0] -cne $bp[0]) { $problems.Add("$k : value changed '$($bp[0])' -> '$($ap[0])'") }
+                if ($ap[1] -cne $bp[1]) { $problems.Add("$k : formula changed '$($bp[1])' -> '$($ap[1])'") }
+                if ($ap[2] -cne $bp[2]) { $problems.Add("$k : format changed [$($bp[2])] -> [$($ap[2])]") }
             }
         }
         if ($problems.Count -gt 0) {
