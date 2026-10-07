@@ -755,7 +755,7 @@ $storagePanel
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Backup & Storage Weekly Health Check - Dashboard</title>
+<title>Backup & Storage Monthly Health Check - Dashboard</title>
 <style>
   body { font-family: Calibri, Arial, sans-serif; background:#eef1f5; color:#1a1a1a; margin:0; padding:0 32px 32px; font-size:16px; line-height:1.4; }
   h1 { color:#1E3A5F; margin:0; font-size:36px; }
@@ -842,7 +842,7 @@ $storagePanel
 </head>
 <body>
   <div class="dashboard-header">
-    <h1>Backup &amp; Storage Weekly Health Check - Dashboard</h1>
+    <h1>Backup &amp; Storage Monthly Health Check - Dashboard</h1>
     <p class="subtitle">Generated $(ConvertTo-HtmlSafe $RunDateDisplay) - $($summaries.Count) site(s)</p>
   </div>
 
