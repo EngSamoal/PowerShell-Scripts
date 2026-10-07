@@ -73,7 +73,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptBuild = 'Set-MissingOwnersByAppCode build 2026-10-07.3'
+$ScriptBuild = 'Set-MissingOwnersByAppCode build 2026-10-07.5'
 Write-Host $ScriptBuild -ForegroundColor Cyan
 
 # ------------------------------------------------------------------------------------------------
@@ -148,7 +148,7 @@ function Get-XfSignature($Xf) {
     return ($parts -join ' ')
 }
 
-function Get-WorkbookSnapshot([string]$Path) {
+function Get-WorkbookSnapshot([string]$Path, [string]$TargetSheet, $TargetCells) {
     # Every existing cell of every sheet -> "value<TAB>formula<TAB>format", so equal snapshots = same data
     # AND same formatting (colours, fonts, borders, number formats, alignment).
     $snap = @{}
@@ -165,9 +165,185 @@ function Get-WorkbookSnapshot([string]$Path) {
                 $snap["$($sheet.Name)|$($cell.Start.Row)|$($cell.Start.Column)"] = "{0}`t{1}`t{2}" -f [string]$cell.Value, $cell.Formula, $xfCache[$sid]
             }
         }
+        # Cells to be filled may not exist in the file yet (empty, formatted only by row/column) - record
+        # the format Excel shows for them, so the check can prove it is the same after the fill.
+        $tws = $p.Workbook.Worksheets[$TargetSheet]
+        foreach ($tc in @($TargetCells)) {
+            $cell = $tws.Cells[$tc.Row, $tc.Column]
+            $sid = $cell.StyleID
+            if (-not $xfCache.ContainsKey($sid)) { $xfCache[$sid] = Get-XfSignature $p.Workbook.Styles.CellXfs[$sid] }
+            $snap["$TargetSheet|$($tc.Row)|$($tc.Column)"] = "{0}`t{1}`t{2}" -f [string]$cell.Value, $cell.Formula, $xfCache[$sid]
+        }
     }
     finally { Close-ExcelPackage $p -NoSave }
     return $snap
+}
+
+function ConvertTo-ColumnLetter([int]$Column) {
+    $s = ''
+    while ($Column -gt 0) { $m = ($Column - 1) % 26; $s = [char](65 + $m) + $s; $Column = [int][Math]::Floor(($Column - 1) / 26) }
+    return $s
+}
+
+function ConvertFrom-CellRef([string]$Ref) {
+    # 'AB12' -> @{ Row = 12; Column = 28 }
+    if ($Ref -notmatch '^([A-Za-z]+)(\d+)$') { throw "Unexpected cell reference '$Ref' in the sheet XML." }
+    $col = 0; foreach ($ch in $Matches[1].ToUpperInvariant().ToCharArray()) { $col = $col * 26 + ([int]$ch - 64) }
+    return @{ Row = [int]$Matches[2]; Column = $col }
+}
+
+function Get-XlsxCellStyles([string]$Path, [string]$SheetName, $Cells) {
+    # Style index Excel uses to DISPLAY each cell, read straight from the worksheet XML:
+    # the cell's own s="" if the cell exists, else the row style (customFormat) else the column style, else 0.
+    # Returns @{ 'row|col' = 'styleIndex' }.
+    Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($Path)
+    try {
+        $info = Open-XlsxSheetXml $zip $SheetName
+        $doc = $info.Doc; $nsm = $info.Nsm
+        $colStyle = @{}
+        foreach ($col in $doc.SelectNodes('/m:worksheet/m:cols/m:col', $nsm)) {
+            if ($col.HasAttribute('style')) { for ($i = [int]$col.GetAttribute('min'); $i -le [int]$col.GetAttribute('max'); $i++) { $colStyle[$i] = $col.GetAttribute('style') } }
+        }
+        $result = @{}
+        foreach ($c in $Cells) {
+            $ref = (ConvertTo-ColumnLetter $c.Column) + $c.Row
+            $style = $null
+            $rowNode = $doc.SelectSingleNode("/m:worksheet/m:sheetData/m:row[@r='$($c.Row)']", $nsm)
+            if ($rowNode) {
+                $cellNode = $rowNode.SelectSingleNode("m:c[@r='$ref']", $nsm)
+                if ($cellNode) { $style = if ($cellNode.HasAttribute('s')) { $cellNode.GetAttribute('s') } else { '0' } }
+                elseif ($rowNode.GetAttribute('customFormat') -in @('1', 'true') -and $rowNode.HasAttribute('s')) { $style = $rowNode.GetAttribute('s') }
+            }
+            if ($null -eq $style) { $style = if ($colStyle.ContainsKey([int]$c.Column)) { $colStyle[[int]$c.Column] } else { '0' } }
+            $result["$($c.Row)|$($c.Column)"] = $style
+        }
+        return $result
+    }
+    finally { $zip.Dispose() }
+}
+
+function Open-XlsxSheetXml($Zip, [string]$SheetName) {
+    # Finds the worksheet part for $SheetName and loads it. Returns @{ Doc; Nsm; Entry; Path }.
+    $rNs = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+    $wbEntry = $Zip.GetEntry('xl/workbook.xml')
+    $relEntry = $Zip.GetEntry('xl/_rels/workbook.xml.rels')
+    if (-not $wbEntry -or -not $relEntry) { throw 'Workbook structure not recognised (xl/workbook.xml missing).' }
+    $wb = Read-ZipXml $wbEntry
+    $sheetNode = @($wb.GetElementsByTagName('sheet', $wb.DocumentElement.NamespaceURI) | Where-Object { $_.GetAttribute('name') -eq $SheetName })[0]
+    if (-not $sheetNode) { throw "Sheet '$SheetName' not found in xl/workbook.xml." }
+    $rid = $sheetNode.GetAttribute('id', $rNs)
+    if (-not $rid) { $rid = $sheetNode.GetAttribute('id', 'http://purl.oclc.org/ooxml/officeDocument/relationships') }
+    $rels = Read-ZipXml $relEntry
+    $rel = @($rels.DocumentElement.ChildNodes | Where-Object { $_.LocalName -eq 'Relationship' -and $_.GetAttribute('Id') -eq $rid })[0]
+    if (-not $rel) { throw "Relationship '$rid' for sheet '$SheetName' not found." }
+    $target = $rel.GetAttribute('Target')
+    $sheetPath = if ($target.StartsWith('/')) { $target.TrimStart('/') } else { 'xl/' + $target }
+    $sheetEntry = $Zip.GetEntry($sheetPath)
+    if (-not $sheetEntry) { throw "Worksheet part '$sheetPath' not found in the file." }
+    $doc = Read-ZipXml $sheetEntry
+    $nsm = New-Object System.Xml.XmlNamespaceManager($doc.NameTable)
+    $nsm.AddNamespace('m', $doc.DocumentElement.NamespaceURI)
+    return @{ Doc = $doc; Nsm = $nsm; Entry = $sheetEntry; Path = $sheetPath }
+}
+
+function Read-ZipXml($Entry) {
+    $doc = New-Object System.Xml.XmlDocument
+    $doc.PreserveWhitespace = $true
+    $st = $Entry.Open(); try { $doc.Load($st) } finally { $st.Dispose() }
+    return $doc
+}
+
+function Set-XlsxCellText([string]$Path, [string]$SheetName, $Cells) {
+    # Writes text into specific cells by editing ONLY that worksheet's XML inside the .xlsx (zip).
+    # Every other part of the file (other sheets, styles, formulas, charts, ...) stays byte-for-byte identical.
+    # Each cell keeps its style; a cell that does not exist yet gets the row/column style Excel would use.
+    # $Cells: objects with Row, Column, Value.
+    Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+    $zip = [System.IO.Compression.ZipFile]::Open($Path, [System.IO.Compression.ZipArchiveMode]::Update)
+    try {
+        $info = Open-XlsxSheetXml $zip $SheetName
+        $sheetEntry = $info.Entry; $sheetPath = $info.Path
+        $doc = $info.Doc
+        $ns = $doc.DocumentElement.NamespaceURI
+        $pfx = $doc.DocumentElement.Prefix
+        $nsm = New-Object System.Xml.XmlNamespaceManager($doc.NameTable)
+        $nsm.AddNamespace('m', $ns)
+        $sheetData = $doc.SelectSingleNode('/m:worksheet/m:sheetData', $nsm)
+        if (-not $sheetData) { throw "No <sheetData> in '$sheetPath'." }
+
+        # Column styles (<cols><col min max style>) for cells that do not exist yet.
+        $colStyle = @{}
+        foreach ($col in $doc.SelectNodes('/m:worksheet/m:cols/m:col', $nsm)) {
+            if ($col.HasAttribute('style')) {
+                for ($i = [int]$col.GetAttribute('min'); $i -le [int]$col.GetAttribute('max'); $i++) { $colStyle[$i] = $col.GetAttribute('style') }
+            }
+        }
+        $rowsByNum = @{}
+        foreach ($rowNode in $sheetData.SelectNodes('m:row', $nsm)) {
+            if (-not $rowNode.HasAttribute('r')) { throw "A row in '$sheetPath' has no row number - unsupported file layout, nothing was changed." }
+            $rowsByNum[[int]$rowNode.GetAttribute('r')] = $rowNode
+        }
+
+        foreach ($c in $Cells) {
+            $ref = (ConvertTo-ColumnLetter $c.Column) + $c.Row
+            $rowNode = $rowsByNum[[int]$c.Row]
+            if (-not $rowNode) { throw "Row $($c.Row) not found in '$sheetPath' (it has a VM name, so it must exist) - nothing was changed." }
+            $cellNode = $null; $insertBefore = $null
+            foreach ($cn in $rowNode.SelectNodes('m:c', $nsm)) {
+                if (-not $cn.HasAttribute('r')) { throw "A cell in row $($c.Row) has no reference - unsupported file layout, nothing was changed." }
+                $pos = ConvertFrom-CellRef $cn.GetAttribute('r')
+                if ($pos.Column -eq $c.Column) { $cellNode = $cn; break }
+                if ($pos.Column -gt $c.Column) { $insertBefore = $cn; break }
+            }
+            if ($cellNode) {
+                if ($cellNode.SelectSingleNode('m:f', $nsm)) { throw "Cell $ref contains a formula - refusing to overwrite it." }
+                foreach ($child in @($cellNode.ChildNodes)) { [void]$cellNode.RemoveChild($child) }   # old blank <v>/<is>
+            }
+            else {
+                $cellNode = $doc.CreateElement($pfx, 'c', $ns)
+                $cellNode.SetAttribute('r', $ref)
+                if ($rowNode.GetAttribute('customFormat') -in @('1', 'true') -and $rowNode.HasAttribute('s')) { $cellNode.SetAttribute('s', $rowNode.GetAttribute('s')) }
+                elseif ($colStyle.ContainsKey([int]$c.Column)) { $cellNode.SetAttribute('s', $colStyle[[int]$c.Column]) }
+                if ($insertBefore) { [void]$rowNode.InsertBefore($cellNode, $insertBefore) } else { [void]$rowNode.AppendChild($cellNode) }
+            }
+            $cellNode.SetAttribute('t', 'inlineStr')
+            $is = $doc.CreateElement($pfx, 'is', $ns)
+            $t = $doc.CreateElement($pfx, 't', $ns)
+            $t.InnerText = [string]$c.Value
+            $sp = $doc.CreateAttribute('xml', 'space', 'http://www.w3.org/XML/1998/namespace'); $sp.Value = 'preserve'
+            [void]$t.Attributes.Append($sp)
+            [void]$is.AppendChild($t)
+            [void]$cellNode.AppendChild($is)
+        }
+
+        # Write the worksheet XML back into the same zip entry (UTF-8 without BOM, no re-indentation).
+        $ms = New-Object System.IO.MemoryStream
+        $xws = New-Object System.Xml.XmlWriterSettings
+        $xws.Encoding = New-Object System.Text.UTF8Encoding($false)
+        $xw = [System.Xml.XmlWriter]::Create($ms, $xws)
+        $doc.Save($xw); $xw.Dispose()
+        $bytes = $ms.ToArray()
+        $st = $sheetEntry.Open()
+        try { $st.SetLength(0); $st.Write($bytes, 0, $bytes.Length) } finally { $st.Dispose() }
+        return $sheetPath
+    }
+    finally { $zip.Dispose() }
+}
+
+function Get-ZipPartHashes([string]$Path) {
+    # zip entry name -> SHA256 of its content
+    Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+    $h = @{}
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($Path)
+    try {
+        foreach ($e in $zip.Entries) {
+            $st = $e.Open(); try { $h[$e.FullName] = [BitConverter]::ToString($sha.ComputeHash($st)) } finally { $st.Dispose() }
+        }
+    }
+    finally { $zip.Dispose(); $sha.Dispose() }
+    return $h
 }
 
 function Copy-FileVerified([string]$Source, [string]$Destination) {
@@ -229,7 +405,6 @@ try {
     $tempCopy = Join-Path ([IO.Path]::GetTempPath()) ('OwnerFill_{0}_{1}{2}' -f $stamp, $baseName, $ext)
     Copy-FileVerified $inFull $tempCopy
     $workFile = $tempCopy
-    $beforeSnapshot = if ($Apply) { Get-WorkbookSnapshot $tempCopy } else { $null }
 
     try { $pkg = Open-ExcelPackage -Path $workFile }
     catch { throw "Could not open the workbook copy '$workFile' (corrupt, password-protected, or not a real .xlsx?): $($_.Exception.Message)" }
@@ -413,23 +588,39 @@ try {
         Write-Host 'Nothing to fill - the original file was left unchanged.' -ForegroundColor Yellow
     }
     elseif ($Apply) {
-        foreach ($ch in $changes) { $ws.Cells[$ch.'Excel Row', $ch.Column].Value = $ch.'New Value' }   # value only; cell style untouched
-        try {
-            Close-ExcelPackage $pkg          # saves the TEMP copy
-            $pkg = $null
+        # The workbook is NOT re-saved by the Excel library (that rewrites the whole file). Instead only the
+        # filled cells are written into the worksheet XML of the temp copy; everything else stays byte-identical.
+        Close-ExcelPackage $pkg -NoSave
+        $pkg = $null
+        $targets = @($changes | ForEach-Object { [pscustomobject]@{ Row = $_.'Excel Row'; Column = $_.Column; Value = $_.'New Value' } })
+        $beforeSnapshot = Get-WorkbookSnapshot $tempCopy $ws.Name $targets
+        $beforeParts = Get-ZipPartHashes $tempCopy
+        $beforeStyles = Get-XlsxCellStyles $tempCopy $ws.Name $targets
+        try { $sheetPart = Set-XlsxCellText $tempCopy $ws.Name $targets }
+        catch { throw "Writing the owners into the temporary copy failed - the original was not changed: $($_.Exception.Message)" }
+
+        # Check 1: every part of the file except that one worksheet is byte-for-byte identical.
+        $afterParts = Get-ZipPartHashes $tempCopy
+        $problems = New-Object System.Collections.Generic.List[string]
+        foreach ($k in $beforeParts.Keys) {
+            if ($k -eq $sheetPart) { continue }
+            if (-not $afterParts.ContainsKey($k)) { $problems.Add("file part missing after update: $k") }
+            elseif ($afterParts[$k] -ne $beforeParts[$k]) { $problems.Add("file part changed: $k") }
         }
-        catch {
-            $pkg = $null
-            throw "Saving the updated temporary copy failed: $($_.Exception.Message)"
+        foreach ($k in $afterParts.Keys) { if (-not $beforeParts.ContainsKey($k)) { $problems.Add("unexpected new file part: $k") } }
+
+        # Check 2: every filled cell shows exactly the same format (style) as the empty cell did before.
+        $afterStyles = Get-XlsxCellStyles $tempCopy $ws.Name $targets
+        foreach ($k in $beforeStyles.Keys) {
+            if ($afterStyles[$k] -ne $beforeStyles[$k]) { $problems.Add("cell $k : format changed (style $($beforeStyles[$k]) -> $($afterStyles[$k]))") }
         }
 
-        # Verify the temp copy cell-by-cell against the original: same value + formula + format everywhere,
-        # except the filled cells, which must hold the new value with their ORIGINAL format.
+        # Check 3: cell-by-cell - same value + formula + format everywhere, except the filled cells, which
+        # must hold the new value with their ORIGINAL format.
         $expected = @{}
         foreach ($ch in $changes) { $expected["$($ws.Name)|$($ch.'Excel Row')|$($ch.Column)"] = $ch.'New Value' }
-        $afterSnapshot = Get-WorkbookSnapshot $tempCopy
+        $afterSnapshot = Get-WorkbookSnapshot $tempCopy $ws.Name $targets
         $defaultFormat = $beforeSnapshot['#defaultFormat']
-        $problems = New-Object System.Collections.Generic.List[string]
         $allKeys = New-Object System.Collections.Generic.HashSet[string]
         foreach ($k in $beforeSnapshot.Keys) { [void]$allKeys.Add($k) }
         foreach ($k in $afterSnapshot.Keys)  { [void]$allKeys.Add($k) }
@@ -437,9 +628,9 @@ try {
             $b = if ($beforeSnapshot.ContainsKey($k)) { $beforeSnapshot[$k] } else { "`t`t$defaultFormat" }
             $a = if ($afterSnapshot.ContainsKey($k))  { $afterSnapshot[$k] }  else { "`t`t$defaultFormat" }
             if ($expected.ContainsKey($k)) {
-                $bStyle = ($b -split "`t")[2]; $aParts = $a -split "`t"
+                # (format of filled cells is checked from the XML in check 2)
+                $aParts = $a -split "`t"
                 if ($aParts[0] -cne $expected[$k]) { $problems.Add("$k : expected value '$($expected[$k])', found '$($aParts[0])'") }
-                if ($aParts[2] -ne $bStyle)        { $problems.Add("$k : format changed ($bStyle  ->  $($aParts[2]))") }
             }
             elseif ($a -cne $b) {
                 $bp = $b -split "`t"; $ap = $a -split "`t"
@@ -463,7 +654,7 @@ try {
             Copy-Item -LiteralPath $backupFile -Destination $inFull -Force
             throw "Writing the original did not complete correctly - it was restored from the backup $backupFile"
         }
-        Write-Host "Verified    : every cell of every sheet is unchanged (values + colours/formats) except the $($changes.Count) filled owner cell(s)." -ForegroundColor Green
+        Write-Host "Verified    : only the $($changes.Count) empty owner cell(s) were filled; all other cells, formulas, colours, formats and sheets are unchanged." -ForegroundColor Green
         Write-Host "Updated     : $inFull" -ForegroundColor Green
     }
     else {
