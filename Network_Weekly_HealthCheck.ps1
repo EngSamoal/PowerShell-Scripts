@@ -901,7 +901,7 @@ $actionPlanBody
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Network Weekly Health Check - Dashboard</title>
+<title>Network Monthly Health Check - Dashboard</title>
 <style>
   body { font-family: Calibri, Arial, sans-serif; background:#eef1f5; color:#1a1a1a; margin:0; padding:0 32px 32px; font-size:16px; line-height:1.4; }
   h1 { color:#1E3A5F; margin:0; font-size:36px; }
@@ -1026,7 +1026,7 @@ $actionPlanBody
 </head>
 <body>
   <div class="dashboard-header">
-    <h1>Network Weekly Health Check - Dashboard</h1>
+    <h1>Network Monthly Health Check - Dashboard</h1>
     <p class="subtitle">Generated $(ConvertTo-HtmlSafe $RunDateDisplay) - $($summaries.Count) site(s)</p>
   </div>
 
