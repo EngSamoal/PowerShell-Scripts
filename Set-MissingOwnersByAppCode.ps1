@@ -18,13 +18,17 @@
 
     SAFETY
       * Dry-run (report only) is the DEFAULT. Nothing is written to Excel unless -Apply is given.
-      * The input workbook is never opened for writing: the script reads a temporary copy, and its SHA256
-        hash is checked at the end to prove it was not modified.
-      * -Apply: the input is backed up first (hash-verified), then copied to -OutputPath and only the filled
-        cells are changed in that copy (formatting, other worksheets, column order and all other data are
-        kept). The saved file is re-opened and every VM Name / owner cell is verified against the expected
-        result. If verification fails the output is renamed *_VERIFY_FAILED.xlsx so it can't be used by mistake.
-      * An existing -OutputPath is not overwritten unless -Force is given (and it is backed up first).
+      * Only the 3 columns VM Name / Business Owner / Technical Owner are read; only EMPTY owner cells are
+        written. All other columns, sheets, colours and formats are left exactly as they are.
+      * -Apply UPDATES THE ORIGINAL FILE (-InputPath), safely:
+          1. A backup copy is made first (<input folder>\Backup\<name>_backup_<timestamp>.xlsx, SHA256 verified).
+          2. The changes are made and saved in a temporary copy - never directly in the original.
+          3. The saved copy is re-opened and EVERY cell of EVERY sheet is compared with the original: the
+             value and the format (colour/font/border/number format) must be identical, except the filled
+             owner cells (new value, same format). Any difference -> the original is NOT touched.
+          4. Only then the temporary copy replaces the original (if the file is open in Excel this fails and
+             the original stays unchanged - close Excel and run again).
+      * Dry-run never writes the workbook; the original's SHA256 hash is checked at the end to prove it.
 
     REPORTS (always written, dry-run and apply; folder = -ReportFolder):
       <name>_<mode>_<timestamp>_Changes.csv       every proposed/applied change
@@ -36,20 +40,20 @@
     Requires the ImportExcel module (does NOT need Microsoft Excel). The script does not install anything.
 
 .PARAMETER Apply
-    Write the result to -OutputPath. Without it the script only reports what it would do.
+    Update the original workbook (after a backup). Without it the script only reports what it would do.
 
 .EXAMPLE
     # 1) Dry run (default) - nothing is written to Excel, only the reports:
     .\Set-MissingOwnersByAppCode.ps1
 
 .EXAMPLE
-    # 2) Apply - backup of the original, then C:\temp\master_draft_Updated.xlsx is created:
+    # 2) Apply - backup, then the missing owners are filled in C:\temp\master_draft.xlsx itself:
     .\Set-MissingOwnersByAppCode.ps1 -Apply
 
 .EXAMPLE
-    # 3) Other file / sheet / output, overwrite an existing output (it is backed up first):
-    .\Set-MissingOwnersByAppCode.ps1 -InputPath 'D:\inv\master.xlsx' -WorksheetName 'Inventory' `
-        -OutputPath 'D:\inv\master_Updated.xlsx' -Apply -Force
+    # 3) Another file (dry run first, then apply):
+    .\Set-MissingOwnersByAppCode.ps1 -InputPath 'D:\inv\master.xlsx'
+    .\Set-MissingOwnersByAppCode.ps1 -InputPath 'D:\inv\master.xlsx' -Apply
 
 .NOTES
     Script build: see $ScriptBuild below (printed as the first line of output).
@@ -58,7 +62,6 @@
 [CmdletBinding()]
 param(
     [string]$InputPath  = 'C:\temp\master_draft.xlsx',
-    [string]$OutputPath = 'C:\temp\master_draft_Updated.xlsx',
     [string]$WorksheetName,                                   # default: first sheet that has all 3 headers
     [string]$ReportFolder,                                    # default: <input folder>\OwnerFill_Reports
     [string]$BackupFolder,                                    # default: <input folder>\Backup
@@ -66,12 +69,11 @@ param(
     [string]$BusinessOwnerHeader  = 'Business Owner',
     [string]$TechnicalOwnerHeader = 'Technical Owner',
     [ValidateRange(1, 1000)][int]$HeaderSearchRows = 25,      # header row is searched in the first N rows
-    [switch]$Apply,
-    [switch]$Force
+    [switch]$Apply
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptBuild = 'Set-MissingOwnersByAppCode build 2026-10-07.1'
+$ScriptBuild = 'Set-MissingOwnersByAppCode build 2026-10-07.2'
 Write-Host $ScriptBuild -ForegroundColor Cyan
 
 # ------------------------------------------------------------------------------------------------
@@ -125,6 +127,24 @@ function Find-HeaderLayout($Worksheet, [int]$MaxRows, [string[]]$Headers) {
     return $null
 }
 
+function Get-WorkbookSnapshot([string]$Path) {
+    # Every existing cell of every sheet -> "value<TAB>styleId". StyleID covers fill colour, font, borders,
+    # alignment and number format, so equal snapshots = same data AND same formatting.
+    $snap = @{}
+    $p = Open-ExcelPackage -Path $Path
+    try {
+        foreach ($sheet in $p.Workbook.Worksheets) {
+            $snap["#sheet|$($sheet.Name)"] = "$($sheet.Index)"
+            if ($null -eq $sheet.Dimension) { continue }
+            foreach ($cell in $sheet.Cells[$sheet.Dimension.Address]) {
+                $snap["$($sheet.Name)|$($cell.Start.Row)|$($cell.Start.Column)"] = "{0}`t{1}`t{2}" -f [string]$cell.Value, $cell.Formula, $cell.StyleID
+            }
+        }
+    }
+    finally { Close-ExcelPackage $p -NoSave }
+    return $snap
+}
+
 function Copy-FileVerified([string]$Source, [string]$Destination) {
     # Copy and prove the copy is byte-identical (SHA256). Throws on mismatch.
     Copy-Item -LiteralPath $Source -Destination $Destination -Force
@@ -156,10 +176,8 @@ try {
 
     if (-not (Test-Path -LiteralPath $InputPath -PathType Leaf)) { throw "Input file not found: $InputPath" }
     $inFull  = (Resolve-Path -LiteralPath $InputPath).ProviderPath
-    $outFull = [IO.Path]::GetFullPath($OutputPath)
     $ext = [IO.Path]::GetExtension($inFull).ToLowerInvariant()
     if ($ext -notin @('.xlsx', '.xlsm')) { throw "Unsupported file type '$ext'. Only .xlsx / .xlsm are supported (save .xls as .xlsx first)." }
-    if ($inFull -ieq $outFull) { throw 'OutputPath must be a different file than InputPath - the original is never modified.' }
 
     $inDir = Split-Path -Parent $inFull
     $baseName = [IO.Path]::GetFileNameWithoutExtension($inFull)
@@ -168,14 +186,9 @@ try {
     if (-not (Test-Path -LiteralPath $ReportFolder)) { New-Item -ItemType Directory -Path $ReportFolder -Force | Out-Null }
     $reportPrefix = Join-Path $ReportFolder ('{0}_{1}_{2}' -f $baseName, $mode, $stamp)
 
-    if ($Apply -and (Test-Path -LiteralPath $outFull) -and -not $Force) {
-        throw "Output file already exists: $outFull  (use -Force to overwrite it - it will be backed up first, or choose another -OutputPath)."
-    }
-
     $originalHash = (Get-FileHash -LiteralPath $inFull -Algorithm SHA256).Hash
-    Write-Host ("Mode        : {0}" -f $(if ($Apply) { 'APPLY (a new workbook will be written)' } else { 'DRY RUN (report only - no workbook is written)' })) -ForegroundColor $(if ($Apply) { 'Yellow' } else { 'Green' })
+    Write-Host ("Mode        : {0}" -f $(if ($Apply) { 'APPLY (the original file will be updated after a backup)' } else { 'DRY RUN (report only - no workbook is written)' })) -ForegroundColor $(if ($Apply) { 'Yellow' } else { 'Green' })
     Write-Host "Input       : $inFull"
-    if ($Apply) { Write-Host "Output      : $outFull" }
     Write-Host "Reports     : $ReportFolder"
 
     # --------------------------------------------------------------------------------------------
@@ -186,21 +199,12 @@ try {
         $backupFile = Join-Path $BackupFolder ('{0}_backup_{1}{2}' -f $baseName, $stamp, $ext)
         Copy-FileVerified $inFull $backupFile
         Write-Host "Backup      : $backupFile (SHA256 verified)" -ForegroundColor Green
-        if (Test-Path -LiteralPath $outFull) {
-            $outBackup = Join-Path $BackupFolder ('{0}_previous_{1}{2}' -f [IO.Path]::GetFileNameWithoutExtension($outFull), $stamp, [IO.Path]::GetExtension($outFull))
-            Copy-FileVerified $outFull $outBackup
-            Write-Host "Old output  : backed up to $outBackup" -ForegroundColor Green
-        }
-        $outDir = Split-Path -Parent $outFull
-        if (-not (Test-Path -LiteralPath $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
-        Copy-FileVerified $inFull $outFull          # the output starts as an exact copy of the original
-        $workFile = $outFull
     }
-    else {
-        $tempCopy = Join-Path ([IO.Path]::GetTempPath()) ('OwnerFill_{0}_{1}{2}' -f $stamp, $baseName, $ext)
-        Copy-FileVerified $inFull $tempCopy         # dry-run reads a throw-away copy, never the original
-        $workFile = $tempCopy
-    }
+    # All work happens in a temporary copy; the original is only replaced at the very end after verification.
+    $tempCopy = Join-Path ([IO.Path]::GetTempPath()) ('OwnerFill_{0}_{1}{2}' -f $stamp, $baseName, $ext)
+    Copy-FileVerified $inFull $tempCopy
+    $workFile = $tempCopy
+    $beforeSnapshot = if ($Apply) { Get-WorkbookSnapshot $tempCopy } else { $null }
 
     try { $pkg = Open-ExcelPackage -Path $workFile }
     catch { throw "Could not open the workbook copy '$workFile' (corrupt, password-protected, or not a real .xlsx?): $($_.Exception.Message)" }
@@ -378,44 +382,60 @@ try {
     # --------------------------------------------------------------------------------------------
     # Apply (only with -Apply): write the filled cells, save, re-open and verify
     # --------------------------------------------------------------------------------------------
-    if ($Apply) {
+    if ($Apply -and $changes.Count -eq 0) {
+        Close-ExcelPackage $pkg -NoSave
+        $pkg = $null
+        Write-Host 'Nothing to fill - the original file was left unchanged.' -ForegroundColor Yellow
+    }
+    elseif ($Apply) {
         foreach ($ch in $changes) { $ws.Cells[$ch.'Excel Row', $ch.Column].Value = $ch.'New Value' }   # value only; cell style untouched
         try {
-            Close-ExcelPackage $pkg
+            Close-ExcelPackage $pkg          # saves the TEMP copy
             $pkg = $null
         }
         catch {
             $pkg = $null
-            Remove-Item -LiteralPath $outFull -Force -ErrorAction SilentlyContinue
-            throw "Saving '$outFull' failed (is it open in Excel?): $($_.Exception.Message)"
+            throw "Saving the updated temporary copy failed: $($_.Exception.Message)"
         }
 
-        # Verify: every VM name / owner cell must equal the original value, or the new value where filled.
+        # Verify the temp copy cell-by-cell against the original: same value + formula + format everywhere,
+        # except the filled cells, which must hold the new value with their ORIGINAL format.
         $expected = @{}
-        foreach ($ch in $changes) { $expected["$($ch.'Excel Row')|$($ch.Column)"] = $ch.'New Value' }
+        foreach ($ch in $changes) { $expected["$($ws.Name)|$($ch.'Excel Row')|$($ch.Column)"] = $ch.'New Value' }
+        $afterSnapshot = Get-WorkbookSnapshot $tempCopy
         $problems = New-Object System.Collections.Generic.List[string]
-        $vpkg = Open-ExcelPackage -Path $outFull
-        try {
-            $vws = $vpkg.Workbook.Worksheets[$ws.Name]
-            if ($vws.Dimension.End.Row -ne $lastRow) { $problems.Add("Last row changed: $lastRow -> $($vws.Dimension.End.Row)") }
-            foreach ($rec in $records) {
-                if ((ConvertTo-CleanText $vws.Cells[$rec.Row, $vmCol].Value) -cne $rec.VMName) { $problems.Add("Row $($rec.Row): VM Name changed") }
-                foreach ($f in $fields) {
-                    $key = "$($rec.Row)|$($f.Col)"
-                    $want = if ($expected.ContainsKey($key)) { $expected[$key] } else { $rec.Owners[$f.Name] }
-                    $got = ConvertTo-CleanText $vws.Cells[$rec.Row, $f.Col].Value
-                    if ($got -cne $want) { $problems.Add("Row $($rec.Row) $($f.Name): expected '$want', found '$got'") }
-                }
+        $allKeys = New-Object System.Collections.Generic.HashSet[string]
+        foreach ($k in $beforeSnapshot.Keys) { [void]$allKeys.Add($k) }
+        foreach ($k in $afterSnapshot.Keys)  { [void]$allKeys.Add($k) }
+        foreach ($k in $allKeys) {
+            $b = if ($beforeSnapshot.ContainsKey($k)) { $beforeSnapshot[$k] } else { "`t`t0" }
+            $a = if ($afterSnapshot.ContainsKey($k))  { $afterSnapshot[$k] }  else { "`t`t0" }
+            if ($expected.ContainsKey($k)) {
+                $bStyle = ($b -split "`t")[2]; $aParts = $a -split "`t"
+                if ($aParts[0] -cne $expected[$k]) { $problems.Add("$k : expected value '$($expected[$k])', found '$($aParts[0])'") }
+                if ($aParts[2] -ne $bStyle)        { $problems.Add("$k : format changed (style $bStyle -> $($aParts[2]))") }
+            }
+            elseif ($a -cne $b) {
+                $problems.Add("$k : changed unexpectedly ('$($b -replace "`t", ' | ')' -> '$($a -replace "`t", ' | ')')")
             }
         }
-        finally { Close-ExcelPackage $vpkg -NoSave }
         if ($problems.Count -gt 0) {
-            $bad = [IO.Path]::ChangeExtension($outFull, $null).TrimEnd('.') + '_VERIFY_FAILED' + [IO.Path]::GetExtension($outFull)
-            Move-Item -LiteralPath $outFull -Destination $bad -Force
-            throw ("Verification of the saved workbook FAILED ({0} problem(s)); file renamed to {1}. First problems:`n  {2}" -f `
-                $problems.Count, $bad, (($problems | Select-Object -First 10) -join "`n  "))
+            throw ("Verification FAILED ({0} difference(s)) - the ORIGINAL FILE WAS NOT CHANGED. First differences:`n  {1}" -f `
+                $problems.Count, (($problems | Select-Object -First 10) -join "`n  "))
         }
-        Write-Host "Verified    : all $($records.Count) data rows re-read from the saved file match the expected values." -ForegroundColor Green
+
+        # Nobody else may have saved the original while we worked, otherwise their edits would be lost.
+        if ((Get-FileHash -LiteralPath $inFull -Algorithm SHA256).Hash -ne $originalHash) {
+            throw 'The original file was changed by someone else while the script was running - it was NOT overwritten. Run the script again.'
+        }
+        try { Copy-Item -LiteralPath $tempCopy -Destination $inFull -Force }
+        catch { throw "Could not update '$inFull' (is it open in Excel? close it and run again). The original was not changed: $($_.Exception.Message)" }
+        if ((Get-FileHash -LiteralPath $inFull -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath $tempCopy -Algorithm SHA256).Hash) {
+            Copy-Item -LiteralPath $backupFile -Destination $inFull -Force
+            throw "Writing the original did not complete correctly - it was restored from the backup $backupFile"
+        }
+        Write-Host "Verified    : every cell of every sheet is unchanged (values + colours/formats) except the $($changes.Count) filled owner cell(s)." -ForegroundColor Green
+        Write-Host "Updated     : $inFull" -ForegroundColor Green
     }
     else {
         Close-ExcelPackage $pkg -NoSave
@@ -457,7 +477,7 @@ try {
     $lines.Add("OWNER FILL SUMMARY  -  $mode  -  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  -  $ScriptBuild")
     $lines.Add('=' * 78)
     $lines.Add("Input workbook                      : $inFull  (sheet '$($ws.Name)')")
-    if ($Apply) { $lines.Add("Output workbook                     : $outFull") ; $lines.Add("Backup of original                  : $backupFile") }
+    if ($Apply) { $lines.Add("Updated workbook (original file)    : $inFull") ; $lines.Add("Backup taken before the update      : $backupFile") }
     $lines.Add("Total VMs processed (data rows)     : $($records.Count)   (+ $emptyRows completely empty row(s) ignored)")
     $lines.Add("Unique applications found           : $($apps.Count)")
     $lines.Add("Missing Business Owners found       : $($missingCount['Business Owner'])")
@@ -497,14 +517,15 @@ try {
     foreach ($k in 'Changes', 'Conflicts', 'Unresolved', 'Invalid', 'Summary') { $lines.Add("  $($files[$k])") }
     if (-not $Apply) {
         $lines.Add('')
-        $lines.Add('DRY RUN - no workbook was written. Review the reports, then run again with -Apply to create the updated file.')
+        $lines.Add('DRY RUN - the workbook was NOT changed. Review the reports, then run again with -Apply to update it.')
     }
     $lines | Out-File -LiteralPath $files.Summary -Encoding UTF8
     Write-Host ''
     $lines | ForEach-Object { Write-Host $_ }
 
-    # Final proof that the original file was not touched.
-    if ((Get-FileHash -LiteralPath $inFull -Algorithm SHA256).Hash -ne $originalHash) {
+    # Dry run (or nothing to fill): final proof that the original file was not touched.
+    if ($Apply -and $changes.Count -gt 0) { }
+    elseif ((Get-FileHash -LiteralPath $inFull -Algorithm SHA256).Hash -ne $originalHash) {
         Write-Host 'WARNING: the input file changed while the script was running (someone else saved it?). Re-run the script.' -ForegroundColor Red
         $exitCode = 3
     }
