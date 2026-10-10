@@ -1,7 +1,6 @@
 <#
 .SYNOPSIS
-    Simple, READ-ONLY full inventory export from vCenter: VMs, templates, vApps and
-    Content Library items (OVF/OVA templates, VM templates, ISOs, etc.).
+    Simple, READ-ONLY full inventory export from vCenter: VMs, templates and vApps.
 
 .DESCRIPTION
     Collects everything that lives in vCenter's VM inventory and writes it to CSV:
@@ -9,12 +8,9 @@
         Type = VM               - every virtual machine (powered on/off, orphaned, inaccessible)
         Type = Template         - every VM template in the VM & Templates inventory
         Type = vApp             - every vApp (deployed OVAs often land as a vApp)
-        Type = ContentLibrary   - every Content Library item (uploaded OVF/OVA templates,
-                                  VM templates stored in a library, ISOs, other files)
 
     Note on "OVA": an .ova file is only a package. Once deployed it becomes a normal VM
-    (or vApp) and is listed above. If it was uploaded to a Content Library and not deployed,
-    it appears as Type = ContentLibrary, ItemType = ovf.
+    (or vApp) and is listed above. Content Library items are intentionally NOT included.
 
     Output (in -OutputFolder):
         vCenter_Inventory_<timestamp>.csv      - everything in one file (filter on Type)
@@ -44,7 +40,7 @@ param(
     [string]$OutputFolder = 'C:\Temp'
 )
 
-$ScriptBuild = 'Export-vCenterFullInventory build 2026-10-10.1'
+$ScriptBuild = 'Export-vCenterFullInventory build 2026-10-10.2'
 Write-Host $ScriptBuild -ForegroundColor Cyan
 
 #region ---- Connect ----
@@ -67,10 +63,10 @@ $results = New-Object System.Collections.Generic.List[object]
 # Builds one output row with the same columns for every object type, so the CSV lines up.
 function New-Row {
     param([hashtable]$p)
-    $cols = 'vCenter','Type','Name','ItemType','PowerState','ConnectionState','GuestOS','IPAddress',
+    $cols = 'vCenter','Type','Name','PowerState','ConnectionState','GuestOS','IPAddress',
             'DNSName','NumCPU','MemoryGB','ProvisionedGB','UsedGB','Datacenter','Cluster','Host',
             'Folder','ResourcePoolOrvApp','Datastores','Networks','ToolsStatus','HWVersion',
-            'ContentLibrary','CreatedDate','Notes'
+            'CreatedDate','Notes'
     $o = [ordered]@{}
     foreach ($c in $cols) { $o[$c] = if ($p.ContainsKey($c)) { $p[$c] } else { '' } }
     [pscustomobject]$o
@@ -173,32 +169,6 @@ foreach ($vc in @($global:DefaultVIServers)) {
         }))
     }
     Write-Host "[$vcName]   vApps: $($vapps.Count)"
-
-    # ---- Content Library items (OVF/OVA templates, library VM templates, ISOs ...) ----
-    try {
-        $clItems = @(Get-ContentLibraryItem -Server $vc -ErrorAction Stop)
-        foreach ($i in $clItems) {
-            $results.Add((New-Row @{
-                vCenter        = $vcName
-                Type           = 'ContentLibrary'
-                Name           = $i.Name
-                ItemType       = $i.ItemType
-                ProvisionedGB  = if ($i.SizeGB) { [math]::Round([double]$i.SizeGB, 2) } else { '' }
-                ContentLibrary = "$($i.ContentLibrary)"
-                CreatedDate    = $i.CreationTime
-                Notes          = $i.Description
-            }))
-        }
-        Write-Host "[$vcName]   Content Library items: $($clItems.Count)"
-    } catch {
-        Write-Warning "[$vcName] Could not read Content Libraries: $($_.Exception.Message)"
-        $results.Add((New-Row @{
-            vCenter = $vcName
-            Type    = 'ContentLibrary'
-            Name    = 'Unable to Check'
-            Notes   = "Get-ContentLibraryItem failed: $($_.Exception.Message) (needs PowerCLI 11.4+ and Content Library read permission)"
-        }))
-    }
 }
 
 #region ---- Export ----
@@ -210,7 +180,7 @@ Write-Host "`nCSV saved : $csvPath" -ForegroundColor Green
 if (Get-Module -ListAvailable -Name ImportExcel) {
     $xlsxPath = Join-Path $OutputFolder "vCenter_Inventory_$stamp.xlsx"
     $results | Export-Excel -Path $xlsxPath -WorksheetName 'All' -AutoSize -AutoFilter -FreezeTopRow -BoldTopRow
-    foreach ($t in 'VM','Template','vApp','ContentLibrary') {
+    foreach ($t in 'VM','Template','vApp') {
         $rows = @($results | Where-Object { $_.Type -eq $t })
         if ($rows.Count -gt 0) {
             $rows | Export-Excel -Path $xlsxPath -WorksheetName $t -AutoSize -AutoFilter -FreezeTopRow -BoldTopRow
