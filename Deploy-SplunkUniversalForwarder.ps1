@@ -47,7 +47,7 @@ param(
 # Bump this on every change and check it against the version quoted in chat before trusting a
 # run's results - prints as the very first line of output so a stale cached copy is always
 # immediately obvious, instead of silently re-running old logic.
-$ScriptBuild = '2026.09.21-9'
+$ScriptBuild = '2026.10.13-1'
 
 # Splunk version this fleet must be running after this script completes.
 [version]$RequiredSplunkVersion = '10.4.2'
@@ -78,6 +78,16 @@ $InstallerTimeoutSec         = 1200   # 20 min ceiling for the Splunk UF install
 $PostInstallTimeoutSec       = 600    # 10 min ceiling for post_installation_Seven.bat
 $PostActionPollTimeoutSec    = 180    # extra time to allow install dir/service to settle after exit
 $PostActionPollIntervalSec   = 10
+
+# Retry settings for transient vCenter/guest-ops connectivity drops - e.g. "There was no endpoint
+# listening at https://.../sdk" from Copy-VMGuestFile and "The underlying connection was closed"
+# from Invoke-VMScript, both seen live when vCenter's own API briefly became unreachable mid-run
+# (not a per-VM problem - everything after the drop fails, including "VM not found" for VMs that
+# are actually fine, because the session itself is broken). 5 attempts x 15s = up to ~70s of
+# retrying, which is enough to ride out a brief vpxd blip without hanging indefinitely on a VM
+# that is genuinely unreachable.
+$VCenterRetryMaxAttempts  = 5
+$VCenterRetryDelaySeconds = 15
 
 #endregion ===========================================================
 
@@ -169,6 +179,64 @@ function Get-SplunkMsiProperties {
 #endregion ============================================================
 
 
+#region ======================= TRANSIENT VCENTER CONNECTIVITY RETRY =======================
+
+# Message patterns seen live for a vCenter/guest-ops connection that briefly dropped mid-run
+# (vpxd restart, network blip, idle/session timeout) - as opposed to a real, non-retryable
+# failure (bad credentials, file not found, VM genuinely powered off, etc.), which should fail
+# immediately instead of wasting a retry window on it.
+$script:TransientConnectivityPatterns = @(
+    'no endpoint listening',
+    'underlying connection was closed',
+    'unable to connect to the remote server',
+    'connection was forcibly closed',
+    'the operation has timed out',
+    'the remote server returned an error: \(503\)',
+    'the remote server returned an error: \(500\)'
+)
+
+function Test-IsTransientConnectivityError {
+    param([string] $Message)
+    if ([string]::IsNullOrWhiteSpace($Message)) { return $false }
+    foreach ($pattern in $script:TransientConnectivityPatterns) {
+        if ($Message -match $pattern) { return $true }
+    }
+    return $false
+}
+
+# Retries a scriptblock only when the failure looks like a transient vCenter/guest-ops
+# connectivity drop (see patterns above) - any other error is rethrown immediately on the first
+# attempt, since retrying a genuine failure (wrong credentials, missing VM) would only waste
+# time and delay reporting the real problem.
+function Invoke-WithTransientRetry {
+    param(
+        [Parameter(Mandatory)] [scriptblock] $ScriptBlock,
+        [string] $OperationName = 'operation',
+        [int] $MaxAttempts = $VCenterRetryMaxAttempts,
+        [int] $DelaySeconds = $VCenterRetryDelaySeconds
+    )
+
+    $lastError = $null
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            return & $ScriptBlock
+        } catch {
+            $lastError = $_
+            $isTransient = Test-IsTransientConnectivityError -Message $_.Exception.Message
+            if (-not $isTransient -or $attempt -ge $MaxAttempts) {
+                throw $lastError
+            }
+            Write-Host "  [retry] $OperationName hit a transient connectivity error (attempt $attempt/$MaxAttempts): $($_.Exception.Message)" -ForegroundColor Yellow
+            Write-Host "  [retry] Waiting $DelaySeconds sec before retrying..." -ForegroundColor Yellow
+            Start-Sleep -Seconds $DelaySeconds
+        }
+    }
+    throw $lastError
+}
+
+#endregion ============================================================
+
+
 #region ======================= GUEST OPERATION HELPER (WITH TIMEOUT) =======================
 
 # Runs a guest script asynchronously and bounds the wait with Wait-Task, so a stuck/slow VM
@@ -192,8 +260,10 @@ function Invoke-GuestScriptWithTimeout {
     # $TimeoutSeconds is kept for future use but is not currently enforced; a stuck guest process
     # will block on this call until Invoke-VMScript/vCenter's own internal behavior resolves it.
     try {
-        $result = Invoke-VMScript -VM $VM -GuestCredential $GuestCredential -ScriptType $ScriptType `
-            -ScriptText $ScriptText -ErrorAction Stop
+        $result = Invoke-WithTransientRetry -OperationName "Invoke-VMScript on $($VM.Name)" -ScriptBlock {
+            Invoke-VMScript -VM $VM -GuestCredential $GuestCredential -ScriptType $ScriptType `
+                -ScriptText $ScriptText -ErrorAction Stop
+        }
 
         [PSCustomObject]@{
             Success      = $true
@@ -514,16 +584,18 @@ function Get-RemoteMsiLogTail {
 
 # Live testing showed Copy-VMGuestFile intermittently fails with a transient HTTP 500 from the
 # ESXi/vCenter guest-file-transfer endpoint - confirmed transient by retrying the exact same call
-# immediately afterward and having it succeed. This wraps the copy with a few retries so the
-# script recovers on its own instead of requiring a manual re-run each time it happens.
+# immediately afterward and having it succeed. Also seen live: a full vCenter API connectivity
+# drop ("no endpoint listening") mid-run, which took longer than the original 3x/10s window to
+# recover from and cascaded into "VM not found" failures for every VM processed afterward - so
+# this now shares the same wider retry window as the rest of the script's guest-ops calls.
 function Copy-VMGuestFileWithRetry {
     param(
         [Parameter(Mandatory)] [string] $Source,
         [Parameter(Mandatory)] [string] $Destination,
         [Parameter(Mandatory)] $VM,
         [Parameter(Mandatory)] [System.Management.Automation.PSCredential] $GuestCredential,
-        [int] $MaxAttempts = 3,
-        [int] $RetryDelaySeconds = 10
+        [int] $MaxAttempts = $VCenterRetryMaxAttempts,
+        [int] $RetryDelaySeconds = $VCenterRetryDelaySeconds
     )
 
     $lastError = $null
@@ -910,8 +982,13 @@ foreach ($vmName in $vmNames) {
     Write-Host "`n--- $vmName ---" -ForegroundColor Cyan
 
     try {
-        # 1. VM exists.
-        $vmMatches = @(Get-VM -Name $vmName -ErrorAction SilentlyContinue)
+        # 1. VM exists. -ErrorAction Stop (not SilentlyContinue) so a transient vCenter connectivity
+        # drop throws here and gets retried, instead of being silently swallowed into a false
+        # "VM not found" - this is exactly what was seen live: once vCenter's API briefly dropped,
+        # Get-VM returned nothing for every VM looked up afterward, not just the one mid-copy.
+        $vmMatches = @(Invoke-WithTransientRetry -OperationName "Get-VM for $vmName" -ScriptBlock {
+            @(Get-VM -Name $vmName -ErrorAction Stop)
+        })
         if ($vmMatches.Count -eq 0) { throw "VM '$vmName' was not found in vCenter." }
         if ($vmMatches.Count -gt 1) { throw "VM name '$vmName' is ambiguous ($($vmMatches.Count) matches) - skipping for safety." }
         $vm = $vmMatches[0]
