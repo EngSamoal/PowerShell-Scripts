@@ -327,6 +327,18 @@ try {
     try { $mp = Get-MpComputerStatus; Add-Row '' INFO 'Microsoft Defender' '' '' "AMRunningMode=$($mp.AMRunningMode); RTP=$($mp.RealTimeProtectionEnabled); Tamper=$($mp.IsTamperProtected)" 'Info' 'Defender policy values only take effect when Defender AV is installed' }
     catch { Add-Row '' INFO 'Microsoft Defender' '' '' 'Get-MpComputerStatus unavailable' 'Info' $_.Exception.Message }
 
+    $lgpo = Join-Path $env:SystemRoot 'System32\GroupPolicy'
+    $acsv = Join-Path $lgpo 'Machine\Microsoft\Windows NT\Audit\audit.csv'
+    if (Test-Path -LiteralPath $acsv) { $al = @(Get-Content -LiteralPath $acsv | Where-Object { $_ -match '\{0cce' }); Add-Row '' LGPO 'Local GPO audit file (audit.csv)' '' '' "present, $($al.Count) subcategories defined" 'Info' 'auditpol changes for subcategories NOT in this file are wiped at policy refresh - set them in gpedit.msc > Advanced Audit Policy Configuration' }
+    else { Add-Row '' LGPO 'Local GPO audit file (audit.csv)' '' '' 'absent' 'Info' '' }
+    Add-Row '' LGPO 'SCENoApplyLegacyAuditPolicy' '' '1' (Show (Get-Reg 'SYSTEM\CurrentControlSet\Control\Lsa' 'SCENoApplyLegacyAuditPolicy')) 'Info' 'Must be 1 or legacy category auditing overrides subcategory settings'
+    $rpol = Join-Path $lgpo 'Machine\Registry.pol'
+    if (Test-Path -LiteralPath $rpol) {
+        $ptxt = [Text.Encoding]::Unicode.GetString([IO.File]::ReadAllBytes($rpol))
+        $hits = @($Spec | Where-Object { $_.T -eq 'Reg' -and $ptxt.IndexOf($_.Name, [StringComparison]::OrdinalIgnoreCase) -ge 0 } | ForEach-Object { "$($_.Ids):$($_.Name)" })
+        Add-Row '' LGPO 'Local GPO Registry.pol' '' '' "present; scripted values also defined in it: $(if ($hits) { $hits -join ', ' } else { 'none' })" 'Info' 'Values listed here are re-applied from the local GPO - change them in gpedit.msc or they revert'
+    } else { Add-Row '' LGPO 'Local GPO Registry.pol' '' '' 'absent' 'Info' '' }
+
     if ($apply -and -not $elevated) { throw 'Guest session is not elevated - no change attempted. Use the built-in Administrator or an account that receives a full token through VMware Tools.' }
 
     $rights = $null; $secpol = $null
@@ -340,6 +352,7 @@ try {
                     $old = Get-Reg $it.Path $it.Name
                     if (Test-Ok $old $it.Ok $it.Value) { Add-Row $it.Ids $it.Grp $item (Show $old) $it.Value (Show $old) 'Already Compliant' ''; break }
                     if ($it.Cond -eq 'DomainOnly' -and $naWg) { Add-Row $it.Ids $it.Grp $item (Show $old) $it.Value '' 'Manual Review' 'Not applicable: WORKGROUP server (domain-scoped control) - not changed; request N/A. Use -IncludeDomainScoped to set it anyway'; break }
+                    if ($it.Cond -eq 'Domain' -and -not $isDomain) { Add-Row $it.Ids $it.Grp $item (Show $old) $it.Value '' 'Manual Review' 'Not applicable: WORKGROUP server - not changed; request N/A'; break }
                     if ($gate -eq 'audit') { Add-Row $it.Ids $it.Grp $item (Show $old) $it.Value '' 'Non-Compliant (AuditOnly)' "$($it.Tier) tier"; break }
                     if ($gate -eq 'tier')  { Add-Row $it.Ids $it.Grp $item (Show $old) $it.Value '' 'Manual Review' "$($it.Tier)-risk item not selected"; break }
                     if ($it.Cond -eq 'Domain' -and -not $isDomain) { Add-Row $it.Ids $it.Grp $item (Show $old) $it.Value '' 'Manual Review' 'Server is not domain-joined: control not meaningful - request exception'; break }
@@ -425,8 +438,8 @@ try {
         $root = $null; $tmp = $false
         try {
             if ($t.Sid -and ($HKU.GetSubKeyNames() -contains $t.Sid)) { $root = $t.Sid }
-            elseif ($gateU -ne 'go') {
-                Add-Row (($uSpec | ForEach-Object { $_.Ids }) -join ',') G23 "HKU profile $($t.Label)" '(hive not loaded)' '1' '' $(if ($gateU -eq 'audit') { 'Non-Compliant (AuditOnly)' } else { 'Manual Review' }) 'Profile hive is only loaded and evaluated with -Apply -IncludeUserProfiles (Qualys reported every profile as not set)'
+            elseif (-not ($gateU -eq 'go' -or ((-not $apply) -and $UserProfiles -eq 1))) {
+                Add-Row (($uSpec | ForEach-Object { $_.Ids }) -join ';') G23 "HKU profile $($t.Label)" '(hive not loaded)' '1' '' 'Manual Review' 'Not evaluated: this user is logged off. Add -IncludeUserProfiles (also works without -Apply) to load the profile and verify it'
                 continue
             }
             else {
