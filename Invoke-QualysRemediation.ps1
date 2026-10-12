@@ -505,7 +505,10 @@ foreach ($name in $VMName) {
         if ($r.ExitCode -ne 0) { Write-Log "[$name] guest exit code $($r.ExitCode): $($r.ScriptOutput)" 'WARN' }
         $localOut = Join-Path $LogDir "result_${name}_$stamp.json"
         Copy-VMGuestFile -VM $vm -Source $guestOut -Destination $localOut -GuestToLocal -GuestCredential $GuestCredential -Force
-        $res = @(Get-Content -LiteralPath $localOut -Raw | ConvertFrom-Json)
+        # Windows PowerShell 5.1 returns the JSON array as ONE object from the pipeline - enumerate it explicitly
+        $parsed = ConvertFrom-Json -InputObject (Get-Content -LiteralPath $localOut -Raw)
+        $res = @($parsed | ForEach-Object { $_ })
+        if ($res.Count -eq 0) { throw "Guest returned no result rows ($localOut)." }
         foreach ($x in $res) {
             $x | Add-Member -NotePropertyName VM -NotePropertyValue $name -Force
             $all.Add($x)
