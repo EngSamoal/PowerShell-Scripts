@@ -280,6 +280,68 @@ function Get-AuditFlags($Guid) {
     return ($line -split ',')[4]
 }
 
+#LGPO-BEGIN
+# Local GPO helpers: a server that already has a local GPO re-applies its own values at policy refresh,
+# so the same change must also be written into Registry.pol / audit.csv or it reverts after reboot.
+function Read-PolEntries([byte[]]$b) {
+    $list = New-Object System.Collections.Generic.List[object]
+    if ($b.Length -lt 8 -or [Text.Encoding]::ASCII.GetString($b, 0, 4) -ne 'PReg') { throw 'Registry.pol: unexpected header' }
+    $u = [Text.Encoding]::Unicode; $i = 8
+    while ($i -lt $b.Length - 1) {
+        if ($b[$i] -ne 0x5B -or $b[$i + 1] -ne 0) { throw "Registry.pol: unexpected byte at offset $i" }
+        $i += 2
+        $s = $i; while (-not ($b[$i] -eq 0 -and $b[$i + 1] -eq 0)) { $i += 2 }
+        $key = $u.GetString($b, $s, $i - $s); $i += 2
+        if ($b[$i] -ne 0x3B) { throw "Registry.pol: separator expected at offset $i" }; $i += 2
+        $s = $i; while (-not ($b[$i] -eq 0 -and $b[$i + 1] -eq 0)) { $i += 2 }
+        $val = $u.GetString($b, $s, $i - $s); $i += 2
+        if ($b[$i] -ne 0x3B) { throw "Registry.pol: separator expected at offset $i" }; $i += 2
+        $type = [BitConverter]::ToInt32($b, $i); $i += 4
+        if ($b[$i] -ne 0x3B) { throw "Registry.pol: separator expected at offset $i" }; $i += 2
+        $size = [BitConverter]::ToInt32($b, $i); $i += 4
+        if ($b[$i] -ne 0x3B) { throw "Registry.pol: separator expected at offset $i" }; $i += 2
+        $list.Add([pscustomobject]@{ Key = $key; Value = $val; Type = $type; Size = $size; DataOffset = $i })
+        $i += $size
+        if ($b[$i] -ne 0x5D) { throw "Registry.pol: entry end expected at offset $i" }; $i += 2
+    }
+    return , $list
+}
+function Find-PolDword([byte[]]$b, $entries, [string]$Key, [string]$Value) {
+    foreach ($e in $entries) {
+        if ([string]::Equals($e.Key, $Key, [StringComparison]::OrdinalIgnoreCase) -and [string]::Equals($e.Value, $Value, [StringComparison]::OrdinalIgnoreCase)) {
+            if ($e.Type -eq 4 -and $e.Size -eq 4) { return [pscustomobject]@{ Offset = $e.DataOffset; Data = [BitConverter]::ToInt32($b, $e.DataOffset) } }
+            return [pscustomobject]@{ Offset = -1; Data = $null }
+        }
+    }
+    return $null
+}
+function Update-AuditCsv([string]$Path, [string]$Guid, [string]$Name, [int]$NeedMask) {
+    $raw = [IO.File]::ReadAllBytes($Path)
+    $enc = [Text.Encoding]::Default
+    if ($raw.Length -ge 2 -and $raw[0] -eq 0xFF -and $raw[1] -eq 0xFE) { $enc = [Text.Encoding]::Unicode }
+    elseif ($raw.Length -ge 3 -and $raw[0] -eq 0xEF -and $raw[1] -eq 0xBB -and $raw[2] -eq 0xBF) { $enc = New-Object Text.UTF8Encoding($true) }
+    $lines = New-Object System.Collections.Generic.List[string]
+    foreach ($l in [IO.File]::ReadAllLines($Path, $enc)) { $lines.Add($l) }
+    $txt = @{ 1 = 'Success'; 2 = 'Failure'; 3 = 'Success and Failure' }
+    $idx = -1
+    for ($n = 0; $n -lt $lines.Count; $n++) { if ($lines[$n].IndexOf($Guid, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $idx = $n; break } }
+    $old = 0
+    if ($idx -ge 0) {
+        $p = $lines[$idx] -split ','
+        if ($p.Count -ne 7) { throw "audit.csv: unexpected line format: $($lines[$idx])" }
+        [void][int]::TryParse($p[6], [ref]$old)
+        $new = $old -bor $NeedMask
+        if ($new -eq $old) { return [pscustomobject]@{ Old = $old; New = $new; Changed = $false } }
+        $p[4] = $txt[$new]; $p[6] = "$new"; $lines[$idx] = $p -join ','
+    } else {
+        $new = $NeedMask
+        $lines.Add(",System,Audit $Name,$($Guid.ToLower()),$($txt[$new]),,$new")
+    }
+    [IO.File]::WriteAllLines($Path, $lines.ToArray(), $enc)
+    return [pscustomobject]@{ Old = $old; New = $new; Changed = $true }
+}
+#LGPO-END
+
 $elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 $cs = Get-CimInstance Win32_ComputerSystem
 $os = Get-CimInstance Win32_OperatingSystem
@@ -334,8 +396,8 @@ try {
     Add-Row '' LGPO 'SCENoApplyLegacyAuditPolicy' '' '1' (Show (Get-Reg 'SYSTEM\CurrentControlSet\Control\Lsa' 'SCENoApplyLegacyAuditPolicy')) 'Info' 'Must be 1 or legacy category auditing overrides subcategory settings'
     $rpol = Join-Path $lgpo 'Machine\Registry.pol'
     if (Test-Path -LiteralPath $rpol) {
-        $ptxt = [Text.Encoding]::Unicode.GetString([IO.File]::ReadAllBytes($rpol))
-        $hits = @($Spec | Where-Object { $_.T -eq 'Reg' -and $ptxt.IndexOf($_.Name, [StringComparison]::OrdinalIgnoreCase) -ge 0 } | ForEach-Object { "$($_.Ids):$($_.Name)" })
+        $dpb = [IO.File]::ReadAllBytes($rpol); $dpe = Read-PolEntries $dpb
+        $hits = @(foreach ($sx in ($Spec | Where-Object { $_.T -eq 'Reg' })) { $hx = Find-PolDword $dpb $dpe $sx.Path $sx.Name; if ($null -ne $hx) { "$($sx.Ids):$($sx.Name)=$($hx.Data)" } })
         Add-Row '' LGPO 'Local GPO Registry.pol' '' '' "present; scripted values also defined in it: $(if ($hits) { $hits -join ', ' } else { 'none' })" 'Info' 'Values listed here are re-applied from the local GPO - change them in gpedit.msc or they revert'
     } else { Add-Row '' LGPO 'Local GPO Registry.pol' '' '' 'absent' 'Info' '' }
 
@@ -421,6 +483,60 @@ try {
             }
         } catch { Add-Row $it.Ids $it.Grp "$($it.T): $($it.Name)$($it.Key)$($it.Right)" '' '' '' 'Failed' $_.Exception.Message }
     }
+
+    # ---- local GPO sync: keep Registry.pol / audit.csv in line so the fixes survive policy refresh ----
+    $gpChanged = $false; $recheck = New-Object System.Collections.Generic.List[object]
+    $inScope = { param($it) -not (($it.Cond -eq 'DomainOnly' -and $naWg) -or ($it.Cond -eq 'Domain' -and -not $isDomain) -or ($it.Cond -like 'Rdp:*')) }
+    try {
+        if (Test-Path -LiteralPath $rpol) {
+            $pb = [IO.File]::ReadAllBytes($rpol); $pe = Read-PolEntries $pb; $polDirty = $false
+            foreach ($it in ($Spec | Where-Object { $_.T -eq 'Reg' -and $_.Kind -eq 'DWord' })) {
+                if (-not (& $inScope $it)) { continue }
+                $hit = Find-PolDword $pb $pe $it.Path $it.Name
+                if ($null -eq $hit) { continue }
+                $item = "Local GPO Registry.pol: $($it.Path)\$($it.Name)"
+                if ($hit.Offset -lt 0) { Add-Row $it.Ids LGPO $item '(non-DWORD entry)' $it.Value '' 'Manual Review' 'Defined in the local GPO with another type - set it in gpedit.msc'; continue }
+                if (Test-Ok $hit.Data $it.Ok $it.Value) { continue }
+                $gate = Get-Gate $it.Tier
+                if ($gate -eq 'audit') { Add-Row $it.Ids LGPO $item $hit.Data $it.Value '' 'Non-Compliant (AuditOnly)' 'The local GPO holds the old value: a registry-only fix reverts at policy refresh / reboot'; continue }
+                if ($gate -eq 'tier')  { Add-Row $it.Ids LGPO $item $hit.Data $it.Value '' 'Manual Review' "$($it.Tier)-risk item not selected"; continue }
+                [Array]::Copy([BitConverter]::GetBytes([int]$it.Value), 0, $pb, $hit.Offset, 4); $polDirty = $true
+                $recheck.Add(@{ It = $it; Item = $item; Old = $hit.Data })
+            }
+            if ($polDirty) {
+                Copy-Item -LiteralPath $rpol -Destination "$rpol.qrem_$(Get-Date -Format yyyyMMddHHmmss).bak" -Force
+                [IO.File]::WriteAllBytes($rpol, $pb); $gpChanged = $true
+            }
+        }
+        if ((Test-Path -LiteralPath $acsv) -and $elevated) {
+            $csvBackedUp = $false
+            foreach ($it in ($Spec | Where-Object { $_.T -eq 'Audit' })) {
+                if (-not (& $inScope $it)) { continue }
+                $mask = 0; if ($it.Need -match 'S') { $mask = $mask -bor 1 }; if ($it.Need -match 'F') { $mask = $mask -bor 2 }
+                $line = @(Get-Content -LiteralPath $acsv | Where-Object { $_.IndexOf($it.Guid, [StringComparison]::OrdinalIgnoreCase) -ge 0 })[0]
+                $cur = 0; if ($line) { [void][int]::TryParse(($line -split ',')[-1], [ref]$cur) }
+                if (($cur -band $mask) -eq $mask) { continue }
+                $item = "Local GPO audit.csv: $($it.Name)"
+                $gate = Get-Gate $it.Tier
+                if ($gate -eq 'audit') { Add-Row $it.Ids LGPO $item $cur $mask '' 'Non-Compliant (AuditOnly)' 'Not defined in the local GPO audit file: an auditpol-only fix is wiped at policy refresh / reboot'; continue }
+                if ($gate -eq 'tier')  { Add-Row $it.Ids LGPO $item $cur $mask '' 'Manual Review' 'Tier not selected'; continue }
+                if (-not $csvBackedUp) { Copy-Item -LiteralPath $acsv -Destination "$acsv.qrem_$(Get-Date -Format yyyyMMddHHmmss).bak" -Force; $csvBackedUp = $true }
+                $r = Update-AuditCsv $acsv $it.Guid $it.Name $mask
+                if ($r.Changed) { $gpChanged = $true; $recheck.Add(@{ It = $it; Item = $item; Old = $r.Old }) }
+            }
+        }
+        if ($gpChanged) {
+            $o = & gpupdate.exe /target:computer /force
+            $gpExit = $LASTEXITCODE
+            Add-Row '' LGPO 'gpupdate /target:computer /force' '' 'exit 0' "exit $gpExit" $(if ($gpExit -eq 0) { 'Info' } else { 'Failed' }) (($o | Where-Object { $_ }) -join ' ')
+            foreach ($rc in $recheck) {
+                $it = $rc.It
+                if ($it.T -eq 'Reg') { $now = Get-Reg $it.Path $it.Name; $ok = Test-Ok $now $it.Ok $it.Value; $exp = $it.Value }
+                else { $now = Get-AuditFlags $it.Guid; $ok = ((-not ($it.Need -match 'S')) -or ($now -match 'Success')) -and ((-not ($it.Need -match 'F')) -or ($now -match 'Failure')); $exp = $it.Need }
+                Add-Row $it.Ids LGPO $rc.Item $rc.Old $exp $now $(if ($ok) { 'Remediated' } else { 'Failed' }) 'Written to the local GPO (backup *.qrem_*.bak next to the file) and confirmed after gpupdate'
+            }
+        }
+    } catch { Add-Row '' LGPO 'Local GPO sync' '' '' '' 'Failed' $_.Exception.Message }
 
     # ---- per-user policy values (HKU) ----
     $uSpec = @($Spec | Where-Object { $_.T -eq 'User' })
