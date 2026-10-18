@@ -103,7 +103,7 @@ param(
     [switch]$OpenWhenDone
 )
 
-$ScriptBuild = '2026.10.18-r6'
+$ScriptBuild = '2026.10.18-r7'
 $SheetName = 'Wkly_Report'          # fixed by design - no other worksheet is ever read
 $Inv = [System.Globalization.CultureInfo]::InvariantCulture
 $ErrRegex = '#(DIV/0!|N/A|VALUE!|REF!|NAME\?|NUM!|NULL!|SPILL!|CALC!|FIELD!|BLOCKED!|CONNECT!|BUSY!|UNKNOWN!|GETTING_DATA)'
@@ -944,6 +944,7 @@ function Repair-InvisibleText {
 function Find-OverlappingText {
     param($Items)
     $texts = @($Items | Where-Object { $_.Kind -eq 'shape' -and $_.Runs -and (($_.Runs | ForEach-Object { $_.Text }) -join '') -match '\S' })
+    $overlaps = 0
     for ($i = 0; $i -lt $texts.Count; $i++) {
         for ($j = $i + 1; $j -lt $texts.Count; $j++) {
             $a = $texts[$i]; $b = $texts[$j]
@@ -952,9 +953,11 @@ function Find-OverlappingText {
             if ($ox -le 0 -or $oy -le 0) { continue }
             $small = [math]::Min($a.W * $a.H, $b.W * $b.H)
             if ($small -le 0 -or ($ox * $oy) / $small -lt 0.2) { continue }
-            Add-Issue -Severity Info -Location ("Text boxes '{0}' / '{1}'" -f $a.Name, $b.Name) -Message 'These text boxes overlap in Excel. If their text collides in the dashboard, turn on Inspect, click each one and send a photo of the panel.' -Y ([math]::Min($a.T, $b.T))
+            $script:Issues.Add([pscustomobject]@{ Severity = 'Info'; Location = ("Text boxes '{0}' / '{1}'" -f $a.Name, $b.Name); Message = 'These text boxes overlap in Excel. If their text collides in the dashboard, turn on Inspect, click each one and send a photo of the panel.'; Y = [math]::Min($a.T, $b.T); Page = $null })
+            $overlaps++
         }
     }
+    if ($overlaps) { Write-Log ("{0} pairs of overlapping text boxes found (listed in Data check)." -f $overlaps) }
 }
 
 function Get-TitleCandidates {
@@ -1149,22 +1152,37 @@ function ConvertTo-RunStyle {
 
 function Get-InspectText {
     # Everything Excel reported for a text box, shown by the dashboard's Inspect mode.
+    # Written with plain string concatenation only (Windows PowerShell 5.1 safe).
     param($It)
-    $lines = New-Object System.Collections.Generic.List[string]
-    $lines.Add(('{0} | at {1},{2} pt | size {3} x {4} pt | fill {5} | outline {6} | shape type {7}' -f $It.Name, [int]$It.L, [int]$It.T, [int]$It.W, [int]$It.H, $(if ($It.Bg) { $It.Bg } else { 'none' }), $(if ($It.Border) { $It.Border } else { 'none' }), $It.ShapeType))
+    $nl = [string][char]10
+    $fill = 'none'; if ($It.Bg) { $fill = [string]$It.Bg }
+    $outline = 'none'; if ($It.Border) { $outline = [string]$It.Border }
+    $out = [string]$It.Name + ' | at ' + [string][int]$It.L + ',' + [string][int]$It.T + ' pt | size ' + [string][int]$It.W + ' x ' + [string][int]$It.H + ' pt | fill ' + $fill + ' | outline ' + $outline + ' | shape type ' + [string]$It.ShapeType
     if ($It.Runs) {
-        $m = $It.Margins
-        $lines.Add(('text anchor {0} | margins L{1} T{2} R{3} B{4} | wrap {5} | autosize {6} | link {7}' -f $It.Anchor, $m[0], $m[1], $m[2], $m[3], $It.Wrap, $It.AutoSize, $(if ($It.Formula) { $It.Formula } else { 'none' })))
+        $m = @($It.Margins)
+        $margins = ''
+        if ($m.Count -ge 4) { $margins = 'L' + [string]$m[0] + ' T' + [string]$m[1] + ' R' + [string]$m[2] + ' B' + [string]$m[3] }
+        $link = 'none'; if ($It.Formula) { $link = [string]$It.Formula }
+        $out += $nl + 'text anchor ' + [string]$It.Anchor + ' | margins ' + $margins + ' | wrap ' + [string]$It.Wrap + ' | autosize ' + [string]$It.AutoSize + ' | link ' + $link
         $k = 0
-        foreach ($pp in @($It.Paras)) { if ($pp) { $k++; $lines.Add(('paragraph {0}: align {1}, before {2}pt, after {3}pt, line {4}' -f $k, $pp.Align, (Format-Num $pp.Before), (Format-Num $pp.After), $pp.LineHeight)) } }
-        foreach ($r in $It.Runs) {
-            $t = ([string]$r.Text) -replace "`r", '[para]' -replace "`v", '[line]' -replace "`n", '[line]'
+        foreach ($pp in @($It.Paras)) {
+            if ($null -eq $pp) { continue }
+            $k = $k + 1
+            $out += $nl + 'paragraph ' + [string]$k + ': align ' + [string]$pp.Align + ', before ' + (Format-Num $pp.Before) + 'pt, after ' + (Format-Num $pp.After) + 'pt, line ' + [string]$pp.LineHeight
+        }
+        foreach ($r in @($It.Runs)) {
+            $t = [string]$r.Text
+            $t = $t.Replace([string][char]13, '[para]').Replace([string][char]11, '[line]').Replace([string][char]10, '[line]')
             if ($t.Length -gt 60) { $t = $t.Substring(0, 57) + '...' }
-            $adj = if ($r.ColorAdjustedFrom) { ' (Excel colour {0}, adjusted to be readable)' -f $r.ColorAdjustedFrom } else { '' }
-            $lines.Add(('"{0}" | {1} {2}pt{3}{4} | colour {5}{6} | {7}' -f $t, $r.Font, $r.Size, $(if ($r.Bold) { ' bold' } else { '' }), $(if ($r.Italic) { ' italic' } else { '' }), $r.Color, $adj, $r.ColorInfo))
+            $style = [string]$r.Font + ' ' + [string]$r.Size + 'pt'
+            if ($r.Bold) { $style += ' bold' }
+            if ($r.Italic) { $style += ' italic' }
+            $colour = [string]$r.Color
+            if ($r.ColorAdjustedFrom) { $colour += ' (Excel colour ' + [string]$r.ColorAdjustedFrom + ', adjusted to be readable)' }
+            $out += $nl + '"' + $t + '" | ' + $style + ' | colour ' + $colour + ' | ' + [string]$r.ColorInfo
         }
     }
-    return ($lines -join "`n")
+    return $out
 }
 
 function ConvertTo-ItemHtml {
@@ -1233,7 +1251,10 @@ function ConvertTo-ItemHtml {
                 $inner = '<div class="tx" style="{0}">{1}</div>' -f $tx, $sb.ToString()
             }
             $cls = if ($It.Wrap) { 'it shp' } else { 'it shp nowrap' }
-            return '<div class="{0}" data-i="{1}" style="{2}">{3}</div>' -f $cls, (([System.Net.WebUtility]::HtmlEncode((Get-InspectText $It))) -replace "`n", '&#10;'), $st, $inner
+            $inspect = ''
+            try { $inspect = ([System.Net.WebUtility]::HtmlEncode([string](Get-InspectText $It))).Replace([string][char]10, '&#10;') }
+            catch { $inspect = [System.Net.WebUtility]::HtmlEncode([string]$It.Name) + ' (details unavailable: ' + [System.Net.WebUtility]::HtmlEncode($_.Exception.Message) + ')' }
+            return '<div class="{0}" data-i="{1}" style="{2}">{3}</div>' -f $cls, $inspect, $st, $inner
         }
         'line' {
             $w = [math]::Max($It.W, 0.01); $h = [math]::Max($It.H, 0.01)
@@ -1314,7 +1335,15 @@ function New-DashboardSite {
         & $add ('<span class="pnum">{0} / {1}</span></div></div>' -f $p.Index, $n)
         & $add ('<div class="pbody"><div class="cvwrap" style="--w:{0}pt;--h:{1}pt;--pz:{2}">' -f (Format-Num $wPt), (Format-Num $hPt), (Format-Num $pz))
         & $add ('<div class="cv" data-w="{0}" data-h="{1}" style="width:{2}pt;height:{3}pt">' -f (Format-Num ($wPt * $pt2px)), (Format-Num ($hPt * $pt2px)), (Format-Num $wPt), (Format-Num $hPt))
-        foreach ($it in $p.Items) { & $add (ConvertTo-ItemHtml $it $p.OffsetX $p.StartY); & $add "`n" }
+        foreach ($it in $p.Items) {
+            $html = $null
+            try { $html = ConvertTo-ItemHtml $it $p.OffsetX $p.StartY }
+            catch {
+                $what = [string]$it.Name; if (-not $what) { $what = [string]$it.Address }
+                Add-Issue -Severity Warning -Location ("{0} '{1}'" -f $it.Kind, $what) -Message ("Could not be drawn and was skipped: {0}" -f (Format-ErrorDetail $_))
+            }
+            if ($html) { & $add $html; & $add "`n" }
+        }
         & $add '</div></div><div class="xlview"><iframe title="Excel rendering of this page"></iframe></div></div>'
         & $add ('<div class="pf"><span>{0}</span><span>Wkly_Report &middot; page {1} of {2} &middot; rows {3}&ndash;{4}</span><span class="c">{5}</span></div></section>' -f (& $enc $DashboardTitle), $p.Index, $n, $p.StartRow, $p.EndRow, (& $enc $Classification))
         & $add "`n"
