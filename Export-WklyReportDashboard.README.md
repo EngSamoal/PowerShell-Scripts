@@ -64,6 +64,8 @@ Output folder contents: `index.html`, `assets\` (charts, pictures, CSS/JS, `exce
 
 ## 4. Using the dashboard
 
+- **☰ (top left)**: hide/show the page list so every page uses the whole window width (remembered).
+  Each page is cropped to its own content and scaled to the window, so all pages line up.
 - **Sidebar**: one entry per detected page. ⚠ shows how many values on that page need checking.
 - **Data check**: source file, SHA-256 before/after (proves the file was not changed), the
   page-detection method, and every Excel error, empty formula result, `####` cell and object
@@ -97,7 +99,7 @@ Output folder contents: `index.html`, `assets\` (charts, pictures, CSS/JS, `exce
 | `Worksheet 'Wkly_Report' was not found` | The tab was renamed; the error lists the tabs in the file. |
 | `Could not copy the workbook` | Another program locks the file exclusively; close it or wait for sync (OneDrive). |
 | Wrong number of pages / a page split in two | Titles in this week's file are smaller or larger than usual. Try `-TitleMinFontSize 18` or `-MinPageHeightPt 350`, or use `-PageMode Manual -PageStartRows 1,40,...`. The method used is shown in Data check. |
-| A chart shows a red "could not be exported" box | Excel failed to export that chart; it is listed in Data check and visible in Excel view. Re-run; if it persists, send `extraction-log.txt`. |
+| A chart shows a red "could not be exported" box | The script tries three export methods (direct, after activating the chart, and with the private Excel window moved off-screen). If all fail, Excel's own error text is shown in Data check and the log; send `extraction-log.txt`. |
 | "Exported chart image is very small and may be blank" | Compare that chart with Excel view; send the log if it really is blank. |
 | A cell shows `####` | The column is too narrow in Excel itself; widen it in the workbook. |
 | A shape looks rectangular but is a different shape in Excel | Uncommon outlines are drawn as rectangles (text and colours kept); listed under *Info*. |
