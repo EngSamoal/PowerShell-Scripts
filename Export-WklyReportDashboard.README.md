@@ -64,8 +64,8 @@ Output folder contents: `index.html`, `assets\` (charts, pictures, CSS/JS, `exce
 
 ## 4. Using the dashboard
 
-- **☰ (top left)**: hide/show the page list so every page uses the whole window width (remembered).
-  Each page is cropped to its own content and scaled to the window, so all pages line up.
+- **☰ (top left)**: opens the page list as a pop-out; pages always use the whole window width.
+- **− / + / Fit** (or keys `-` `+`): zoom the pages; all pages share one scale and left edge so they line up.
 - **Sidebar**: one entry per detected page. ⚠ shows how many values on that page need checking.
 - **Data check**: source file, SHA-256 before/after (proves the file was not changed), the
   page-detection method, and every Excel error, empty formula result, `####` cell and object
