@@ -103,7 +103,7 @@ param(
     [switch]$OpenWhenDone
 )
 
-$ScriptBuild = '2026.10.18-r1'
+$ScriptBuild = '2026.10.18-r2'
 $SheetName = 'Wkly_Report'          # fixed by design - no other worksheet is ever read
 $Inv = [System.Globalization.CultureInfo]::InvariantCulture
 $ErrRegex = '#(DIV/0!|N/A|VALUE!|REF!|NAME\?|NUM!|NULL!|SPILL!|CALC!|FIELD!|BLOCKED!|CONNECT!|BUSY!|UNKNOWN!|GETTING_DATA)'
@@ -113,6 +113,10 @@ $script:LogLines = New-Object System.Collections.Generic.List[string]
 $script:Issues = New-Object System.Collections.Generic.List[object]
 $script:ChartIndex = 0
 $script:LoggedShapeTypes = @{}
+$script:XlApp = $null
+$script:XlSheet = $null
+$script:ChartMode = $null
+$script:XlMadeVisible = $false
 
 # ======================================================================================
 #  Small helpers
@@ -419,7 +423,7 @@ function Read-CellItems {
                 elseif ($v -is [bool] -or $v -is [int]) { 'center' }
                 else { 'left' }
                 $va = [int]$df.VerticalAlignment
-                $valign = if ($vAlign.ContainsKey($va)) { $vAlign[$va] } else { 'bottom' }
+                $vAlignName = if ($vAlign.ContainsKey($va)) { $vAlign[$va] } else { 'bottom' }
 
                 $bg = $null
                 $interior = $df.Interior
@@ -429,10 +433,10 @@ function Read-CellItems {
                 foreach ($edge in @(@(7, 'left'), @(8, 'top'), @(9, 'bottom'), @(10, 'right'))) {
                     $b = $df.Borders.Item($edge[0])
                     if ([int]$b.LineStyle -ne -4142) {
-                        $w = if ($weights.ContainsKey([int]$b.Weight)) { $weights[[int]$b.Weight] } else { 1 }
+                        $bw = if ($weights.ContainsKey([int]$b.Weight)) { $weights[[int]$b.Weight] } else { 1 }
                         $bc = ConvertTo-CssColor $b.Color
                         if (-not $bc) { $bc = '#000' }
-                        $borders.Add(('border-{0}:{1}pt solid {2}' -f $edge[1], (Format-Num $w), $bc))
+                        $borders.Add(('border-{0}:{1}pt solid {2}' -f $edge[1], (Format-Num $bw), $bc))
                     }
                 }
                 $orient = 0
@@ -445,7 +449,7 @@ function Read-CellItems {
                         Bold      = (Test-MsoTrue $font.Bold); Italic = (Test-MsoTrue $font.Italic)
                         Underline = ([int]$font.Underline -ne -4142)
                         Color     = (ConvertTo-CssColor $font.Color)
-                        Align     = $align; VAlign = $valign; Wrap = (Test-MsoTrue $df.WrapText)
+                        Align     = $align; VAlign = $vAlignName; Wrap = (Test-MsoTrue $df.WrapText)
                         Indent    = [int]$df.IndentLevel; Orientation = $orient
                         Bg        = $bg; Borders = ($borders -join ';')
                     })
@@ -536,6 +540,40 @@ function Read-ShapeText {
     return [pscustomobject]@{ Runs = $runs; Aligns = $aligns; Anchor = $anchor; Margins = $m; Wrap = $wrap; Orientation = $orient }
 }
 
+function Export-ChartImage {
+    # Returns $null on success, otherwise the error text of every method tried.
+    # Some Excel builds only render a chart for export once its sheet/chart is active, or only
+    # while the application window exists, so these are tried in turn on the hidden temp copy
+    # (nothing is saved). The first method that works is reused for the remaining charts.
+    param($Shape, [string]$Path)
+    $errors = New-Object System.Collections.Generic.List[string]
+    $methods = @('direct', 'activate', 'offscreen-window')
+    if ($script:ChartMode) { $methods = @($script:ChartMode) + @($methods | Where-Object { $_ -ne $script:ChartMode }) }
+    foreach ($method in $methods) {
+        try {
+            if ($method -eq 'offscreen-window' -and -not $script:XlMadeVisible) {
+                $script:XlApp.Visible = $true
+                try { $script:XlApp.WindowState = -4143; $script:XlApp.Left = -30000; $script:XlApp.Top = -30000 } catch { }
+                $script:XlMadeVisible = $true
+                Write-Log 'Charts only export with a visible Excel window on this PC; the private Excel window (temp copy) was moved off-screen.' 'WARN'
+            }
+            if ($method -ne 'direct') {
+                $script:XlSheet.Activate()
+                try { $Shape.Chart.Parent.Activate() } catch { }
+            }
+            if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Force }
+            $ret = $Shape.Chart.Export($Path, 'PNG', $false)
+            if ((Test-Path -LiteralPath $Path) -and (Get-Item -LiteralPath $Path).Length -gt 0) {
+                if ($script:ChartMode -ne $method) { $script:ChartMode = $method; Write-Log "Chart export method in use: $method" }
+                return $null
+            }
+            $errors.Add(('{0}: Export returned {1} but wrote no file' -f $method, $ret))
+        }
+        catch { $errors.Add(('{0}: {1}' -f $method, $_.Exception.Message)) }
+    }
+    return ($errors -join ' | ')
+}
+
 function Read-OneShape {
     param($Shape, [double]$Z, $Items, [string]$AssetsDir, [hashtable]$MediaMap)
     $name = '(unnamed)'
@@ -560,8 +598,8 @@ function Read-OneShape {
             $full = Join-Path $AssetsDir $file
             $title = $name
             try { if (Test-MsoTrue $Shape.Chart.HasTitle) { $title = [string]$Shape.Chart.ChartTitle.Text } } catch { }
-            try { [void]$Shape.Chart.Export($full, 'PNG', $false) } catch { }
-            if ((Test-Path -LiteralPath $full) -and (Get-Item -LiteralPath $full).Length -gt 0) {
+            $exportError = Export-ChartImage -Shape $Shape -Path $full
+            if (-not $exportError) {
                 $Items.Add([pscustomobject]@{ Kind = 'image'; L = $L; T = $T; W = $W; H = $H; Z = $Z; Rot = $rot; Src = "assets/$file"; Alt = $title; IsChart = $true })
                 if ((Get-Item -LiteralPath $full).Length -lt 1500) {
                     Add-Issue -Severity Warning -Location "Chart '$name'" -Message 'Exported chart image is very small and may be blank - compare with Excel view.' -Y $T
@@ -569,7 +607,7 @@ function Read-OneShape {
             }
             else {
                 $Items.Add([pscustomobject]@{ Kind = 'missing'; L = $L; T = $T; W = $W; H = $H; Z = $Z; Rot = $rot; Message = "Chart '$title' could not be exported - see Excel view" })
-                Add-Issue -Severity Error -Location "Chart '$name'" -Message 'Excel could not export this chart as an image. A labelled placeholder is shown instead; see Excel view.' -Y $T
+                Add-Issue -Severity Error -Location "Chart '$name'" -Message ("Excel could not export this chart as an image [{0}]. A labelled placeholder is shown instead; see Excel view." -f $exportError) -Y $T
             }
             return
         }
@@ -793,12 +831,18 @@ function Find-ReportPages {
         $pageItems = @($Items | Where-Object { $_.T -lt $ey - 1 -and ($_.T + [math]::Max($_.H, 0.5)) -gt $sy + 1 } | Sort-Object Z)
         $content = @($pageItems | Where-Object { $_.Kind -in 'cell', 'shape', 'image', 'missing' })
         if ($content.Count -eq 0) { continue }
+        # crop the page to its own content: left edge includes coloured side bars, right edge the content
+        $minL = $ContentWidth; $maxR = 0
+        foreach ($it in $content) { if ($it.L -lt $minL) { $minL = $it.L }; if ($it.L + $it.W -gt $maxR) { $maxR = $it.L + $it.W } }
+        foreach ($it in $pageItems) { if ($it.Kind -eq 'fill' -and $it.L -lt $minL -and $it.L + $it.W -gt $minL - 40) { $minL = $it.L } }
+        $minL = [math]::Max(0, $minL - 4); $maxR = [math]::Min($ContentWidth, $maxR + 4)
+        if ($maxR - $minL -lt 50) { $minL = 0; $maxR = $ContentWidth }
         $idx = $pages.Count + 1
         $title = $sorted[$i].Title
         if (-not $title) { $title = Get-PageTitle -Items $content -StartY $sy -EndY $ey -Index $idx }
         if ($title.Length -gt 80) { $title = $title.Substring(0, 77) + '...' }
         $pages.Add([pscustomobject]@{
-                Index    = $idx; StartY = $sy; EndY = $ey; Title = $title
+                Index    = $idx; StartY = $sy; EndY = $ey; Title = $title; OffsetX = $minL; Width = $maxR - $minL
                 StartRow = (Get-RowAtY $Geo.RowTops $Geo.LastRow $sy)
                 EndRow   = (Get-RowAtY $Geo.RowTops $Geo.LastRow ($ey - 0.5))
                 Items    = $pageItems; ExcelView = $null; IssueCount = 0
@@ -835,8 +879,8 @@ function Find-LabelValue {
 # ======================================================================================
 
 function Get-BoxStyle {
-    param($It, [double]$OffsetY)
-    $s = 'left:{0}pt;top:{1}pt;width:{2}pt;height:{3}pt' -f (Format-Num $It.L), (Format-Num ($It.T - $OffsetY)), (Format-Num ([math]::Max($It.W, 0))), (Format-Num ([math]::Max($It.H, 0)))
+    param($It, [double]$OffsetX, [double]$OffsetY)
+    $s = 'left:{0}pt;top:{1}pt;width:{2}pt;height:{3}pt' -f (Format-Num ($It.L - $OffsetX)), (Format-Num ($It.T - $OffsetY)), (Format-Num ([math]::Max($It.W, 0))), (Format-Num ([math]::Max($It.H, 0)))
     if ($It.Rot -and [math]::Abs([double]$It.Rot) -gt 0.01) { $s += ';transform:rotate({0}deg)' -f (Format-Num $It.Rot) }
     return $s
 }
@@ -854,8 +898,8 @@ function ConvertTo-RunStyle {
 }
 
 function ConvertTo-ItemHtml {
-    param($It, [double]$OffsetY)
-    $box = Get-BoxStyle $It $OffsetY
+    param($It, [double]$OffsetX, [double]$OffsetY)
+    $box = Get-BoxStyle $It $OffsetX $OffsetY
     switch ($It.Kind) {
         'fill' { return '<div class="it" style="{0};background:{1}"></div>' -f $box, $It.Bg }
         'blank' { return '<div class="it blankcell" title="Wkly_Report!{0} - formula returns an empty value (shown as blank, not zero)"></div>' -f $It.Address }
@@ -913,7 +957,7 @@ function ConvertTo-ItemHtml {
             $w = [math]::Max($It.W, 0.01); $h = [math]::Max($It.H, 0.01)
             $x1 = if ($It.FlipH) { $w } else { 0 }; $x2 = $w - $x1
             $y1 = if ($It.FlipV) { $h } else { 0 }; $y2 = $h - $y1
-            $st = 'left:{0}pt;top:{1}pt;width:{2}pt;height:{3}pt;overflow:visible' -f (Format-Num $It.L), (Format-Num ($It.T - $OffsetY)), (Format-Num $w), (Format-Num $h)
+            $st = 'left:{0}pt;top:{1}pt;width:{2}pt;height:{3}pt;overflow:visible' -f (Format-Num ($It.L - $OffsetX)), (Format-Num ($It.T - $OffsetY)), (Format-Num $w), (Format-Num $h)
             if ($It.Rot -and [math]::Abs([double]$It.Rot) -gt 0.01) { $st += ';transform:rotate({0}deg)' -f (Format-Num $It.Rot) }
             return '<svg class="it" style="{0}" viewBox="0 0 {1} {2}" preserveAspectRatio="none"><line x1="{3}" y1="{4}" x2="{5}" y2="{6}" stroke="{7}" stroke-width="{8}"/></svg>' -f $st, (Format-Num $w), (Format-Num $h), (Format-Num $x1), (Format-Num $y1), (Format-Num $x2), (Format-Num $y2), $It.Color, (Format-Num $It.Weight)
         }
@@ -927,7 +971,7 @@ function ConvertTo-ItemHtml {
 }
 
 function New-DashboardSite {
-    param($Pages, [string]$OutDir, $Meta, $Issues, [double]$ContentWidth)
+    param($Pages, [string]$OutDir, $Meta, $Issues)
 
     $assets = Join-Path $OutDir 'assets'
     [System.IO.File]::WriteAllText((Join-Path $assets 'dashboard.css'), $DashboardCss, (New-Object System.Text.UTF8Encoding($false)))
@@ -951,7 +995,7 @@ function New-DashboardSite {
     & $add "`n<link rel=`"stylesheet`" href=`"assets/dashboard.css`">`n</head>`n<body>`n"
 
     # ---- top bar
-    & $add '<header class="topbar"><div class="brand"><div class="mark">ITSM</div>EXECUTIVE DASHBOARD</div>'
+    & $add '<header class="topbar"><button class="btn menu" id="btnMenu" title="Show/hide the page list">&#9776;</button><div class="brand"><div class="mark">ITSM</div>EXECUTIVE DASHBOARD</div>'
     & $add ('<div class="tb-title"><b>{0}</b><span>Source: {1} &middot; Wkly_Report (read-only snapshot)</span></div>' -f (& $enc $DashboardTitle), (& $enc $Meta.FileName))
     if ($Meta.ReportingPeriod) { & $add ('<span class="chip" title="Reporting Period (from Wkly_Report)">{0}</span>' -f (& $enc $Meta.ReportingPeriod)) }
     if ($Meta.ReportDate) { & $add ('<span class="chip" title="Report Date (from Wkly_Report)">Report Date: {0}</span>' -f (& $enc $Meta.ReportDate)) }
@@ -976,16 +1020,17 @@ function New-DashboardSite {
     $n = $Pages.Count
     foreach ($p in $Pages) {
         $hPt = $p.EndY - $p.StartY
-        $pz = [math]::Min(1.0, [math]::Min($printW / $ContentWidth, $printH / $hPt))
+        $wPt = $p.Width
+        $pz = [math]::Min(1.0, [math]::Min($printW / $wPt, $printH / $hPt))
         & $add ('<section class="page" id="p{0}" data-title="{1}">' -f $p.Index, (ConvertTo-Attr $p.Title))
         & $add ('<div class="pbar"><div class="pt"><span class="pn">{0:D2}</span><h2>{1}</h2><span class="rows">rows {2}&ndash;{3}</span></div><div class="tools">' -f $p.Index, (& $enc $p.Title), $p.StartRow, $p.EndRow)
         if ($p.IssueCount -gt 0) { & $add ('<span class="badge" title="See Data check">&#9888; {0} to check</span>' -f $p.IssueCount) }
         if ($p.ExcelView) { & $add ('<button class="btn xbtn" data-xl="{0}">Excel view</button>' -f $p.ExcelView) }
         else { & $add '<button class="btn xbtn" disabled title="Excel view was not exported for this run">Excel view</button>' }
         & $add ('<span class="pnum">{0} / {1}</span></div></div>' -f $p.Index, $n)
-        & $add ('<div class="pbody"><div class="cvwrap" style="--w:{0}pt;--h:{1}pt;--pz:{2}">' -f (Format-Num $ContentWidth), (Format-Num $hPt), (Format-Num $pz))
-        & $add ('<div class="cv" data-w="{0}" data-h="{1}" style="width:{2}pt;height:{3}pt">' -f (Format-Num ($ContentWidth * $pt2px)), (Format-Num ($hPt * $pt2px)), (Format-Num $ContentWidth), (Format-Num $hPt))
-        foreach ($it in $p.Items) { & $add (ConvertTo-ItemHtml $it $p.StartY); & $add "`n" }
+        & $add ('<div class="pbody"><div class="cvwrap" style="--w:{0}pt;--h:{1}pt;--pz:{2}">' -f (Format-Num $wPt), (Format-Num $hPt), (Format-Num $pz))
+        & $add ('<div class="cv" data-w="{0}" data-h="{1}" style="width:{2}pt;height:{3}pt">' -f (Format-Num ($wPt * $pt2px)), (Format-Num ($hPt * $pt2px)), (Format-Num $wPt), (Format-Num $hPt))
+        foreach ($it in $p.Items) { & $add (ConvertTo-ItemHtml $it $p.OffsetX $p.StartY); & $add "`n" }
         & $add '</div></div><div class="xlview"><iframe title="Excel rendering of this page"></iframe></div></div>'
         & $add ('<div class="pf"><span>{0}</span><span>Wkly_Report &middot; page {1} of {2} &middot; rows {3}&ndash;{4}</span><span class="c">{5}</span></div></section>' -f (& $enc $DashboardTitle), $p.Index, $n, $p.StartRow, $p.EndRow, (& $enc $Classification))
         & $add "`n"
@@ -1035,7 +1080,9 @@ $DashboardCss = @'
 html{scroll-behavior:smooth}
 body{margin:0;font-family:"Segoe UI",Calibri,Arial,sans-serif;color:var(--ink);background:var(--bg);-webkit-print-color-adjust:exact;print-color-adjust:exact}
 .topbar{position:sticky;top:0;z-index:30;min-height:62px;background:var(--navy);color:#fff;display:flex;align-items:center;gap:12px;padding:6px 18px 6px 0;border-bottom:3px solid var(--gold)}
-.brand{width:270px;flex:none;display:flex;align-items:center;gap:10px;padding-left:20px;font-weight:700;letter-spacing:.6px;font-size:14px}
+.menu{margin-left:12px;font-size:16px;padding:5px 10px}
+body.nosb .sidebar{display:none}
+.brand{width:250px;flex:none;display:flex;align-items:center;gap:10px;padding-left:8px;font-weight:700;letter-spacing:.6px;font-size:14px}
 .brand .mark{width:34px;height:34px;border-radius:7px;background:linear-gradient(135deg,var(--gold-2),#8c6d10);display:grid;place-items:center;color:var(--navy);font-size:12px;font-weight:800}
 .tb-title{flex:1;min-width:0}
 .tb-title b{display:block;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -1062,19 +1109,19 @@ nav a .flag{margin-left:auto;font-size:11px;color:#b42318;font-weight:700;white-
 nav a.active .flag{color:#ffb4ab}
 .src{margin-top:auto;border-top:1px solid var(--line);padding:14px 22px;font-size:12px;color:var(--muted);line-height:1.65}
 .src b{color:var(--ink);font-weight:600}
-main{flex:1;min-width:0;padding:22px 26px}
-.page{background:#fff;border-radius:12px;box-shadow:0 1px 3px rgba(16,24,40,.08),0 10px 28px rgba(16,24,40,.07);margin:0 auto 28px;overflow:hidden;scroll-margin-top:84px;display:flex;flex-direction:column}
-.pbar{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:10px 18px;background:linear-gradient(90deg,var(--navy),var(--navy-2));border-left:6px solid var(--gold);color:#fff}
+main{flex:1;min-width:0;padding:12px 12px}
+.page{background:#fff;border-radius:10px;box-shadow:0 1px 3px rgba(16,24,40,.08),0 10px 28px rgba(16,24,40,.07);margin:0 0 16px;overflow:hidden;scroll-margin-top:84px;display:flex;flex-direction:column}
+.pbar{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:6px 14px;background:linear-gradient(90deg,var(--navy),var(--navy-2));border-left:6px solid var(--gold);color:#fff}
 .pbar .pt{display:flex;align-items:center;gap:12px;min-width:0}
 .pbar .pn{background:var(--gold);color:var(--navy);font-weight:800;border-radius:6px;padding:3px 8px;font-size:13px}
-.pbar h2{margin:0;font-size:17px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pbar h2{margin:0;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .pbar .rows{font-size:11px;color:#aab3cf;white-space:nowrap}
 .pbar .tools{display:flex;align-items:center;gap:10px}
 .pbar .badge{background:#fdecea;color:#b42318;border-radius:999px;padding:3px 10px;font-size:12px;font-weight:700;white-space:nowrap}
 .pnum{font-size:12px;color:#aab3cf;white-space:nowrap}
 .xbtn{font-size:12px;padding:5px 10px}
-.pbody{padding:14px;background:#f6f7fa;flex:1}
-.cvwrap{position:relative;overflow:hidden;margin:0 auto;border-radius:6px;box-shadow:0 0 0 1px var(--line)}
+.pbody{padding:6px;background:#f6f7fa;flex:1}
+.cvwrap{position:relative;overflow:hidden;margin:0;border-radius:4px}
 .cv{position:absolute;left:0;top:0;transform-origin:0 0;background:#fff;overflow:hidden}
 .it{position:absolute;box-sizing:border-box;margin:0}
 .cell{display:flex;padding:0 1.5pt;line-height:1.2;overflow:visible}
@@ -1170,7 +1217,7 @@ $DashboardJs = @'
       var wrap = p.querySelector('.cvwrap'), cv = p.querySelector('.cv');
       if (!wrap || !cv) return;
       var W = parseFloat(cv.dataset.w), H = parseFloat(cv.dataset.h);
-      var avail = p.querySelector('.pbody').clientWidth - 28;
+      var avail = p.querySelector('.pbody').clientWidth - 12;
       if (present) avail = window.innerWidth - 12;
       var s = avail / W;
       if (present) {
@@ -1186,6 +1233,15 @@ $DashboardJs = @'
   window.addEventListener('resize', fit);
   fit();
   if (document.fonts && document.fonts.ready) document.fonts.ready.then(fit);
+
+  // page list on/off (gives the pages the whole window width); remembered per browser
+  try { if (localStorage.getItem('itsmdash.nosb') === '1') body.classList.add('nosb'); } catch (e) { }
+  fit();
+  document.getElementById('btnMenu').addEventListener('click', function () {
+    body.classList.toggle('nosb');
+    try { localStorage.setItem('itsmdash.nosb', body.classList.contains('nosb') ? '1' : '0'); } catch (e) { }
+    fit();
+  });
 
   // navigation highlight
   var links = [].slice.call(document.querySelectorAll('#nav a'));
@@ -1358,7 +1414,8 @@ function Invoke-Main {
         $wb = $excel.Workbooks.Open($tempCopy, 0, $true, $m, $m, $m, $true, $m, $m, $false, $false, $m, $false)
 
         $ws = $null
-        try { $ws = $wb.Worksheets.Item($SheetName) }
+        $script:XlApp = $excel
+        try { $ws = $wb.Worksheets.Item($SheetName); $script:XlSheet = $ws }
         catch {
             $names = @(); foreach ($s in $wb.Worksheets) { $names += $s.Name }
             throw "Worksheet '$SheetName' was not found. Worksheets in the file: $($names -join ', ')"
@@ -1456,7 +1513,7 @@ function Invoke-Main {
         foreach ($o in @($ws, $used, $wb, $blank, $excel)) {
             if ($null -ne $o -and [System.Runtime.InteropServices.Marshal]::IsComObject($o)) { try { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($o) } catch { } }
         }
-        $ws = $null; $used = $null; $wb = $null; $blank = $null; $excel = $null
+        $ws = $null; $used = $null; $wb = $null; $blank = $null; $excel = $null; $script:XlApp = $null; $script:XlSheet = $null
         [GC]::Collect(); [GC]::WaitForPendingFinalizers(); [GC]::Collect(); [GC]::WaitForPendingFinalizers()
         if ($excelPid -gt 0) {
             $proc = Get-Process -Id $excelPid -ErrorAction SilentlyContinue
@@ -1488,7 +1545,7 @@ function Invoke-Main {
         ReportingPeriod = (Find-LabelValue -Items $items -Label 'Reporting Period')
         ReportDate      = (Find-LabelValue -Items $items -Label 'Report Date')
     }
-    $index = New-DashboardSite -Pages $result.Pages -OutDir $outDir -Meta $meta -Issues $script:Issues -ContentWidth $contentWidth
+    $index = New-DashboardSite -Pages $result.Pages -OutDir $outDir -Meta $meta -Issues $script:Issues
     Write-Log "Dashboard written: $index" 'OK'
 
     if ($ExportDashboardPdf) { Export-DashboardPdf -IndexPath $index -PdfPath (Join-Path $outDir 'ITSM_Dashboard.pdf') }
