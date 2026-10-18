@@ -43,7 +43,12 @@ Before pushing any change to `VMware_Weekly_HealthCheck.ps1` (or similar scripts
    inspecting the real file over guessing from the image: `.docx` files are zip archives —
    `unzip` them and read `word/document.xml` directly for exact table contents, using
    `libreoffice --headless --convert-to pdf` to render if a visual check is needed.
-4. Don't guess twice at the same class of bug. If a fix doesn't hold up against the next report
+4. The user runs scripts in **Windows PowerShell 5.1 / PowerShell ISE**, not PowerShell 7. Code that
+   passes on pwsh 7 can still fail on 5.1 (e.g. `Export-WklyReportDashboard.ps1` build r6 crashed on 5.1
+   with "Argument types do not match" in a line that ran fine on 7). Prefer plain constructs (build strings
+   in variables, avoid inline `$(if ...)` inside `-f` arguments / method calls), and make optional or
+   diagnostic features unable to abort the main output (per-item try/catch).
+5. Don't guess twice at the same class of bug. If a fix doesn't hold up against the next report
    the user sends, get the actual error/log data before proposing another fix, rather than
    patching blind again.
 
