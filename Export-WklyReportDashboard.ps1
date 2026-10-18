@@ -103,7 +103,7 @@ param(
     [switch]$OpenWhenDone
 )
 
-$ScriptBuild = '2026.10.18-r8'
+$ScriptBuild = '2026.10.18-r9'
 $SheetName = 'Wkly_Report'          # fixed by design - no other worksheet is ever read
 $Inv = [System.Globalization.CultureInfo]::InvariantCulture
 $ErrRegex = '#(DIV/0!|N/A|VALUE!|REF!|NAME\?|NUM!|NULL!|SPILL!|CALC!|FIELD!|BLOCKED!|CONNECT!|BUSY!|UNKNOWN!|GETTING_DATA)'
@@ -121,6 +121,8 @@ $script:XlMadeVisible = $false
 $script:ThemeMinor = 'Calibri'
 $script:ThemeMajor = 'Calibri Light'
 $script:Clip = $null
+$script:PictureScale = 3
+$script:PictureMethods = @{}
 
 # ======================================================================================
 #  Small helpers
@@ -688,26 +690,47 @@ function Export-ShapeViaClipboard {
 
 function Initialize-EmfHelper {
     # Reads Excel's vector picture (EMF) from the clipboard and saves it as a sharp PNG.
-    if ('ItsmDash.EmfClip' -as [type]) { return $true }
+    if ('ItsmDash.EmfClip2' -as [type]) { return $true }
     $code = @'
 using System;
 using System.Runtime.InteropServices;
 using System.Drawing;
 using System.Drawing.Imaging;
 namespace ItsmDash {
-  public static class EmfClip {
+  public static class EmfClip2 {
+    [StructLayout(LayoutKind.Sequential)] struct RECT { public int Left, Top, Right, Bottom; }
     [DllImport("user32.dll")] static extern bool OpenClipboard(IntPtr h);
     [DllImport("user32.dll")] static extern bool CloseClipboard();
     [DllImport("user32.dll")] static extern IntPtr GetClipboardData(uint f);
     [DllImport("user32.dll")] static extern bool IsClipboardFormatAvailable(uint f);
     [DllImport("gdi32.dll")] static extern IntPtr CopyEnhMetaFile(IntPtr h, IntPtr file);
+    [DllImport("gdi32.dll")] static extern bool PlayEnhMetaFile(IntPtr hdc, IntPtr hemf, ref RECT r);
+    [DllImport("gdi32.dll")] static extern bool DeleteEnhMetaFile(IntPtr h);
+    public static string LastMethod = "";
+    // Native GDI playback keeps Excel's exact per-letter positions (GDI+ re-lays out text and squeezes it).
     public static bool SavePng(string path, int width, int height) {
+      LastMethod = "";
       if (!IsClipboardFormatAvailable(14)) return false;
       IntPtr copy = IntPtr.Zero;
       if (!OpenClipboard(IntPtr.Zero)) return false;
       try { IntPtr h = GetClipboardData(14); if (h != IntPtr.Zero) copy = CopyEnhMetaFile(h, IntPtr.Zero); }
       finally { CloseClipboard(); }
       if (copy == IntPtr.Zero) return false;
+      bool played = false;
+      try {
+        using (Bitmap bmp = new Bitmap(width, height, PixelFormat.Format24bppRgb)) {
+          using (Graphics g = Graphics.FromImage(bmp)) {
+            g.Clear(Color.White);
+            IntPtr hdc = g.GetHdc();
+            try { RECT r = new RECT(); r.Left = 0; r.Top = 0; r.Right = width; r.Bottom = height; played = PlayEnhMetaFile(hdc, copy, ref r); }
+            finally { g.ReleaseHdc(hdc); }
+          }
+          if (played) { bmp.Save(path, ImageFormat.Png); LastMethod = "GDI"; }
+        }
+      }
+      catch { played = false; }
+      if (played) { DeleteEnhMetaFile(copy); return true; }
+      LastMethod = "GDI+";
       using (Metafile mf = new Metafile(copy, true))
       using (Bitmap bmp = new Bitmap(width, height))
       using (Graphics g = Graphics.FromImage(bmp)) {
@@ -744,9 +767,9 @@ function Export-RangePicture {
         try { if (-not $saved.Text -and $cb::ContainsImage()) { $saved.Image = $cb::GetImage() } } catch { }
         $script:Clip = $saved
     }
-    $wPx = [int][math]::Ceiling($WidthPt * 96 / 72 * 2)
-    $hPx = [int][math]::Ceiling($HeightPt * 96 / 72 * 2)
-    $emfType = 'ItsmDash.EmfClip' -as [type]
+    $wPx = [int][math]::Ceiling($WidthPt * 96 / 72 * $script:PictureScale)
+    $hPx = [int][math]::Ceiling($HeightPt * 96 / 72 * $script:PictureScale)
+    $emfType = 'ItsmDash.EmfClip2' -as [type]
     $attempts = 0
     while ($attempts -lt 2) {
         $attempts = $attempts + 1
@@ -755,7 +778,12 @@ function Export-RangePicture {
                 $cb::Clear()
                 $null = $Range.CopyPicture(1, -4147)          # xlScreen, xlPicture (vector)
                 Start-Sleep -Milliseconds 150
-                if ($emfType::SavePng($Path, $wPx, $hPx)) { $ErrorText.Value = $null; return $true }
+                if ($emfType::SavePng($Path, $wPx, $hPx)) {
+                    $how = [string]$emfType::LastMethod
+                    $script:PictureMethods[$how] = 1 + [int]$script:PictureMethods[$how]
+                    $ErrorText.Value = $null
+                    return $true
+                }
                 $errs.Add('vector: no picture on the clipboard')
             }
             catch { $errs.Add('vector: ' + $_.Exception.Message) }
@@ -766,7 +794,12 @@ function Export-RangePicture {
             $img = $null
             $tries = 0
             while ($tries -lt 10 -and $null -eq $img) { Start-Sleep -Milliseconds 100; $img = $cb::GetImage(); $tries = $tries + 1 }
-            if ($img) { $img.Save($Path, ('System.Drawing.Imaging.ImageFormat' -as [type])::Png); $img.Dispose(); $ErrorText.Value = $null; return $true }
+            if ($img) {
+                $img.Save($Path, ('System.Drawing.Imaging.ImageFormat' -as [type])::Png); $img.Dispose()
+                $script:PictureMethods['bitmap'] = 1 + [int]$script:PictureMethods['bitmap']
+                $ErrorText.Value = $null
+                return $true
+            }
             $errs.Add('bitmap: no picture on the clipboard')
         }
         catch { $errs.Add('bitmap: ' + $_.Exception.Message) }
@@ -811,7 +844,8 @@ function Add-PagePictures {
         }
         catch { Add-Issue -Severity Warning -Location ("Page {0}" -f $p.Index) -Message ("Page picture failed; the re-drawn view is shown: {0}" -f (Format-ErrorDetail $_)) -Y $p.StartY }
     }
-    Write-Log ("Excel page pictures: {0} of {1} pages captured." -f $ok, $Pages.Count) 'OK'
+    $how = ($script:PictureMethods.Keys | ForEach-Object { '{0}: {1}' -f $_, $script:PictureMethods[$_] }) -join ', '
+    Write-Log ("Excel page pictures: {0} of {1} pages captured at {2}x ({3})." -f $ok, $Pages.Count, $script:PictureScale, $how) 'OK'
     return $ok
 }
 
