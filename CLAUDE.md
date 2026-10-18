@@ -45,9 +45,12 @@ Before pushing any change to `VMware_Weekly_HealthCheck.ps1` (or similar scripts
    `libreoffice --headless --convert-to pdf` to render if a visual check is needed.
 4. The user runs scripts in **Windows PowerShell 5.1 / PowerShell ISE**, not PowerShell 7. Code that
    passes on pwsh 7 can still fail on 5.1 (e.g. `Export-WklyReportDashboard.ps1` build r6 crashed on 5.1
-   with "Argument types do not match" in a line that ran fine on 7). Prefer plain constructs (build strings
-   in variables, avoid inline `$(if ...)` inside `-f` arguments / method calls), and make optional or
-   diagnostic features unable to abort the main output (per-item try/catch).
+   with "Argument types do not match"). Root cause, reproduced on pwsh 7 too: wrapping a
+   `System.Collections.Generic.List[object]` in the array operator — `@($list)`, `@($obj.ListProp).Count`,
+   `foreach ($x in @($list))` — throws that error. Iterate lists directly (`foreach ($x in $list)`, which is
+   also safe for `$null`) and use `$list.Count`; `@(... | Where-Object ...)` pipelines are fine. Test helper
+   code with real `List[object]` data, not hand-built arrays, and make optional or diagnostic features
+   unable to abort the main output (per-item try/catch).
 5. Don't guess twice at the same class of bug. If a fix doesn't hold up against the next report
    the user sends, get the actual error/log data before proposing another fix, rather than
    patching blind again.

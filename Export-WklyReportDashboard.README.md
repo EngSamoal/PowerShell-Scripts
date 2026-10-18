@@ -70,6 +70,9 @@ Output folder contents: `<workbook name>.html`, `assets\` (charts, pictures, CSS
 - **Data check**: source file, SHA-256 before/after (proves the file was not changed), the
   page-detection method, and every Excel error, empty formula result, `####` cell and object
   that was not reproduced, each with its cell address or object name.
+- **View: Excel picture / Re-drawn**: by default each page is Excel's own picture of that page (every
+  value, chart, colour and text position exactly as Excel draws it). *Re-drawn* shows the HTML version.
+  If Excel's picture of a page can't be captured, that page shows the re-drawn version and Data check says why.
 - **Inspect: on/off**: click any text box to see what Excel reported for it (fonts, colours, spacing,
   cell link). Useful when something looks different from Excel — a photo of the panel is enough to diagnose it.
 - **Markers: on/off**: dashed outlines on Excel errors and empty formula results. The value

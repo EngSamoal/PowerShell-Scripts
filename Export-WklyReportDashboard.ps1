@@ -103,7 +103,7 @@ param(
     [switch]$OpenWhenDone
 )
 
-$ScriptBuild = '2026.10.18-r7'
+$ScriptBuild = '2026.10.18-r8'
 $SheetName = 'Wkly_Report'          # fixed by design - no other worksheet is ever read
 $Inv = [System.Globalization.CultureInfo]::InvariantCulture
 $ErrRegex = '#(DIV/0!|N/A|VALUE!|REF!|NAME\?|NUM!|NULL!|SPILL!|CALC!|FIELD!|BLOCKED!|CONNECT!|BUSY!|UNKNOWN!|GETTING_DATA)'
@@ -686,6 +686,135 @@ function Export-ShapeViaClipboard {
     catch { $ErrorText.Value = $_.Exception.Message; return $false }
 }
 
+function Initialize-EmfHelper {
+    # Reads Excel's vector picture (EMF) from the clipboard and saves it as a sharp PNG.
+    if ('ItsmDash.EmfClip' -as [type]) { return $true }
+    $code = @'
+using System;
+using System.Runtime.InteropServices;
+using System.Drawing;
+using System.Drawing.Imaging;
+namespace ItsmDash {
+  public static class EmfClip {
+    [DllImport("user32.dll")] static extern bool OpenClipboard(IntPtr h);
+    [DllImport("user32.dll")] static extern bool CloseClipboard();
+    [DllImport("user32.dll")] static extern IntPtr GetClipboardData(uint f);
+    [DllImport("user32.dll")] static extern bool IsClipboardFormatAvailable(uint f);
+    [DllImport("gdi32.dll")] static extern IntPtr CopyEnhMetaFile(IntPtr h, IntPtr file);
+    public static bool SavePng(string path, int width, int height) {
+      if (!IsClipboardFormatAvailable(14)) return false;
+      IntPtr copy = IntPtr.Zero;
+      if (!OpenClipboard(IntPtr.Zero)) return false;
+      try { IntPtr h = GetClipboardData(14); if (h != IntPtr.Zero) copy = CopyEnhMetaFile(h, IntPtr.Zero); }
+      finally { CloseClipboard(); }
+      if (copy == IntPtr.Zero) return false;
+      using (Metafile mf = new Metafile(copy, true))
+      using (Bitmap bmp = new Bitmap(width, height))
+      using (Graphics g = Graphics.FromImage(bmp)) {
+        g.Clear(Color.White);
+        g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.HighQuality;
+        g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+        g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+        g.DrawImage(mf, new Rectangle(0, 0, width, height));
+        bmp.Save(path, ImageFormat.Png);
+      }
+      return true;
+    }
+  }
+}
+'@
+    try { Add-Type -TypeDefinition $code -ReferencedAssemblies System.Drawing -ErrorAction Stop; return $true }
+    catch { Write-Log ("Vector page pictures unavailable ({0}); using bitmap pictures." -f $_.Exception.Message) 'WARN'; return $false }
+}
+
+function Export-RangePicture {
+    # Excel's own picture of a cell range including every chart, shape and text box on it.
+    # Vector (EMF) rendered at 2x for sharpness; bitmap as fallback. Uses the clipboard (restored later).
+    param($Range, [string]$Path, [double]$WidthPt, [double]$HeightPt, [ref]$ErrorText)
+    $errs = New-Object System.Collections.Generic.List[string]
+    if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
+        $ErrorText.Value = 'clipboard access needs Windows PowerShell or PowerShell ISE (STA thread)'
+        return $false
+    }
+    Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+    $cb = 'System.Windows.Forms.Clipboard' -as [type]
+    if ($null -eq $script:Clip) {
+        $saved = [pscustomobject]@{ Text = $null; Image = $null }
+        try { if ($cb::ContainsText()) { $saved.Text = $cb::GetText() } } catch { }
+        try { if (-not $saved.Text -and $cb::ContainsImage()) { $saved.Image = $cb::GetImage() } } catch { }
+        $script:Clip = $saved
+    }
+    $wPx = [int][math]::Ceiling($WidthPt * 96 / 72 * 2)
+    $hPx = [int][math]::Ceiling($HeightPt * 96 / 72 * 2)
+    $emfType = 'ItsmDash.EmfClip' -as [type]
+    $attempts = 0
+    while ($attempts -lt 2) {
+        $attempts = $attempts + 1
+        if ($emfType) {
+            try {
+                $cb::Clear()
+                $null = $Range.CopyPicture(1, -4147)          # xlScreen, xlPicture (vector)
+                Start-Sleep -Milliseconds 150
+                if ($emfType::SavePng($Path, $wPx, $hPx)) { $ErrorText.Value = $null; return $true }
+                $errs.Add('vector: no picture on the clipboard')
+            }
+            catch { $errs.Add('vector: ' + $_.Exception.Message) }
+        }
+        try {
+            $cb::Clear()
+            $null = $Range.CopyPicture(1, 2)                  # xlScreen, xlBitmap
+            $img = $null
+            $tries = 0
+            while ($tries -lt 10 -and $null -eq $img) { Start-Sleep -Milliseconds 100; $img = $cb::GetImage(); $tries = $tries + 1 }
+            if ($img) { $img.Save($Path, ('System.Drawing.Imaging.ImageFormat' -as [type])::Png); $img.Dispose(); $ErrorText.Value = $null; return $true }
+            $errs.Add('bitmap: no picture on the clipboard')
+        }
+        catch { $errs.Add('bitmap: ' + $_.Exception.Message) }
+        # Some Excel builds only draw pictures while the application window exists: retry once off-screen.
+        if ($script:XlMadeVisible) { break }
+        try {
+            $null = ($script:XlApp.Visible = $true)
+            try { $script:XlApp.WindowState = -4143; $script:XlApp.Left = -30000; $script:XlApp.Top = -30000 } catch { }
+            $script:XlMadeVisible = $true
+            $null = $script:XlSheet.Activate()
+        }
+        catch { break }
+    }
+    $ErrorText.Value = ($errs -join ' | ')
+    return $false
+}
+
+function Add-PagePictures {
+    param($Pages, $Ws, $Geo, [string]$AssetsDir)
+    $null = Initialize-EmfHelper
+    $ok = 0
+    foreach ($p in $Pages) {
+        try {
+            $c1 = 1
+            for ($c = 1; $c -le $Geo.LastCol; $c++) { if ($Geo.ColLefts[$c] -le $p.OffsetX + 0.5) { $c1 = $c } }
+            $right = $p.OffsetX + $p.Width - 0.5
+            $c2 = $c1
+            for ($c = $c1; $c -le $Geo.LastCol; $c++) { if ($Geo.ColLefts[$c] -lt $right) { $c2 = $c } }
+            $L = $Geo.ColLefts[$c1]; $T = $Geo.RowTops[$p.StartRow]
+            $W = $Geo.ColLefts[$c2 + 1] - $L; $H = $Geo.RowTops[$p.EndRow + 1] - $T
+            $addr = (ConvertTo-ColumnLetter $c1) + [string]$p.StartRow + ':' + (ConvertTo-ColumnLetter $c2) + [string]$p.EndRow
+            $file = 'page-{0:D2}.png' -f $p.Index
+            $err = $null
+            $done = (Export-RangePicture -Range $Ws.Range($addr) -Path (Join-Path $AssetsDir $file) -WidthPt $W -HeightPt $H -ErrorText ([ref]$err)) -eq $true
+            if ($done) {
+                $p.Picture = [pscustomobject]@{ Kind = 'image'; L = $L; T = $T; W = $W; H = $H; Z = 0; Rot = 0; Src = "assets/$file"; Alt = ('Wkly_Report ' + $addr); IsChart = $false }
+                $ok = $ok + 1
+            }
+            else {
+                Add-Issue -Severity Warning -Location ("Page {0}" -f $p.Index) -Message ("Excel's picture of {0} could not be captured [{1}]; the re-drawn view is shown for this page." -f $addr, $err) -Y $p.StartY
+            }
+        }
+        catch { Add-Issue -Severity Warning -Location ("Page {0}" -f $p.Index) -Message ("Page picture failed; the re-drawn view is shown: {0}" -f (Format-ErrorDetail $_)) -Y $p.StartY }
+    }
+    Write-Log ("Excel page pictures: {0} of {1} pages captured." -f $ok, $Pages.Count) 'OK'
+    return $ok
+}
+
 function Restore-Clipboard {
     if ($null -eq $script:Clip) { return }
     try {
@@ -1091,7 +1220,7 @@ function Find-ReportPages {
                 Index    = $idx; StartY = $sy; EndY = $ey; Title = $title; OffsetX = $minL; Width = $maxR - $minL
                 StartRow = (Get-RowAtY $Geo.RowTops $Geo.LastRow $sy)
                 EndRow   = (Get-RowAtY $Geo.RowTops $Geo.LastRow ($ey - 0.5))
-                Items    = $pageItems; ExcelView = $null; IssueCount = 0
+                Items    = $pageItems; ExcelView = $null; IssueCount = 0; Picture = $null
             })
     }
     # All pages share one horizontal crop so they have the same scale and line up with each other.
@@ -1159,18 +1288,18 @@ function Get-InspectText {
     $outline = 'none'; if ($It.Border) { $outline = [string]$It.Border }
     $out = [string]$It.Name + ' | at ' + [string][int]$It.L + ',' + [string][int]$It.T + ' pt | size ' + [string][int]$It.W + ' x ' + [string][int]$It.H + ' pt | fill ' + $fill + ' | outline ' + $outline + ' | shape type ' + [string]$It.ShapeType
     if ($It.Runs) {
-        $m = @($It.Margins)
+        $m = $It.Margins
         $margins = ''
-        if ($m.Count -ge 4) { $margins = 'L' + [string]$m[0] + ' T' + [string]$m[1] + ' R' + [string]$m[2] + ' B' + [string]$m[3] }
+        if ($m -and $m.Count -ge 4) { $margins = 'L' + [string]$m[0] + ' T' + [string]$m[1] + ' R' + [string]$m[2] + ' B' + [string]$m[3] }
         $link = 'none'; if ($It.Formula) { $link = [string]$It.Formula }
         $out += $nl + 'text anchor ' + [string]$It.Anchor + ' | margins ' + $margins + ' | wrap ' + [string]$It.Wrap + ' | autosize ' + [string]$It.AutoSize + ' | link ' + $link
         $k = 0
-        foreach ($pp in @($It.Paras)) {
+        foreach ($pp in $It.Paras) {
             if ($null -eq $pp) { continue }
             $k = $k + 1
             $out += $nl + 'paragraph ' + [string]$k + ': align ' + [string]$pp.Align + ', before ' + (Format-Num $pp.Before) + 'pt, after ' + (Format-Num $pp.After) + 'pt, line ' + [string]$pp.LineHeight
         }
-        foreach ($r in @($It.Runs)) {
+        foreach ($r in $It.Runs) {
             $t = [string]$r.Text
             $t = $t.Replace([string][char]13, '[para]').Replace([string][char]11, '[line]').Replace([string][char]10, '[line]')
             if ($t.Length -gt 60) { $t = $t.Substring(0, 57) + '...' }
@@ -1304,6 +1433,7 @@ function New-DashboardSite {
     if ($Meta.ReportDate) { & $add ('<span class="chip" title="Report Date (from Wkly_Report)">Report Date: {0}</span>' -f (& $enc $Meta.ReportDate)) }
     & $add ('<button class="btn warn" id="btnLog">Data check <span class="cnt">{0}</span></button>' -f $issueTotal)
     & $add '<div class="zoom" title="Zoom (keys + and -). Fit = whole page width"><button class="btn" id="zOut">&minus;</button><span id="zVal">Fit</span><button class="btn" id="zIn">+</button><button class="btn" id="zFit">Fit</button></div>'
+    & $add '<button class="btn" id="btnView" title="Excel picture = exactly as Excel draws the page. Re-drawn = HTML version (Inspect works there).">View: Excel picture</button>'
     & $add '<button class="btn" id="btnInspect" title="Click a text box to see what Excel reported for it">Inspect: off</button>'
     & $add '<button class="btn" id="btnMarkers" title="Show/hide the markers on Excel errors and empty formula results">Markers: on</button>'
     & $add '<button class="btn" id="btnPresent" title="Presentation mode (P)">&#x26F6; Present</button>'
@@ -1327,7 +1457,8 @@ function New-DashboardSite {
         $hPt = $p.EndY - $p.StartY
         $wPt = $p.Width
         $pz = [math]::Min(1.0, [math]::Min($printW / $wPt, $printH / $hPt))
-        & $add ('<section class="page" id="p{0}" data-title="{1}">' -f $p.Index, (ConvertTo-Attr $p.Title))
+        $pageClass = 'page'; if ($p.Picture) { $pageClass = 'page haspic' }
+        & $add ('<section class="{2}" id="p{0}" data-title="{1}">' -f $p.Index, (ConvertTo-Attr $p.Title), $pageClass)
         & $add ('<div class="pbar"><div class="pt"><span class="pn">{0:D2}</span><h2>{1}</h2><span class="rows">rows {2}&ndash;{3}</span></div><div class="tools">' -f $p.Index, (& $enc $p.Title), $p.StartRow, $p.EndRow)
         if ($p.IssueCount -gt 0) { & $add ('<span class="badge" title="See Data check">&#9888; {0} to check</span>' -f $p.IssueCount) }
         if ($p.ExcelView) { & $add ('<button class="btn xbtn" data-xl="{0}">Excel view</button>' -f $p.ExcelView) }
@@ -1335,6 +1466,12 @@ function New-DashboardSite {
         & $add ('<span class="pnum">{0} / {1}</span></div></div>' -f $p.Index, $n)
         & $add ('<div class="pbody"><div class="cvwrap" style="--w:{0}pt;--h:{1}pt;--pz:{2}">' -f (Format-Num $wPt), (Format-Num $hPt), (Format-Num $pz))
         & $add ('<div class="cv" data-w="{0}" data-h="{1}" style="width:{2}pt;height:{3}pt">' -f (Format-Num ($wPt * $pt2px)), (Format-Num ($hPt * $pt2px)), (Format-Num $wPt), (Format-Num $hPt))
+        if ($p.Picture) {
+            $picHtml = ''
+            try { $picHtml = ConvertTo-ItemHtml $p.Picture $p.OffsetX $p.StartY } catch { }
+            & $add ('<div class="lay-pic">' + $picHtml + '</div>')
+        }
+        & $add '<div class="lay-html">'
         foreach ($it in $p.Items) {
             $html = $null
             try { $html = ConvertTo-ItemHtml $it $p.OffsetX $p.StartY }
@@ -1344,7 +1481,7 @@ function New-DashboardSite {
             }
             if ($html) { & $add $html; & $add "`n" }
         }
-        & $add '</div></div><div class="xlview"><iframe title="Excel rendering of this page"></iframe></div></div>'
+        & $add '</div></div></div><div class="xlview"><iframe title="Excel rendering of this page"></iframe></div></div>'
         & $add ('<div class="pf"><span>{0}</span><span>Wkly_Report &middot; page {1} of {2} &middot; rows {3}&ndash;{4}</span><span class="c">{5}</span></div></section>' -f (& $enc $DashboardTitle), $p.Index, $n, $p.StartRow, $p.EndRow, (& $enc $Classification))
         & $add "`n"
     }
@@ -1363,6 +1500,7 @@ function New-DashboardSite {
     & $add '</ul><h5>CAPTURED</h5><ul>'
     & $add ('<li><span class="ok">&#10004;</span> {0}</li>' -f (& $enc $Meta.PageMethod))
     & $add ('<li><span class="ok">&#10004;</span> {0} non-empty cells, {1} shapes/text boxes, {2} charts, {3} pictures</li>' -f $Meta.CellCount, $Meta.ShapeCount, $Meta.ChartCount, $Meta.PictureCount)
+    & $add ('<li><span class="ok">&#10004;</span> Pages: {0}</li>' -f (& $enc $Meta.PictureNote))
     & $add ('<li><span class="ok">&#10004;</span> Excel view: {0}</li>' -f (& $enc $Meta.ExcelViewNote))
     & $add '</ul><h5>NEEDS ATTENTION</h5>'
     $shown = @($Issues | Sort-Object @{ Expression = { if ($_.Page) { $_.Page } else { 0 } } }, @{ Expression = { switch ($_.Severity) { 'Error' { 0 } 'Warning' { 1 } default { 2 } } } })
@@ -1488,6 +1626,10 @@ body.no-markers .blankcell{display:none}
 #inspectBox .btn{float:right}
 body.inspect .shp{cursor:crosshair}
 body.inspect .shp:hover{outline:2px solid #e5484d;outline-offset:-1px}
+.lay-pic,.lay-html{position:absolute;inset:0}
+.page.haspic .lay-html{display:none}
+body.redraw .page.haspic .lay-html{display:block}
+body.redraw .page.haspic .lay-pic{display:none}
 .present-hud{display:none}
 body.present .topbar,body.present .sidebar,body.present .xbtn,body.present .badge{display:none}
 body.present main{padding:0}
@@ -1605,11 +1747,22 @@ $DashboardJs = @'
   document.getElementById('btnClose').addEventListener('click', function () { drawer.classList.remove('open'); });
   [].slice.call(drawer.querySelectorAll('a[href^="#p"]')).forEach(function (a) { a.addEventListener('click', function () { drawer.classList.remove('open'); }); });
 
+  // View: Excel's own picture of each page (default) or the re-drawn HTML version
+  var vb = document.getElementById('btnView');
+  try { if (localStorage.getItem('itsmdash.view') === 'redraw') body.classList.add('redraw'); } catch (e) { }
+  function viewLabel() { vb.textContent = body.classList.contains('redraw') ? 'View: Re-drawn' : 'View: Excel picture'; }
+  viewLabel();
+  vb.addEventListener('click', function () {
+    body.classList.toggle('redraw'); viewLabel();
+    try { localStorage.setItem('itsmdash.view', body.classList.contains('redraw') ? 'redraw' : 'pic'); } catch (e) { }
+  });
+
   // Inspect: click a text box to show what Excel reported for it
   var ib = document.getElementById('inspectBox'), insp = document.getElementById('btnInspect');
   insp.addEventListener('click', function () {
     body.classList.toggle('inspect');
     insp.textContent = body.classList.contains('inspect') ? 'Inspect: on' : 'Inspect: off';
+    if (body.classList.contains('inspect') && !body.classList.contains('redraw')) { body.classList.add('redraw'); viewLabel(); }
     if (!body.classList.contains('inspect')) ib.style.display = 'none';
   });
   document.getElementById('inspectClose').addEventListener('click', function () { ib.style.display = 'none'; });
@@ -1743,6 +1896,7 @@ function Invoke-Main {
     $items = New-Object System.Collections.Generic.List[object]
     $result = $null; $geo = $null; $contentWidth = 0; $cellCount = 0; $shapeCount = 0
     $excelViewNote = 'skipped (-SkipExcelView)'
+    $pictureNote = 'not captured'
     try {
         try { $excel = New-Object -ComObject Excel.Application }
         catch { throw 'Microsoft Excel is not available on this computer (COM class Excel.Application could not be created).' }
@@ -1847,12 +2001,17 @@ function Invoke-Main {
             catch { Write-Log 'Page breaks could not be read (no printer configured?).' 'WARN' }
         }
 
-        try { Repair-InvisibleText -Items $items } catch { Add-Issue -Severity Warning -Location 'Text colours' -Message ("Colour check failed: {0}" -f (Format-ErrorDetail $_)) }
         try { Find-OverlappingText -Items $items } catch { }
         $result = Find-ReportPages -Items $items -Geo $geo -ContentWidth $contentWidth -ContentBottom $contentBottom `
             -Mode $PageMode -StartRows $PageStartRows -BreakRows $breakRows -MinFont $TitleMinFontSize -MinHeight $MinPageHeightPt
 
         $lastColLetter = ConvertTo-ColumnLetter ([math]::Max(1, $lastCol))
+        $pictureNote = 'not captured'
+        try {
+            $pc = Add-PagePictures -Pages $result.Pages -Ws $ws -Geo $geo -AssetsDir $assets
+            $pictureNote = '{0} of {1} pages shown as Excel''s own picture' -f $pc, $result.Pages.Count
+        }
+        catch { Add-Issue -Severity Warning -Location 'Page pictures' -Message ("Page pictures failed; the re-drawn view is shown: {0}" -f (Format-ErrorDetail $_)) }
         if (-not $SkipExcelView) {
             $ok = 0
             foreach ($p in $result.Pages) {
@@ -1911,6 +2070,7 @@ function Invoke-Main {
         ChartCount      = $script:ChartIndex
         PictureCount    = $mediaMap.Count
         ExcelViewNote   = $excelViewNote
+        PictureNote     = $pictureNote
         ReportingPeriod = (Find-LabelValue -Items $items -Label 'Reporting Period')
         ReportDate      = (Find-LabelValue -Items $items -Label 'Report Date')
     }
