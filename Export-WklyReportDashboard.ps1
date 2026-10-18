@@ -103,7 +103,7 @@ param(
     [switch]$OpenWhenDone
 )
 
-$ScriptBuild = '2026.10.18-r4'
+$ScriptBuild = '2026.10.18-r5'
 $SheetName = 'Wkly_Report'          # fixed by design - no other worksheet is ever read
 $Inv = [System.Globalization.CultureInfo]::InvariantCulture
 $ErrRegex = '#(DIV/0!|N/A|VALUE!|REF!|NAME\?|NUM!|NULL!|SPILL!|CALC!|FIELD!|BLOCKED!|CONNECT!|BUSY!|UNKNOWN!|GETTING_DATA)'
@@ -112,20 +112,25 @@ $GeneratedMarker = '.generated-by-Export-WklyReportDashboard'
 $script:LogLines = New-Object System.Collections.Generic.List[string]
 $script:Issues = New-Object System.Collections.Generic.List[object]
 $script:ChartIndex = 0
+$script:PictureIndex = 0
 $script:LoggedShapeTypes = @{}
 $script:XlApp = $null
 $script:XlSheet = $null
 $script:ChartMode = $null
 $script:XlMadeVisible = $false
+$script:ThemeMinor = 'Calibri'
+$script:ThemeMajor = 'Calibri Light'
+$script:Clip = $null
 
 # ======================================================================================
 #  Small helpers
 # ======================================================================================
 
 function Write-Log {
-    param([string]$Message, [ValidateSet('INFO', 'WARN', 'ERROR', 'OK')][string]$Level = 'INFO')
+    param([string]$Message, [ValidateSet('INFO', 'WARN', 'ERROR', 'OK')][string]$Level = 'INFO', [switch]$FileOnly)
     $line = '{0} [{1}] {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message
     $script:LogLines.Add($line)
+    if ($FileOnly) { return }
     $color = switch ($Level) { 'ERROR' { 'Red' } 'WARN' { 'Yellow' } 'OK' { 'Green' } default { 'Gray' } }
     Write-Host $line -ForegroundColor $color
 }
@@ -199,8 +204,10 @@ function ConvertTo-Attr {
 
 function Get-CssFont {
     param([string]$Name)
-    $fallback = "'Segoe UI',Calibri,Arial,sans-serif"
-    if ([string]::IsNullOrWhiteSpace($Name) -or $Name.StartsWith('+')) { return $fallback }
+    $fallback = "Calibri,'Segoe UI',Arial,sans-serif"
+    if ($Name -and $Name.StartsWith('+mj')) { $Name = $script:ThemeMajor }       # theme heading font
+    elseif ($Name -and $Name.StartsWith('+')) { $Name = $script:ThemeMinor }     # theme body font
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $fallback }
     return "'" + ($Name -replace "['`"<>;]", '') + "',$fallback"
 }
 
@@ -520,23 +527,72 @@ function Get-RunInfo {
     }
 }
 
+function Get-LinkedText {
+    # Text a linked text box displays when TextFrame2 reports no text: legacy text API first, then
+    # (only for links to a cell on Wkly_Report itself) that cell's displayed text.
+    param($Shape, [string]$Name, [double]$Y)
+    $formula = $null
+    try { $formula = [string]$Shape.DrawingObject.Formula } catch { }
+    $text = $null
+    try { $text = [string]$Shape.TextFrame.Characters().Text } catch { }
+    $linkPattern = '^=(?:''?(?<sheet>[^''!]+)''?!)?\$?(?<col>[A-Za-z]{1,3})\$?(?<row>\d+)$'
+    if (-not $text -and $formula -match $linkPattern) {
+        $sheet = $Matches['sheet']
+        if (-not $sheet -or $sheet -eq $SheetName) {
+            try { $text = [string]$script:XlSheet.Range($Matches['col'] + $Matches['row']).Text } catch { }
+        }
+        else {
+            Add-Issue -Severity Warning -Location "Text box '$Name'" -Message ("Linked to {0} on another worksheet and Excel returned no text for it; that tab is not read, so the box is shown empty. See Excel view." -f $formula) -Y $Y
+        }
+    }
+    if ($formula) { Write-Log ("  linked text box '{0}' {1} -> '{2}'" -f $Name, $formula, $text) -FileOnly }
+    return $text
+}
+
 function Read-ShapeText {
-    param($Shape)
-    try { if (-not (Test-MsoTrue $Shape.TextFrame2.HasText)) { return $null } } catch { return $null }
-    $tf = $Shape.TextFrame2
-    $tr = $tf.TextRange
+    param($Shape, [string]$Name = '', [double]$Y = -1)
+    $hasText = $false
+    try { $hasText = Test-MsoTrue $Shape.TextFrame2.HasText } catch { }
+    $tf = $null; $tr = $null
+    try { $tf = $Shape.TextFrame2; $tr = $tf.TextRange } catch { }
     $runs = New-Object System.Collections.Generic.List[object]
-    $cnt = 0
-    try { $cnt = [int]$tr.Runs().Count } catch { }
-    if ($cnt -gt 0) { for ($i = 1; $i -le $cnt; $i++) { $runs.Add((Get-RunInfo $tr.Runs($i, 1))) } }
-    else { $runs.Add((Get-RunInfo $tr)) }
+    if ($hasText) {
+        $cnt = 0
+        try { $cnt = [int]$tr.Runs().Count } catch { }
+        if ($cnt -gt 0) { for ($i = 1; $i -le $cnt; $i++) { $runs.Add((Get-RunInfo $tr.Runs($i, 1))) } }
+        else { $runs.Add((Get-RunInfo $tr)) }
+    }
+    else {
+        $linked = Get-LinkedText -Shape $Shape -Name $Name -Y $Y
+        if (-not $linked) { return $null }
+        $run = $null
+        try { $run = Get-RunInfo $tr } catch { }
+        if (-not $run) { $run = [pscustomobject]@{ Text = ''; Size = 11; Bold = $false; Italic = $false; Underline = $false; Color = $null; Font = $null } }
+        $run.Text = $linked
+        $runs.Add($run)
+    }
+    if (-not $tf) { return [pscustomobject]@{ Runs = $runs; Aligns = $null; Paras = $null; Anchor = 'top'; Margins = @(7.2, 3.6, 7.2, 3.6); Wrap = $true; Orientation = 1 } }
     $aligns = New-Object System.Collections.Generic.List[string]
+    $paras = New-Object System.Collections.Generic.List[object]
     $map = @{ 1 = 'left'; 2 = 'center'; 3 = 'right'; 4 = 'justify'; 5 = 'justify'; 7 = 'justify' }
     try {
         $pc = [int]$tr.Paragraphs().Count
+        $baseSize = if ($runs.Count -and $runs[0].Size -gt 0) { [double]$runs[0].Size } else { 11 }
         for ($p = 1; $p -le $pc; $p++) {
-            $a = [int]$tr.Paragraphs($p, 1).ParagraphFormat.Alignment
-            $aligns.Add($(if ($map.ContainsKey($a)) { $map[$a] } else { 'left' }))
+            $pf = $tr.Paragraphs($p, 1).ParagraphFormat
+            $a = [int]$pf.Alignment
+            $align = if ($map.ContainsKey($a)) { $map[$a] } else { 'left' }
+            $aligns.Add($align)
+            # Excel paragraph spacing: values are points, or lines when the matching LineRule is set
+            $before = 0; $after = 0; $lh = $null
+            try { $before = [double]$pf.SpaceBefore; if (Test-MsoTrue $pf.LineRuleBefore) { $before = $before * 1.2 * $baseSize } } catch { }
+            try { $after = [double]$pf.SpaceAfter; if (Test-MsoTrue $pf.LineRuleAfter) { $after = $after * 1.2 * $baseSize } } catch { }
+            try {
+                $sw = [double]$pf.SpaceWithin
+                if ($sw -gt 0) { $lh = if (Test-MsoTrue $pf.LineRuleWithin) { Format-Num (1.2 * $sw) } else { (Format-Num $sw) + 'pt' } }
+            }
+            catch { }
+            $paras.Add([pscustomobject]@{ Align = $align; Before = [math]::Max(0, $before); After = [math]::Max(0, $after); LineHeight = $lh })
         }
     }
     catch { $aligns.Add('left') }
@@ -548,7 +604,7 @@ function Read-ShapeText {
     try { $wrap = Test-MsoTrue $tf.WordWrap } catch { }
     $orient = 1
     try { $orient = [int]$tf.Orientation } catch { }
-    return [pscustomobject]@{ Runs = $runs; Aligns = $aligns; Anchor = $anchor; Margins = $m; Wrap = $wrap; Orientation = $orient }
+    return [pscustomobject]@{ Runs = $runs; Aligns = $aligns; Paras = $paras; Anchor = $anchor; Margins = $m; Wrap = $wrap; Orientation = $orient }
 }
 
 function Export-ChartImage {
@@ -585,6 +641,75 @@ function Export-ChartImage {
     }
     $ErrorText.Value = ($errors -join ' | ')
     return $false
+}
+
+function Export-ShapeViaClipboard {
+    # Camera/linked pictures and some objects have no image stored in the file. Excel renders them
+    # with CopyPicture; the clipboard's text/picture is saved before the first use and restored at the end.
+    param($Shape, [string]$Path, [ref]$ErrorText)
+    try {
+        if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
+            $ErrorText.Value = 'clipboard access needs Windows PowerShell or PowerShell ISE (STA thread)'
+            return $false
+        }
+        Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+        $cb = 'System.Windows.Forms.Clipboard' -as [type]
+        $png = ('System.Drawing.Imaging.ImageFormat' -as [type])::Png
+        if ($null -eq $script:Clip) {
+            $saved = [pscustomobject]@{ Text = $null; Image = $null }
+            try { if ($cb::ContainsText()) { $saved.Text = $cb::GetText() } } catch { }
+            try { if (-not $saved.Text -and $cb::ContainsImage()) { $saved.Image = $cb::GetImage() } } catch { }
+            $script:Clip = $saved
+        }
+        $errs = New-Object System.Collections.Generic.List[string]
+        foreach ($mode in @(@(1, 2), @(2, 2))) {        # (xlScreen, xlBitmap), then (xlPrinter, xlBitmap)
+            try {
+                $cb::Clear()
+                $null = $Shape.CopyPicture($mode[0], $mode[1])
+                $img = $null
+                for ($try = 0; $try -lt 10 -and -not $img; $try++) { Start-Sleep -Milliseconds 100; $img = $cb::GetImage() }
+                if ($img) {
+                    $img.Save($Path, $png); $img.Dispose()
+                    $ErrorText.Value = $null
+                    return $true
+                }
+                $errs.Add(("mode {0}: no picture on the clipboard" -f $mode[0]))
+            }
+            catch { $errs.Add(("mode {0}: {1}" -f $mode[0], $_.Exception.Message)) }
+        }
+        $ErrorText.Value = ($errs -join ' | ')
+        return $false
+    }
+    catch { $ErrorText.Value = $_.Exception.Message; return $false }
+}
+
+function Restore-Clipboard {
+    if ($null -eq $script:Clip) { return }
+    try {
+        $cb = 'System.Windows.Forms.Clipboard' -as [type]
+        $cb::Clear()
+        if ($script:Clip.Text) { $cb::SetText($script:Clip.Text) }
+        elseif ($script:Clip.Image) { $cb::SetImage($script:Clip.Image) }
+        Write-Log 'Clipboard restored to what it held before the run.'
+    }
+    catch { Write-Log ("Clipboard could not be restored: {0}" -f $_.Exception.Message) 'WARN' }
+    $script:Clip = $null
+}
+
+function Add-ObjectPicture {
+    # Adds Excel's own picture of an object, or a labelled placeholder plus a Data check entry.
+    param($Shape, [string]$Name, [string]$What, $Items, [string]$AssetsDir, [double]$L, [double]$T, [double]$W, [double]$H, [double]$Z, [double]$Rot)
+    $script:PictureIndex++
+    $file = 'object-{0:D3}.png' -f $script:PictureIndex
+    $err = $null
+    $ok = (Export-ShapeViaClipboard -Shape $Shape -Path (Join-Path $AssetsDir $file) -ErrorText ([ref]$err)) -eq $true
+    if ($ok) {
+        $Items.Add([pscustomobject]@{ Kind = 'image'; L = $L; T = $T; W = $W; H = $H; Z = $Z; Rot = $Rot; Src = "assets/$file"; Alt = $Name; IsChart = $false })
+        Write-Log ("{0} '{1}' captured as Excel's own picture." -f $What, $Name)
+        return
+    }
+    $Items.Add([pscustomobject]@{ Kind = 'missing'; L = $L; T = $T; W = $W; H = $H; Z = $Z; Rot = $Rot; Message = "$What '$Name' not reproduced - see Excel view" })
+    Add-Issue -Severity Warning -Location "$What '$Name'" -Message ("Could not be reproduced [{0}]. Placeholder shown; see Excel view." -f $err) -Y $T
 }
 
 function Read-OneShape {
@@ -638,8 +763,8 @@ function Read-OneShape {
                 catch { }
             }
             else {
-                $Items.Add([pscustomobject]@{ Kind = 'missing'; L = $L; T = $T; W = $W; H = $H; Z = $Z; Rot = $rot; Message = "Picture '$name' not reproduced - see Excel view" })
-                Add-Issue -Severity Warning -Location "Picture '$name'" -Message 'Picture could not be extracted from the workbook package (linked/camera picture or .xlsb/.xls file). Placeholder shown; see Excel view.' -Y $T
+                # linked/camera picture (or .xlsb/.xls): nothing stored in the file, ask Excel for its picture
+                Add-ObjectPicture -Shape $Shape -Name $name -What 'Picture' -Items $Items -AssetsDir $AssetsDir -L $L -T $T -W $W -H $H -Z $Z -Rot $rot
             }
             return
         }
@@ -685,16 +810,16 @@ function Read-OneShape {
                 }
             }
             catch { }
-            $text = Read-ShapeText $Shape
+            $text = Read-ShapeText -Shape $Shape -Name $name -Y $T
             if (-not $bg -and -not $border -and -not $text) { return }   # invisible helper shape
             $obj = [pscustomobject]@{
                 Kind = 'shape'; L = $L; T = $T; W = $W; H = $H; Z = $Z; Rot = $rot; Name = $name
                 Bg = $bg; Border = $border; Radius = $radius; Shadow = $shadow
-                Runs = $null; Aligns = $null; Anchor = 'top'; Margins = $null; Wrap = $true; TextOrientation = 1
+                Runs = $null; Aligns = $null; Paras = $null; Anchor = 'top'; Margins = $null; Wrap = $true; TextOrientation = 1
             }
             if ($text) {
                 # assigned directly so single-item lists are not unrolled into scalars
-                $obj.Runs = $text.Runs; $obj.Aligns = $text.Aligns; $obj.Anchor = $text.Anchor
+                $obj.Runs = $text.Runs; $obj.Aligns = $text.Aligns; $obj.Paras = $text.Paras; $obj.Anchor = $text.Anchor
                 $obj.Margins = $text.Margins; $obj.Wrap = $text.Wrap; $obj.TextOrientation = $text.Orientation
             }
             $Items.Add($obj)
@@ -709,8 +834,7 @@ function Read-OneShape {
 
         $typeNames = @{ 2 = 'callout'; 7 = 'embedded OLE object'; 8 = 'form control'; 10 = 'linked OLE object'; 12 = 'ActiveX control'; 21 = 'ink'; 24 = 'SmartArt'; 25 = 'slicer'; 26 = 'web video'; 29 = '3D model' }
         $tn = if ($typeNames.ContainsKey($type)) { $typeNames[$type] } else { "type $type" }
-        $Items.Add([pscustomobject]@{ Kind = 'missing'; L = $L; T = $T; W = $W; H = $H; Z = $Z; Rot = 0; Message = "$tn '$name' not reproduced - see Excel view" })
-        Add-Issue -Severity Warning -Location "Object '$name'" -Message ("{0} cannot be reproduced in HTML. Placeholder shown; see Excel view." -f $tn) -Y $T
+        Add-ObjectPicture -Shape $Shape -Name $name -What $tn -Items $Items -AssetsDir $AssetsDir -L $L -T $T -W $W -H $H -Z $Z -Rot 0
     }
     catch {
         Add-Issue -Severity Warning -Location "Object '$name'" -Message ("Could not be read: {0}" -f $_.Exception.Message)
@@ -1004,14 +1128,26 @@ function ConvertTo-ItemHtml {
                 elseif ($It.TextOrientation -eq 3 -or $It.TextOrientation -eq 5) { $tx += ';writing-mode:vertical-rl' }
                 $sb = New-Object System.Text.StringBuilder
                 $pi = 0
-                $alignOf = { param($k) if ($It.Aligns -and $k -lt $It.Aligns.Count) { $It.Aligns[$k] } else { 'left' } }
-                [void]$sb.Append('<div class="pa" style="text-align:' + (& $alignOf $pi) + '">')
+                $alignOf = {
+                    param($k)
+                    if ($It.Paras -and $k -lt $It.Paras.Count) {
+                        $pp = $It.Paras[$k]
+                        $st2 = 'text-align:' + $pp.Align
+                        if ($pp.Before -gt 0) { $st2 += ';margin-top:' + (Format-Num $pp.Before) + 'pt' }
+                        if ($pp.After -gt 0) { $st2 += ';margin-bottom:' + (Format-Num $pp.After) + 'pt' }
+                        if ($pp.LineHeight) { $st2 += ';line-height:' + $pp.LineHeight }
+                        return $st2
+                    }
+                    if ($It.Aligns -and $k -lt $It.Aligns.Count) { return 'text-align:' + $It.Aligns[$k] }
+                    return 'text-align:left'
+                }
+                [void]$sb.Append('<div class="pa" style="' + (& $alignOf $pi) + '">')
                 foreach ($run in $It.Runs) {
                     $segments = ([string]$run.Text) -split "`r"
                     for ($s = 0; $s -lt $segments.Count; $s++) {
                         if ($s -gt 0) {
                             $pi++
-                            [void]$sb.Append('</div><div class="pa" style="text-align:' + (& $alignOf $pi) + '">')
+                            [void]$sb.Append('</div><div class="pa" style="' + (& $alignOf $pi) + '">')
                         }
                         if ($segments[$s].Length) { [void]$sb.Append('<span style="' + (ConvertTo-RunStyle $run) + '">' + (ConvertTo-HtmlText $segments[$s]) + '</span>') }
                         elseif ($s -gt 0 -or $segments.Count -eq 1) { [void]$sb.Append('<span style="' + (ConvertTo-RunStyle $run) + '">&#8203;</span>') }
@@ -1497,6 +1633,12 @@ function Invoke-Main {
         Write-Log 'Opening the temporary copy read-only (links not updated)...'
         $wb = $excel.Workbooks.Open($tempCopy, 0, $true, $m, $m, $m, $true, $m, $m, $false, $false, $m, $false)
 
+        try {
+            $script:ThemeMinor = [string]$wb.Theme.ThemeFontScheme.MinorFont.Item(1).Name
+            $script:ThemeMajor = [string]$wb.Theme.ThemeFontScheme.MajorFont.Item(1).Name
+            Write-Log ("Theme fonts: body '{0}', headings '{1}'" -f $script:ThemeMinor, $script:ThemeMajor)
+        }
+        catch { }
         $ws = $null
         $script:XlApp = $excel
         try { $ws = $wb.Worksheets.Item($SheetName); $script:XlSheet = $ws }
@@ -1595,6 +1737,7 @@ function Invoke-Main {
         }
     }
     finally {
+        Restore-Clipboard
         Write-Log 'Closing the temporary copy without saving and closing the private Excel instance...'
         if ($wb) { try { $null = $wb.Close($false) } catch { } }
         if ($blank) { try { $null = $blank.Close($false) } catch { } }
