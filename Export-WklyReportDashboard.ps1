@@ -4,7 +4,7 @@
     executive HTML dashboard - strictly READ-ONLY.
 
 .DESCRIPTION
-    Workflow:  Excel workbook (Wkly_Report)  ->  this script  ->  index.html dashboard
+    Workflow:  Excel workbook (Wkly_Report)  ->  this script  ->  <workbook name>.html dashboard
 
     SAFETY - the script never changes anything:
       * The original workbook is never opened. It is copied to a private temp folder and
@@ -35,8 +35,8 @@
     The weekly workbook. Default: C:\Temp\Bi_Wkly_Report-Daily Data.xlsx
 
 .PARAMETER OutputDirectory
-    Where index.html and the assets folder are written. Default: C:\Temp\ITSM_Dashboard
-    Each run replaces only what this script generated earlier (index.html, assets\, the log
+    Where the dashboard (<workbook name>.html) and the assets folder are written. Default: C:\Temp\ITSM_Dashboard
+    Each run replaces only what this script generated earlier (the .html, assets\, the log
     and the PDFs); any other files in that folder are left alone.
 
 .PARAMETER PageMode
@@ -68,10 +68,10 @@
     Do not export the full "Wkly_Report (Excel export).pdf".
 
 .PARAMETER ExportDashboardPdf
-    Also print the dashboard to "ITSM_Dashboard.pdf" with Microsoft Edge (headless, local).
+    Also print the dashboard to "<workbook name> (Dashboard).pdf" with Microsoft Edge (headless, local).
 
 .PARAMETER OpenWhenDone
-    Open index.html in the default browser when finished.
+    Open the dashboard in the default browser when finished.
 
 .EXAMPLE
     .\Export-WklyReportDashboard.ps1
@@ -103,7 +103,7 @@ param(
     [switch]$OpenWhenDone
 )
 
-$ScriptBuild = '2026.10.18-r5'
+$ScriptBuild = '2026.10.18-r6'
 $SheetName = 'Wkly_Report'          # fixed by design - no other worksheet is ever read
 $Inv = [System.Globalization.CultureInfo]::InvariantCulture
 $ErrRegex = '#(DIV/0!|N/A|VALUE!|REF!|NAME\?|NUM!|NULL!|SPILL!|CALC!|FIELD!|BLOCKED!|CONNECT!|BUSY!|UNKNOWN!|GETTING_DATA)'
@@ -521,9 +521,12 @@ function Get-RunInfo {
     try { $color = ConvertTo-CssColor $f.Fill.ForeColor.RGB } catch { }
     $under = $false
     try { $under = ([int]$f.UnderlineStyle -ne 0) } catch { }
+    $colorInfo = ''
+    try { $fc = $f.Fill.ForeColor; $colorInfo = 'theme {0}, brightness {1}, tint {2}' -f [int]$fc.ObjectThemeColor, (Format-Num ([double]$fc.Brightness)), (Format-Num ([double]$fc.TintAndShade)) } catch { }
     return [pscustomobject]@{
         Text = [string]$Range.Text; Size = [double]$f.Size; Bold = (Test-MsoTrue $f.Bold)
         Italic = (Test-MsoTrue $f.Italic); Underline = $under; Color = $color; Font = [string]$f.Name
+        ColorInfo = $colorInfo; ColorAdjustedFrom = $null
     }
 }
 
@@ -812,8 +815,11 @@ function Read-OneShape {
             catch { }
             $text = Read-ShapeText -Shape $Shape -Name $name -Y $T
             if (-not $bg -and -not $border -and -not $text) { return }   # invisible helper shape
+            $formula = $null; $autoSize = $null
+            try { $formula = [string]$Shape.DrawingObject.Formula } catch { }
+            try { $autoSize = [int]$Shape.TextFrame2.AutoSize } catch { }
             $obj = [pscustomobject]@{
-                Kind = 'shape'; L = $L; T = $T; W = $W; H = $H; Z = $Z; Rot = $rot; Name = $name
+                Kind = 'shape'; L = $L; T = $T; W = $W; H = $H; Z = $Z; Rot = $rot; Name = $name; Formula = $formula; AutoSize = $autoSize; ShapeType = $ast
                 Bg = $bg; Border = $border; Radius = $radius; Shadow = $shadow
                 Runs = $null; Aligns = $null; Paras = $null; Anchor = 'top'; Margins = $null; Wrap = $true; TextOrientation = 1
             }
@@ -899,6 +905,56 @@ function Get-DarkBand {
         if ((Get-CssLuminance $c.Bg) -lt 0.35) { return $c }
     }
     return $null
+}
+
+function Repair-InvisibleText {
+    # Text drawn in (almost) the same colour as what is behind it cannot be read. Excel shows it, so the
+    # colour Excel reported is incomplete (e.g. a theme colour with brightness). Make it readable and say so.
+    param($Items)
+    $surfaces = @($Items | Where-Object { $_.Bg -and $_.Kind -in 'fill', 'cell', 'shape' })
+    $count = 0
+    foreach ($it in $Items) {
+        if ($it.Kind -ne 'shape' -or -not $it.Runs) { continue }
+        $bg = $it.Bg
+        if (-not $bg) {
+            $cx = $it.L + $it.W / 2; $cy = $it.T + $it.H / 2; $bestZ = -1
+            foreach ($s in $surfaces) {
+                if ($s -eq $it -or $s.Z -ge $it.Z -or $s.Z -le $bestZ) { continue }
+                if ($cx -lt $s.L -or $cx -gt $s.L + $s.W -or $cy -lt $s.T -or $cy -gt $s.T + $s.H) { continue }
+                $bg = $s.Bg; $bestZ = $s.Z
+            }
+        }
+        if (-not $bg) { $bg = '#ffffff' }
+        $bl = Get-CssLuminance $bg
+        foreach ($r in $it.Runs) {
+            if (-not $r.Color -or ([string]$r.Text) -notmatch '\S') { continue }
+            $tl = Get-CssLuminance $r.Color
+            $ratio = ([math]::Max($tl, $bl) + 0.05) / ([math]::Min($tl, $bl) + 0.05)
+            if ($ratio -ge 1.6) { continue }
+            $r | Add-Member -NotePropertyName ColorAdjustedFrom -NotePropertyValue $r.Color -Force
+            $r.Color = if ($bl -gt 0.5) { '#1b2333' } else { '#ffffff' }
+            $count++
+            $t = ([string]$r.Text).Trim(); if ($t.Length -gt 40) { $t = $t.Substring(0, 37) + '...' }
+            Add-Issue -Severity Info -Location "Text box '$($it.Name)'" -Message ("Text '{0}' had colour {1} on background {2} (unreadable; Excel reported {3}). Shown in {4} so it can be read - the text itself is unchanged." -f $t, $r.ColorAdjustedFrom, $bg, $r.ColorInfo, $r.Color) -Y $it.T
+        }
+    }
+    if ($count) { Write-Log ("{0} text run(s) had the same colour as their background and were made readable (listed in Data check)." -f $count) 'WARN' }
+}
+
+function Find-OverlappingText {
+    param($Items)
+    $texts = @($Items | Where-Object { $_.Kind -eq 'shape' -and $_.Runs -and (($_.Runs | ForEach-Object { $_.Text }) -join '') -match '\S' })
+    for ($i = 0; $i -lt $texts.Count; $i++) {
+        for ($j = $i + 1; $j -lt $texts.Count; $j++) {
+            $a = $texts[$i]; $b = $texts[$j]
+            $ox = [math]::Min($a.L + $a.W, $b.L + $b.W) - [math]::Max($a.L, $b.L)
+            $oy = [math]::Min($a.T + $a.H, $b.T + $b.H) - [math]::Max($a.T, $b.T)
+            if ($ox -le 0 -or $oy -le 0) { continue }
+            $small = [math]::Min($a.W * $a.H, $b.W * $b.H)
+            if ($small -le 0 -or ($ox * $oy) / $small -lt 0.2) { continue }
+            Add-Issue -Severity Info -Location ("Text boxes '{0}' / '{1}'" -f $a.Name, $b.Name) -Message 'These text boxes overlap in Excel. If their text collides in the dashboard, turn on Inspect, click each one and send a photo of the panel.' -Y ([math]::Min($a.T, $b.T))
+        }
+    }
 }
 
 function Get-TitleCandidates {
@@ -1091,6 +1147,26 @@ function ConvertTo-RunStyle {
     return ($p -join ';')
 }
 
+function Get-InspectText {
+    # Everything Excel reported for a text box, shown by the dashboard's Inspect mode.
+    param($It)
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add(('{0} | at {1},{2} pt | size {3} x {4} pt | fill {5} | outline {6} | shape type {7}' -f $It.Name, [int]$It.L, [int]$It.T, [int]$It.W, [int]$It.H, $(if ($It.Bg) { $It.Bg } else { 'none' }), $(if ($It.Border) { $It.Border } else { 'none' }), $It.ShapeType))
+    if ($It.Runs) {
+        $m = $It.Margins
+        $lines.Add(('text anchor {0} | margins L{1} T{2} R{3} B{4} | wrap {5} | autosize {6} | link {7}' -f $It.Anchor, $m[0], $m[1], $m[2], $m[3], $It.Wrap, $It.AutoSize, $(if ($It.Formula) { $It.Formula } else { 'none' })))
+        $k = 0
+        foreach ($pp in @($It.Paras)) { if ($pp) { $k++; $lines.Add(('paragraph {0}: align {1}, before {2}pt, after {3}pt, line {4}' -f $k, $pp.Align, (Format-Num $pp.Before), (Format-Num $pp.After), $pp.LineHeight)) } }
+        foreach ($r in $It.Runs) {
+            $t = ([string]$r.Text) -replace "`r", '[para]' -replace "`v", '[line]' -replace "`n", '[line]'
+            if ($t.Length -gt 60) { $t = $t.Substring(0, 57) + '...' }
+            $adj = if ($r.ColorAdjustedFrom) { ' (Excel colour {0}, adjusted to be readable)' -f $r.ColorAdjustedFrom } else { '' }
+            $lines.Add(('"{0}" | {1} {2}pt{3}{4} | colour {5}{6} | {7}' -f $t, $r.Font, $r.Size, $(if ($r.Bold) { ' bold' } else { '' }), $(if ($r.Italic) { ' italic' } else { '' }), $r.Color, $adj, $r.ColorInfo))
+        }
+    }
+    return ($lines -join "`n")
+}
+
 function ConvertTo-ItemHtml {
     param($It, [double]$OffsetX, [double]$OffsetY)
     $box = Get-BoxStyle $It $OffsetX $OffsetY
@@ -1157,7 +1233,7 @@ function ConvertTo-ItemHtml {
                 $inner = '<div class="tx" style="{0}">{1}</div>' -f $tx, $sb.ToString()
             }
             $cls = if ($It.Wrap) { 'it shp' } else { 'it shp nowrap' }
-            return '<div class="{0}" data-name="{1}" style="{2}">{3}</div>' -f $cls, (ConvertTo-Attr $It.Name), $st, $inner
+            return '<div class="{0}" data-i="{1}" style="{2}">{3}</div>' -f $cls, (([System.Net.WebUtility]::HtmlEncode((Get-InspectText $It))) -replace "`n", '&#10;'), $st, $inner
         }
         'line' {
             $w = [math]::Max($It.W, 0.01); $h = [math]::Max($It.H, 0.01)
@@ -1201,12 +1277,13 @@ function New-DashboardSite {
     & $add "`n<link rel=`"stylesheet`" href=`"assets/dashboard.css`">`n</head>`n<body>`n"
 
     # ---- top bar
-    & $add '<header class="topbar"><button class="btn menu" id="btnMenu" title="Show/hide the page list">&#9776;</button><div class="brand"><div class="mark">ITSM</div>EXECUTIVE DASHBOARD</div>'
+    & $add '<header class="topbar"><button class="btn menu" id="btnMenu" title="Show/hide the page list">&#9776;</button><div class="brand"><div class="mark">ITSM</div><span class="lbl">EXECUTIVE DASHBOARD</span></div>'
     & $add ('<div class="tb-title"><b>{0}</b><span>Source: {1} &middot; Wkly_Report (read-only snapshot)</span></div>' -f (& $enc $DashboardTitle), (& $enc $Meta.FileName))
     if ($Meta.ReportingPeriod) { & $add ('<span class="chip" title="Reporting Period (from Wkly_Report)">{0}</span>' -f (& $enc $Meta.ReportingPeriod)) }
     if ($Meta.ReportDate) { & $add ('<span class="chip" title="Report Date (from Wkly_Report)">Report Date: {0}</span>' -f (& $enc $Meta.ReportDate)) }
     & $add ('<button class="btn warn" id="btnLog">Data check <span class="cnt">{0}</span></button>' -f $issueTotal)
     & $add '<div class="zoom" title="Zoom (keys + and -). Fit = whole page width"><button class="btn" id="zOut">&minus;</button><span id="zVal">Fit</span><button class="btn" id="zIn">+</button><button class="btn" id="zFit">Fit</button></div>'
+    & $add '<button class="btn" id="btnInspect" title="Click a text box to see what Excel reported for it">Inspect: off</button>'
     & $add '<button class="btn" id="btnMarkers" title="Show/hide the markers on Excel errors and empty formula results">Markers: on</button>'
     & $add '<button class="btn" id="btnPresent" title="Presentation mode (P)">&#x26F6; Present</button>'
     & $add '<button class="btn" onclick="window.print()">Print / PDF</button>'
@@ -1246,6 +1323,7 @@ function New-DashboardSite {
 
     # ---- data-check drawer
     & $add '<div class="present-hud"><span id="hudPos"></span><button class="btn" id="hudPrev">&#9664;</button><button class="btn" id="hudNext">&#9654;</button><button class="btn" id="hudExit">Exit (Esc)</button></div>'
+    & $add '<div id="inspectBox"><button class="btn" id="inspectClose">&#10005;</button><pre id="inspectText"></pre></div>'
     & $add '<aside class="drawer" id="drawer"><header><b>Data check &amp; extraction log</b><button class="btn" id="btnClose">&#10005;</button></header><div class="body">'
     & $add '<p class="lead">Everything the dashboard could not reproduce exactly is listed here, so nothing is silently replaced. Values themselves are never changed.</p>'
     & $add '<h5>SOURCE</h5><ul>'
@@ -1272,7 +1350,10 @@ function New-DashboardSite {
     & $add ('<h5>LOG</h5><p>Full log: <code>extraction-log.txt</code> in the output folder. Build {0}.</p>' -f $ScriptBuild)
     & $add "</div></aside>`n<script src=`"assets/dashboard.js`"></script>`n</body>`n</html>`n"
 
-    $index = Join-Path $OutDir 'index.html'
+    $index = Join-Path $OutDir ($Meta.BaseName + '.html')
+    # an index.html left by builds r1-r5 of this script is removed so only the current dashboard remains
+    $old = Join-Path $OutDir 'index.html'
+    if ((Test-Path -LiteralPath $old) -and (Select-String -LiteralPath $old -Pattern 'assets/dashboard.js' -SimpleMatch -Quiet)) { Remove-Item -LiteralPath $old -Force }
     [System.IO.File]::WriteAllText($index, $sb.ToString(), (New-Object System.Text.UTF8Encoding($false)))
     return $index
 }
@@ -1292,7 +1373,9 @@ body{margin:0;font-family:"Segoe UI",Calibri,Arial,sans-serif;color:var(--ink);b
 .brand .mark{width:34px;height:34px;border-radius:7px;background:linear-gradient(135deg,var(--gold-2),#8c6d10);display:grid;place-items:center;color:var(--navy);font-size:12px;font-weight:800}
 .tb-title{flex:1;min-width:0}
 .tb-title b{display:block;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.tb-title span{font-size:12px;color:#c3cbe4}
+.tb-title span{display:block;font-size:12px;color:#c3cbe4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.topbar .btn,.topbar .chip,.topbar .conf{flex:none}
+@media (max-width:1750px){.brand{width:auto}.brand .lbl{display:none}.chip{max-width:220px}}
 .chip{border:1px solid rgba(201,162,39,.65);color:var(--gold-2);border-radius:999px;padding:4px 12px;font-size:12px;white-space:nowrap;max-width:340px;overflow:hidden;text-overflow:ellipsis}
 .conf{background:var(--red);color:#fff;border-radius:4px;padding:4px 10px;font-size:11px;font-weight:700;letter-spacing:1.5px}
 .btn{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.22);color:#fff;border-radius:6px;padding:7px 12px;font-size:13px;cursor:pointer;font-family:inherit;white-space:nowrap}
@@ -1371,6 +1454,11 @@ body.no-markers .blankcell{display:none}
 .iss tr.wn td:first-child{border-left:3px solid #e5892a}
 .iss tr.in td:first-child{border-left:3px solid #9aa3b2}
 .iss tr td{font-weight:400;color:var(--ink)}
+#inspectBox{display:none;position:fixed;left:12px;right:12px;bottom:12px;z-index:60;background:#0b1640;color:#fff;border:2px solid #c9a227;border-radius:8px;padding:10px 14px;max-height:45vh;overflow:auto}
+#inspectBox pre{margin:0;white-space:pre-wrap;font:13px/1.45 Consolas,"Cascadia Mono",monospace}
+#inspectBox .btn{float:right}
+body.inspect .shp{cursor:crosshair}
+body.inspect .shp:hover{outline:2px solid #e5484d;outline-offset:-1px}
 .present-hud{display:none}
 body.present .topbar,body.present .sidebar,body.present .xbtn,body.present .badge{display:none}
 body.present main{padding:0}
@@ -1487,6 +1575,23 @@ $DashboardJs = @'
   document.getElementById('btnLog').addEventListener('click', function () { drawer.classList.add('open'); });
   document.getElementById('btnClose').addEventListener('click', function () { drawer.classList.remove('open'); });
   [].slice.call(drawer.querySelectorAll('a[href^="#p"]')).forEach(function (a) { a.addEventListener('click', function () { drawer.classList.remove('open'); }); });
+
+  // Inspect: click a text box to show what Excel reported for it
+  var ib = document.getElementById('inspectBox'), insp = document.getElementById('btnInspect');
+  insp.addEventListener('click', function () {
+    body.classList.toggle('inspect');
+    insp.textContent = body.classList.contains('inspect') ? 'Inspect: on' : 'Inspect: off';
+    if (!body.classList.contains('inspect')) ib.style.display = 'none';
+  });
+  document.getElementById('inspectClose').addEventListener('click', function () { ib.style.display = 'none'; });
+  document.addEventListener('click', function (e) {
+    if (!body.classList.contains('inspect')) return;
+    var t = e.target.closest ? e.target.closest('.shp[data-i]') : null;
+    if (!t) return;
+    e.preventDefault();
+    document.getElementById('inspectText').textContent = t.getAttribute('data-i');
+    ib.style.display = 'block';
+  });
 
   // markers on/off
   var mk = document.getElementById('btnMarkers');
@@ -1713,6 +1818,8 @@ function Invoke-Main {
             catch { Write-Log 'Page breaks could not be read (no printer configured?).' 'WARN' }
         }
 
+        try { Repair-InvisibleText -Items $items } catch { Add-Issue -Severity Warning -Location 'Text colours' -Message ("Colour check failed: {0}" -f (Format-ErrorDetail $_)) }
+        try { Find-OverlappingText -Items $items } catch { }
         $result = Find-ReportPages -Items $items -Geo $geo -ContentWidth $contentWidth -ContentBottom $contentBottom `
             -Mode $PageMode -StartRows $PageStartRows -BreakRows $breakRows -MinFont $TitleMinFontSize -MinHeight $MinPageHeightPt
 
@@ -1763,6 +1870,7 @@ function Invoke-Main {
 
     $meta = [pscustomobject]@{
         FileName        = $sourceInfo.Name
+        BaseName        = (($sourceInfo.BaseName -replace '[\\/:*?"<>|]', '_').Trim())
         SourcePath      = $source
         Saved           = $sourceInfo.LastWriteTime.ToString('dd/MM/yyyy HH:mm')
         Snapshot        = (Get-Date).ToString('dd/MM/yyyy HH:mm')
@@ -1780,7 +1888,7 @@ function Invoke-Main {
     $index = New-DashboardSite -Pages $result.Pages -OutDir $outDir -Meta $meta -Issues $script:Issues
     Write-Log "Dashboard written: $index" 'OK'
 
-    if ($ExportDashboardPdf) { Export-DashboardPdf -IndexPath $index -PdfPath (Join-Path $outDir 'ITSM_Dashboard.pdf') }
+    if ($ExportDashboardPdf) { Export-DashboardPdf -IndexPath $index -PdfPath (Join-Path $outDir ($meta.BaseName + ' (Dashboard).pdf')) }
 
     $errs = @($script:Issues | Where-Object { $_.Severity -eq 'Error' }).Count
     $warns = @($script:Issues | Where-Object { $_.Severity -eq 'Warning' }).Count

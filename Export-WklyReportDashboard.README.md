@@ -34,12 +34,12 @@ cd C:\Temp
 ```
 
 Defaults: the workbook is `C:\Temp\Bi_Wkly_Report-Daily Data.xlsx`; output goes to
-`C:\Temp\ITSM_Dashboard\`. Open `index.html` there in Edge or Chrome.
+`C:\Temp\ITSM_Dashboard\`. Open the dashboard there in Edge or Chrome; it has the workbook's name, e.g. `Bi_Wkly_Report-Daily Data.html`.
 
 The first line printed shows the build, e.g. `Export-WklyReportDashboard build 2026.10.18-r1`,
 so you can confirm which version ran.
 
-Weekly routine: update the workbook as usual → save → run the script → open `index.html`.
+Weekly routine: update the workbook as usual → save → run the script → open `<workbook name>.html`.
 The workbook can stay open in Excel while the script runs.
 
 ## 3. Options
@@ -47,7 +47,7 @@ The workbook can stay open in Excel while the script runs.
 | Parameter | Default | Purpose |
 |---|---|---|
 | `-WorkbookPath` | `C:\Temp\Bi_Wkly_Report-Daily Data.xlsx` | Workbook to read |
-| `-OutputDirectory` | `C:\Temp\ITSM_Dashboard` | Where `index.html` + `assets\` go (only its own earlier output is replaced) |
+| `-OutputDirectory` | `C:\Temp\ITSM_Dashboard` | Where `<workbook name>.html` + `assets\` go (only its own earlier output is replaced) |
 | `-PageMode` | `Auto` | `Auto`, `Titles`, `PageBreaks`, `Manual` |
 | `-PageStartRows` | – | With `-PageMode Manual`: e.g. `1,40,72,105` |
 | `-TitleMinFontSize` | `20` | Font size that counts as a page title |
@@ -56,11 +56,11 @@ The workbook can stay open in Excel while the script runs.
 | `-Classification` | `CONFIDENTIAL` | Marking on top bar and every page footer |
 | `-SkipExcelView` | off | Skip the per-page Excel PDFs (faster) |
 | `-SkipSheetPdf` | off | Skip `Wkly_Report (Excel export).pdf` |
-| `-ExportDashboardPdf` | off | Also save `ITSM_Dashboard.pdf` using Edge (headless, local) |
+| `-ExportDashboardPdf` | off | Also save `<workbook name> (Dashboard).pdf` using Edge (headless, local) |
 | `-OpenWhenDone` | off | Open the dashboard at the end |
 
-Output folder contents: `index.html`, `assets\` (charts, pictures, CSS/JS, `excel-view\page-NN.pdf`),
-`Wkly_Report (Excel export).pdf`, `extraction-log.txt`, and optionally `ITSM_Dashboard.pdf`.
+Output folder contents: `<workbook name>.html`, `assets\` (charts, pictures, CSS/JS, `excel-view\page-NN.pdf`),
+`Wkly_Report (Excel export).pdf`, `extraction-log.txt`, and optionally `<workbook name> (Dashboard).pdf`.
 
 ## 4. Using the dashboard
 
@@ -70,6 +70,8 @@ Output folder contents: `index.html`, `assets\` (charts, pictures, CSS/JS, `exce
 - **Data check**: source file, SHA-256 before/after (proves the file was not changed), the
   page-detection method, and every Excel error, empty formula result, `####` cell and object
   that was not reproduced, each with its cell address or object name.
+- **Inspect: on/off**: click any text box to see what Excel reported for it (fonts, colours, spacing,
+  cell link). Useful when something looks different from Excel — a photo of the panel is enough to diagnose it.
 - **Markers: on/off**: dashed outlines on Excel errors and empty formula results. The value
   itself is never changed.
 - **Excel view** (per page): Excel's own rendering, for side-by-side comparison.
