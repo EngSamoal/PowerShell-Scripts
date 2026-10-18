@@ -103,7 +103,7 @@ param(
     [switch]$OpenWhenDone
 )
 
-$ScriptBuild = '2026.10.18-r2'
+$ScriptBuild = '2026.10.18-r3'
 $SheetName = 'Wkly_Report'          # fixed by design - no other worksheet is ever read
 $Inv = [System.Globalization.CultureInfo]::InvariantCulture
 $ErrRegex = '#(DIV/0!|N/A|VALUE!|REF!|NAME\?|NUM!|NULL!|SPILL!|CALC!|FIELD!|BLOCKED!|CONNECT!|BUSY!|UNKNOWN!|GETTING_DATA)'
@@ -541,37 +541,41 @@ function Read-ShapeText {
 }
 
 function Export-ChartImage {
-    # Returns $null on success, otherwise the error text of every method tried.
+    # Returns $true when the image file was written; otherwise $false with the error text of every
+    # method tried in $ErrorText. Every Excel call is assigned to $null: COM methods such as
+    # Activate() return a value, and anything left uncaptured would become part of the result.
     # Some Excel builds only render a chart for export once its sheet/chart is active, or only
     # while the application window exists, so these are tried in turn on the hidden temp copy
     # (nothing is saved). The first method that works is reused for the remaining charts.
-    param($Shape, [string]$Path)
+    param($Shape, [string]$Path, [ref]$ErrorText)
     $errors = New-Object System.Collections.Generic.List[string]
     $methods = @('direct', 'activate', 'offscreen-window')
     if ($script:ChartMode) { $methods = @($script:ChartMode) + @($methods | Where-Object { $_ -ne $script:ChartMode }) }
     foreach ($method in $methods) {
         try {
             if ($method -eq 'offscreen-window' -and -not $script:XlMadeVisible) {
-                $script:XlApp.Visible = $true
+                $null = ($script:XlApp.Visible = $true)
                 try { $script:XlApp.WindowState = -4143; $script:XlApp.Left = -30000; $script:XlApp.Top = -30000 } catch { }
                 $script:XlMadeVisible = $true
                 Write-Log 'Charts only export with a visible Excel window on this PC; the private Excel window (temp copy) was moved off-screen.' 'WARN'
             }
             if ($method -ne 'direct') {
-                $script:XlSheet.Activate()
-                try { $Shape.Chart.Parent.Activate() } catch { }
+                $null = $script:XlSheet.Activate()
+                try { $null = $Shape.Chart.Parent.Activate() } catch { }
             }
-            if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Force }
+            if (Test-Path -LiteralPath $Path) { $null = Remove-Item -LiteralPath $Path -Force }
             $ret = $Shape.Chart.Export($Path, 'PNG', $false)
             if ((Test-Path -LiteralPath $Path) -and (Get-Item -LiteralPath $Path).Length -gt 0) {
                 if ($script:ChartMode -ne $method) { $script:ChartMode = $method; Write-Log "Chart export method in use: $method" }
-                return $null
+                $ErrorText.Value = $null
+                return $true
             }
             $errors.Add(('{0}: Export returned {1} but wrote no file' -f $method, $ret))
         }
         catch { $errors.Add(('{0}: {1}' -f $method, $_.Exception.Message)) }
     }
-    return ($errors -join ' | ')
+    $ErrorText.Value = ($errors -join ' | ')
+    return $false
 }
 
 function Read-OneShape {
@@ -598,8 +602,9 @@ function Read-OneShape {
             $full = Join-Path $AssetsDir $file
             $title = $name
             try { if (Test-MsoTrue $Shape.Chart.HasTitle) { $title = [string]$Shape.Chart.ChartTitle.Text } } catch { }
-            $exportError = Export-ChartImage -Shape $Shape -Path $full
-            if (-not $exportError) {
+            $exportError = $null
+            $exported = (Export-ChartImage -Shape $Shape -Path $full -ErrorText ([ref]$exportError)) -eq $true
+            if ($exported) {
                 $Items.Add([pscustomobject]@{ Kind = 'image'; L = $L; T = $T; W = $W; H = $H; Z = $Z; Rot = $rot; Src = "assets/$file"; Alt = $title; IsChart = $true })
                 if ((Get-Item -LiteralPath $full).Length -lt 1500) {
                     Add-Issue -Severity Warning -Location "Chart '$name'" -Message 'Exported chart image is very small and may be blank - compare with Excel view.' -Y $T
@@ -723,19 +728,48 @@ function Read-ShapeItems {
 #  Page detection (pure logic - no Excel calls)
 # ======================================================================================
 
+function Get-CssLuminance {
+    param([string]$Css)
+    if (-not $Css) { return 1.0 }
+    if ($Css -match '#([0-9a-fA-F]{2})([0-9a-fA-F]{2})([0-9a-fA-F]{2})') { $r = [Convert]::ToInt32($Matches[1], 16); $g = [Convert]::ToInt32($Matches[2], 16); $b = [Convert]::ToInt32($Matches[3], 16) }
+    elseif ($Css -match 'rgba?\((\d+),(\d+),(\d+)') { $r = [int]$Matches[1]; $g = [int]$Matches[2]; $b = [int]$Matches[3] }
+    else { return 1.0 }
+    return (0.2126 * $r + 0.7152 * $g + 0.0722 * $b) / 255
+}
+
+function Get-DarkBand {
+    # A page-wide dark band/panel (navy header, dark cover) whose top is just above the text.
+    param($It, $Items, [double]$ContentWidth)
+    $px = $It.L + [math]::Min(10, $It.W / 2); $py = $It.T + [math]::Min(6, $It.H / 2)
+    foreach ($c in $Items) {
+        if (($c.Kind -ne 'shape' -and $c.Kind -ne 'fill') -or -not $c.Bg) { continue }
+        if ($c.W -lt 0.45 * $ContentWidth) { continue }
+        if ($c.L -gt $px -or ($c.L + $c.W) -lt $px -or $c.T -gt $py -or ($c.T + $c.H) -lt $py) { continue }
+        if ($It.T - $c.T -gt 80) { continue }
+        if ((Get-CssLuminance $c.Bg) -lt 0.35) { return $c }
+    }
+    return $null
+}
+
 function Get-TitleCandidates {
+    # A page title is short text on the left of the sheet that is either very large (>= MinFont)
+    # or >= 16pt and sitting at the top of a page-wide dark header band.
     param($Items, [double]$ContentWidth, [double]$MinFont)
     $list = New-Object System.Collections.Generic.List[object]
     foreach ($it in $Items) {
         if ($it.Kind -ne 'cell' -and $it.Kind -ne 'shape') { continue }
         $size = Get-ItemMaxFont $it
-        if ($size -lt $MinFont) { continue }
+        if ($size -lt [math]::Min(16, $MinFont)) { continue }
         $t = ((Get-ItemText $it) -replace '\s+', ' ').Trim()
         if ($t.Length -eq 0 -or $t.Length -gt 120) { continue }
         if ([regex]::Matches($t, '\p{L}').Count -lt 4) { continue }
         if ($t -match $ErrRegex) { continue }
         if ($it.L -gt 0.35 * $ContentWidth) { continue }
-        $list.Add([pscustomobject]@{ Text = $t; Top = [double]$it.T; Item = $it })
+        $reason = $null
+        if ($size -ge $MinFont) { $reason = 'large font' }
+        elseif (Get-DarkBand -It $it -Items $Items -ContentWidth $ContentWidth) { $reason = 'header band' }
+        if (-not $reason) { continue }
+        $list.Add([pscustomobject]@{ Text = $t; Top = [double]$it.T; Item = $it; Size = $size; Reason = $reason })
     }
     return @($list | Sort-Object Top, { $_.Item.L })
 }
@@ -795,9 +829,12 @@ function Find-ReportPages {
         $cur = [pscustomobject]@{ Y = 0.0; Title = $null; TitleTop = $null }
         $starts.Add($cur)
         foreach ($c in $cands) {
-            if ($null -eq $cur.Title -and ($c.Top - $cur.Y) -lt $MinHeight) { $cur.Title = $c.Text; $cur.TitleTop = $c.Top; continue }
+            $row = Get-RowAtY $Geo.RowTops $Geo.LastRow $c.Top
+            $short = if ($c.Text.Length -gt 50) { $c.Text.Substring(0, 47) + '...' } else { $c.Text }
+            if ($null -eq $cur.Title -and ($c.Top - $cur.Y) -lt $MinHeight) { $cur.Title = $c.Text; $cur.TitleTop = $c.Top; Write-Log ("  title row {0} ({1}pt, {2}): '{3}' -> title of current page" -f $row, $c.Size, $c.Reason, $short); continue }
             $ref = if ($null -ne $cur.TitleTop) { $cur.TitleTop } else { $cur.Y }
-            if (($c.Top - $ref) -lt $MinHeight) { continue }
+            if (($c.Top - $ref) -lt $MinHeight) { Write-Log ("  title row {0} ({1}pt, {2}): '{3}' -> ignored, within {4}pt of the previous title" -f $row, $c.Size, $c.Reason, $short, $MinHeight); continue }
+            Write-Log ("  title row {0} ({1}pt, {2}): '{3}' -> NEW PAGE" -f $row, $c.Size, $c.Reason, $short)
             $b = Get-PageBoundary -Candidate $c -Items $Items -MinY ($ref + 1)
             $cur = [pscustomobject]@{ Y = $b; Title = $c.Text; TitleTop = $c.Top }
             $starts.Add($cur)
@@ -831,7 +868,7 @@ function Find-ReportPages {
         $pageItems = @($Items | Where-Object { $_.T -lt $ey - 1 -and ($_.T + [math]::Max($_.H, 0.5)) -gt $sy + 1 } | Sort-Object Z)
         $content = @($pageItems | Where-Object { $_.Kind -in 'cell', 'shape', 'image', 'missing' })
         if ($content.Count -eq 0) { continue }
-        # crop the page to its own content: left edge includes coloured side bars, right edge the content
+        # content extent of this page; left edge includes coloured side bars
         $minL = $ContentWidth; $maxR = 0
         foreach ($it in $content) { if ($it.L -lt $minL) { $minL = $it.L }; if ($it.L + $it.W -gt $maxR) { $maxR = $it.L + $it.W } }
         foreach ($it in $pageItems) { if ($it.Kind -eq 'fill' -and $it.L -lt $minL -and $it.L + $it.W -gt $minL - 40) { $minL = $it.L } }
@@ -848,7 +885,14 @@ function Find-ReportPages {
                 Items    = $pageItems; ExcelView = $null; IssueCount = 0
             })
     }
+    # All pages share one horizontal crop so they have the same scale and line up with each other.
+    if ($pages.Count) {
+        $gL = ($pages | Measure-Object -Property OffsetX -Minimum).Minimum
+        $gR = ($pages | ForEach-Object { $_.OffsetX + $_.Width } | Measure-Object -Maximum).Maximum
+        foreach ($p in $pages) { $p.OffsetX = $gL; $p.Width = $gR - $gL }
+    }
     Write-Log ("Page detection - {0}. Pages: {1}" -f $method, $pages.Count) 'OK'
+    foreach ($p in $pages) { Write-Log ("  page {0}: rows {1}-{2}, {3} x {4} pt, '{5}'" -f $p.Index, $p.StartRow, $p.EndRow, [int]$p.Width, [int]($p.EndY - $p.StartY), $p.Title) }
     return [pscustomobject]@{ Pages = $pages; Method = $method }
 }
 
@@ -1000,6 +1044,7 @@ function New-DashboardSite {
     if ($Meta.ReportingPeriod) { & $add ('<span class="chip" title="Reporting Period (from Wkly_Report)">{0}</span>' -f (& $enc $Meta.ReportingPeriod)) }
     if ($Meta.ReportDate) { & $add ('<span class="chip" title="Report Date (from Wkly_Report)">Report Date: {0}</span>' -f (& $enc $Meta.ReportDate)) }
     & $add ('<button class="btn warn" id="btnLog">Data check <span class="cnt">{0}</span></button>' -f $issueTotal)
+    & $add '<div class="zoom" title="Zoom (keys + and -). Fit = whole page width"><button class="btn" id="zOut">&minus;</button><span id="zVal">Fit</span><button class="btn" id="zIn">+</button><button class="btn" id="zFit">Fit</button></div>'
     & $add '<button class="btn" id="btnMarkers" title="Show/hide the markers on Excel errors and empty formula results">Markers: on</button>'
     & $add '<button class="btn" id="btnPresent" title="Presentation mode (P)">&#x26F6; Present</button>'
     & $add '<button class="btn" onclick="window.print()">Print / PDF</button>'
@@ -1081,7 +1126,6 @@ html{scroll-behavior:smooth}
 body{margin:0;font-family:"Segoe UI",Calibri,Arial,sans-serif;color:var(--ink);background:var(--bg);-webkit-print-color-adjust:exact;print-color-adjust:exact}
 .topbar{position:sticky;top:0;z-index:30;min-height:62px;background:var(--navy);color:#fff;display:flex;align-items:center;gap:12px;padding:6px 18px 6px 0;border-bottom:3px solid var(--gold)}
 .menu{margin-left:12px;font-size:16px;padding:5px 10px}
-body.nosb .sidebar{display:none}
 .brand{width:250px;flex:none;display:flex;align-items:center;gap:10px;padding-left:8px;font-weight:700;letter-spacing:.6px;font-size:14px}
 .brand .mark{width:34px;height:34px;border-radius:7px;background:linear-gradient(135deg,var(--gold-2),#8c6d10);display:grid;place-items:center;color:var(--navy);font-size:12px;font-weight:800}
 .tb-title{flex:1;min-width:0}
@@ -1095,7 +1139,12 @@ body.nosb .sidebar{display:none}
 .btn.warn{border-color:#f0b4ad}
 .btn .cnt{background:var(--red);border-radius:999px;padding:0 6px;margin-left:6px;font-size:11px}
 .layout{display:flex}
-.sidebar{position:sticky;top:65px;height:calc(100vh - 65px);width:270px;flex:none;background:#fff;border-right:1px solid var(--line);display:flex;flex-direction:column}
+.sidebar{position:fixed;left:0;top:65px;z-index:45;height:calc(100vh - 65px);width:300px;background:#fff;border-right:1px solid var(--line);box-shadow:8px 0 24px rgba(0,0,0,.15);display:flex;flex-direction:column;transform:translateX(-105%);transition:transform .2s ease}
+body.sb .sidebar{transform:none}
+.zoom{display:flex;align-items:center;gap:4px}
+.zoom .btn{padding:6px 10px}
+.zoom span{font-size:12px;color:#c3cbe4;min-width:44px;text-align:center}
+.pbody{overflow-x:auto}
 .sidebar h4{margin:16px 22px 4px;font-size:11px;letter-spacing:1.6px;color:var(--muted)}
 nav{overflow:auto}
 nav ol{list-style:none;margin:0;padding:6px 12px}
@@ -1211,6 +1260,14 @@ $DashboardJs = @'
     });
   });
 
+  var zoom = 1;
+  try { zoom = parseFloat(localStorage.getItem('itsmdash.zoom')) || 1; } catch (e) { }
+  function setZoom(z) {
+    zoom = Math.max(0.5, Math.min(3, Math.round(z * 100) / 100));
+    document.getElementById('zVal').textContent = zoom === 1 ? 'Fit' : Math.round(zoom * 100) + '%';
+    try { localStorage.setItem('itsmdash.zoom', String(zoom)); } catch (e) { }
+    fit();
+  }
   function fit() {
     var present = body.classList.contains('present');
     pages.forEach(function (p) {
@@ -1219,7 +1276,7 @@ $DashboardJs = @'
       var W = parseFloat(cv.dataset.w), H = parseFloat(cv.dataset.h);
       var avail = p.querySelector('.pbody').clientWidth - 12;
       if (present) avail = window.innerWidth - 12;
-      var s = avail / W;
+      var s = avail / W * (present ? 1 : zoom);
       if (present) {
         var ah = window.innerHeight - p.querySelector('.pbar').offsetHeight - p.querySelector('.pf').offsetHeight - 14;
         s = Math.min(s, ah / H);
@@ -1234,14 +1291,13 @@ $DashboardJs = @'
   fit();
   if (document.fonts && document.fonts.ready) document.fonts.ready.then(fit);
 
-  // page list on/off (gives the pages the whole window width); remembered per browser
-  try { if (localStorage.getItem('itsmdash.nosb') === '1') body.classList.add('nosb'); } catch (e) { }
-  fit();
-  document.getElementById('btnMenu').addEventListener('click', function () {
-    body.classList.toggle('nosb');
-    try { localStorage.setItem('itsmdash.nosb', body.classList.contains('nosb') ? '1' : '0'); } catch (e) { }
-    fit();
-  });
+  // page list is a pop-out, so pages always use the whole window width
+  document.getElementById('btnMenu').addEventListener('click', function () { body.classList.toggle('sb'); });
+  [].slice.call(document.querySelectorAll('#nav a')).forEach(function (a) { a.addEventListener('click', function () { body.classList.remove('sb'); }); });
+  document.getElementById('zIn').addEventListener('click', function () { setZoom(zoom + 0.25); });
+  document.getElementById('zOut').addEventListener('click', function () { setZoom(zoom - 0.25); });
+  document.getElementById('zFit').addEventListener('click', function () { setZoom(1); });
+  setZoom(zoom);
 
   // navigation highlight
   var links = [].slice.call(document.querySelectorAll('#nav a'));
@@ -1305,6 +1361,8 @@ $DashboardJs = @'
   document.addEventListener('keydown', function (e) {
     if (e.key === 'Escape') drawer.classList.remove('open');
     if (!body.classList.contains('present')) {
+      if ((e.key === '+' || e.key === '=') && !e.ctrlKey) { setZoom(zoom + 0.25); return; }
+      if (e.key === '-' && !e.ctrlKey) { setZoom(zoom - 0.25); return; }
       if ((e.key === 'p' || e.key === 'P') && !e.ctrlKey && !e.metaKey && !e.altKey) { e.preventDefault(); startPresent(); }
       return;
     }
@@ -1492,7 +1550,7 @@ function Invoke-Main {
                 $pdf = Join-Path $assets ('excel-view\page-{0:D2}.pdf' -f $p.Index)
                 try {
                     $rng = $ws.Range(('A{0}:{1}{2}' -f $p.StartRow, $lastColLetter, $p.EndRow))
-                    $rng.ExportAsFixedFormat(0, $pdf, 0, $true, $true)
+                    $null = $rng.ExportAsFixedFormat(0, $pdf, 0, $true, $true)
                     if (Test-Path -LiteralPath $pdf) { $p.ExcelView = 'assets/excel-view/page-{0:D2}.pdf' -f $p.Index; $ok++ }
                 }
                 catch { Add-Issue -Severity Warning -Location ("Page {0}" -f $p.Index) -Message ("Excel view PDF could not be exported: {0}" -f $_.Exception.Message) -Y $p.StartY }
@@ -1501,15 +1559,15 @@ function Invoke-Main {
         }
         if (-not $SkipSheetPdf) {
             $sheetPdf = Join-Path $outDir 'Wkly_Report (Excel export).pdf'
-            try { $ws.ExportAsFixedFormat(0, $sheetPdf, 0, $true, $false); Write-Log "Excel PDF of Wkly_Report written: $sheetPdf" 'OK' }
+            try { $null = $ws.ExportAsFixedFormat(0, $sheetPdf, 0, $true, $false); Write-Log "Excel PDF of Wkly_Report written: $sheetPdf" 'OK' }
             catch { Add-Issue -Severity Warning -Location 'Wkly_Report PDF' -Message ("Excel could not export the worksheet PDF: {0}" -f $_.Exception.Message) }
         }
     }
     finally {
         Write-Log 'Closing the temporary copy without saving and closing the private Excel instance...'
-        if ($wb) { try { $wb.Close($false) } catch { } }
-        if ($blank) { try { $blank.Close($false) } catch { } }
-        if ($excel) { try { $excel.Quit() } catch { } }
+        if ($wb) { try { $null = $wb.Close($false) } catch { } }
+        if ($blank) { try { $null = $blank.Close($false) } catch { } }
+        if ($excel) { try { $null = $excel.Quit() } catch { } }
         foreach ($o in @($ws, $used, $wb, $blank, $excel)) {
             if ($null -ne $o -and [System.Runtime.InteropServices.Marshal]::IsComObject($o)) { try { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($o) } catch { } }
         }
