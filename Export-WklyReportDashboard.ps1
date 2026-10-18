@@ -103,7 +103,7 @@ param(
     [switch]$OpenWhenDone
 )
 
-$ScriptBuild = '2026.10.18-r3'
+$ScriptBuild = '2026.10.18-r4'
 $SheetName = 'Wkly_Report'          # fixed by design - no other worksheet is ever read
 $Inv = [System.Globalization.CultureInfo]::InvariantCulture
 $ErrRegex = '#(DIV/0!|N/A|VALUE!|REF!|NAME\?|NUM!|NULL!|SPILL!|CALC!|FIELD!|BLOCKED!|CONNECT!|BUSY!|UNKNOWN!|GETTING_DATA)'
@@ -140,6 +140,17 @@ function Add-Issue {
     $script:Issues.Add([pscustomobject]@{ Severity = $Severity; Location = $Location; Message = $Message; Y = $Y; Page = $null })
     $level = switch ($Severity) { 'Error' { 'WARN' } 'Warning' { 'WARN' } default { 'INFO' } }
     Write-Log ("{0}: {1}" -f $Location, $Message) $level
+}
+
+function Format-ErrorDetail {
+    # Message plus the script line and call path, so a failure can be located from the log alone.
+    param($ErrorRecord)
+    $msg = $ErrorRecord.Exception.Message
+    $ii = $ErrorRecord.InvocationInfo
+    if ($ii -and $ii.ScriptLineNumber) { $msg += (' [line {0}: {1}]' -f $ii.ScriptLineNumber, $ii.Line.Trim()) }
+    $stack = [string]$ErrorRecord.ScriptStackTrace
+    if ($stack) { $msg += ' [stack: ' + (($stack -split "`r?`n" | Select-Object -First 4) -join ' <- ') + ']' }
+    return $msg
 }
 
 function Format-Num {
@@ -549,7 +560,7 @@ function Export-ChartImage {
     # (nothing is saved). The first method that works is reused for the remaining charts.
     param($Shape, [string]$Path, [ref]$ErrorText)
     $errors = New-Object System.Collections.Generic.List[string]
-    $methods = @('direct', 'activate', 'offscreen-window')
+    $methods = @('direct', 'sheet-active', 'chart-activate', 'offscreen-window')
     if ($script:ChartMode) { $methods = @($script:ChartMode) + @($methods | Where-Object { $_ -ne $script:ChartMode }) }
     foreach ($method in $methods) {
         try {
@@ -559,10 +570,8 @@ function Export-ChartImage {
                 $script:XlMadeVisible = $true
                 Write-Log 'Charts only export with a visible Excel window on this PC; the private Excel window (temp copy) was moved off-screen.' 'WARN'
             }
-            if ($method -ne 'direct') {
-                $null = $script:XlSheet.Activate()
-                try { $null = $Shape.Chart.Parent.Activate() } catch { }
-            }
+            if ($method -ne 'direct') { $null = $script:XlSheet.Activate() }
+            if ($method -eq 'chart-activate' -or $method -eq 'offscreen-window') { try { $null = $Shape.Chart.Parent.Activate() } catch { } }
             if (Test-Path -LiteralPath $Path) { $null = Remove-Item -LiteralPath $Path -Force }
             $ret = $Shape.Chart.Export($Path, 'PNG', $false)
             if ((Test-Path -LiteralPath $Path) -and (Get-Item -LiteralPath $Path).Length -gt 0) {
@@ -709,19 +718,36 @@ function Read-OneShape {
 }
 
 function Read-ShapeItems {
-    param($Ws, [string]$AssetsDir, [hashtable]$MediaMap)
-    $items = New-Object System.Collections.Generic.List[object]
-    $n = [int]$Ws.Shapes.Count
+    # Each object is read on its own: a failure is recorded and skipped, never fatal.
+    param($Ws, [string]$AssetsDir, [hashtable]$MediaMap, $Items)
+    $shapes = $Ws.Shapes
+    $n = [int]$shapes.Count
+    $failedInRow = 0
     for ($k = 1; $k -le $n; $k++) {
         Write-Progress -Activity 'Reading Wkly_Report shapes and charts' -PercentComplete ([int](100 * $k / [math]::Max(1, $n)))
-        $s = $Ws.Shapes.Item($k)
+        $s = $null
+        try { $s = $shapes.Item($k) } catch { }
+        if ($null -eq $s) {
+            # Excel can hand back an empty collection reference after a chart was activated; fetch it again once.
+            try { $shapes = $Ws.Shapes; $s = $shapes.Item($k) }
+            catch { Add-Issue -Severity Warning -Location "Object #$k" -Message ("Could not be read and was skipped: {0}" -f (Format-ErrorDetail $_)) }
+        }
+        if ($null -eq $s) {
+            $failedInRow++
+            if ($failedInRow -ge 10) {
+                Add-Issue -Severity Error -Location 'Wkly_Report objects' -Message ("Excel stopped answering after object {0} of {1}; the remaining objects are missing from the dashboard (see Excel view)." -f ($k - 10), $n)
+                break
+            }
+            continue
+        }
+        $failedInRow = 0
         $zp = $k
         try { $zp = [int]$s.ZOrderPosition } catch { }
-        Read-OneShape -Shape $s -Z (10 + $zp) -Items $items -AssetsDir $AssetsDir -MediaMap $MediaMap
+        try { Read-OneShape -Shape $s -Z (10 + $zp) -Items $Items -AssetsDir $AssetsDir -MediaMap $MediaMap }
+        catch { Add-Issue -Severity Warning -Location "Object #$k" -Message ("Could not be read and was skipped: {0}" -f (Format-ErrorDetail $_)) }
     }
     Write-Progress -Activity 'Reading Wkly_Report shapes and charts' -Completed
     Write-Log ("Read {0} shapes ({1} charts exported)." -f $n, $script:ChartIndex)
-    return , $items
 }
 
 # ======================================================================================
@@ -1494,16 +1520,21 @@ function Invoke-Main {
         $geo = Get-SheetGeometry -Ws $ws -LastRow $lastRow -LastCol $lastCol
 
         Write-Log 'Reading cell background fills...'
-        foreach ($it in (Read-FillItems -Ws $ws -Geo $geo -R1 ([int]$used.Row) -C1 ([int]$used.Column) -R2 ([int]$used.Row + [int]$used.Rows.Count - 1) -C2 ([int]$used.Column + [int]$used.Columns.Count - 1))) { $items.Add($it) }
+        try { foreach ($it in (Read-FillItems -Ws $ws -Geo $geo -R1 ([int]$used.Row) -C1 ([int]$used.Column) -R2 ([int]$used.Row + [int]$used.Rows.Count - 1) -C2 ([int]$used.Column + [int]$used.Columns.Count - 1))) { $items.Add($it) } }
+        catch { Add-Issue -Severity Warning -Location 'Cell fills' -Message ("Background colours could not be read: {0}" -f (Format-ErrorDetail $_)) }
         Write-Log 'Reading cells (displayed text and formatting)...'
-        $cellItems = Read-CellItems -Ws $ws -Geo $geo
+        $cellItems = @()
+        try { $cellItems = Read-CellItems -Ws $ws -Geo $geo }
+        catch { Add-Issue -Severity Error -Location 'Cells' -Message ("Cell values could not be read: {0}" -f (Format-ErrorDetail $_)) }
         foreach ($it in $cellItems) { $items.Add($it) }
         $cellCount = @($cellItems | Where-Object { $_.Kind -eq 'cell' }).Count
         foreach ($b in @($cellItems | Where-Object { $_.Kind -eq 'blank' })) {
             Add-Issue -Severity Info -Location "Wkly_Report!$($b.Address)" -Message 'Formula returns an empty value - shown as blank (dashed marker), not as zero.' -Y $b.T
         }
         Write-Log 'Reading shapes, text boxes, charts and pictures...'
-        $shapeItems = Read-ShapeItems -Ws $ws -AssetsDir $assets -MediaMap $mediaMap
+        $shapeItems = New-Object System.Collections.Generic.List[object]
+        try { Read-ShapeItems -Ws $ws -AssetsDir $assets -MediaMap $mediaMap -Items $shapeItems }
+        catch { Add-Issue -Severity Error -Location 'Wkly_Report objects' -Message ("Reading objects stopped early; what was read is shown: {0}" -f (Format-ErrorDetail $_)) }
         foreach ($it in $shapeItems) { $items.Add($it) }
         $shapeCount = @($shapeItems | Where-Object { $_.Kind -eq 'shape' }).Count
 
@@ -1620,7 +1651,7 @@ if ($MyInvocation.InvocationName -ne '.') {
     $outForLog = $null
     try { $outForLog = Invoke-Main }
     catch {
-        Write-Log $_.Exception.Message 'ERROR'
+        Write-Log (Format-ErrorDetail $_) 'ERROR'
         Write-Log 'No dashboard was produced. The original workbook was not modified.' 'ERROR'
         $exitCode = 1
     }
