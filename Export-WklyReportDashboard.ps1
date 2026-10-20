@@ -103,7 +103,7 @@ param(
     [switch]$OpenWhenDone
 )
 
-$ScriptBuild = '2026.10.20-r16'
+$ScriptBuild = '2026.10.20-r17'
 $SheetName = 'Wkly_Report'          # fixed by design - no other worksheet is ever read
 $Inv = [System.Globalization.CultureInfo]::InvariantCulture
 $ErrRegex = '#(DIV/0!|N/A|VALUE!|REF!|NAME\?|NUM!|NULL!|SPILL!|CALC!|FIELD!|BLOCKED!|CONNECT!|BUSY!|UNKNOWN!|GETTING_DATA)'
@@ -828,22 +828,43 @@ namespace ItsmDash {
 
 function Export-RangePicture {
     # Excel's own picture of a cell range including every chart, shape and text box on it.
-    # Vector (EMF) rendered at 2x for sharpness; bitmap as fallback. Uses the clipboard (restored later).
-    param($Range, [string]$Path, [double]$WidthPt, [double]$HeightPt, [ref]$ErrorText)
+    # 1) print-quality vector picture rendered at 3x (sharp text, exact letter positions);
+    # 2) Excel's screen image (exactly as on screen, but only at the monitor's resolution);
+    # 3) screen-layout vector picture. Uses the clipboard (restored later).
+    param($Range, [string]$Path, [double]$WidthPt, [double]$HeightPt, [ref]$ErrorText, [bool]$PrintQuality = $true)
     $errs = New-Object System.Collections.Generic.List[string]
-    if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
-        $ErrorText.Value = 'clipboard access needs Windows PowerShell or PowerShell ISE (STA thread)'
-        return $false
+    if (-not $script:TestClipboard) {
+        if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
+            $ErrorText.Value = 'clipboard access needs Windows PowerShell or PowerShell ISE (STA thread)'
+            return $false
+        }
+        Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+        Save-ClipboardOnce
     }
-    Add-Type -AssemblyName System.Windows.Forms, System.Drawing
-    Save-ClipboardOnce
     $wPx = [int][math]::Ceiling($WidthPt * 96 / 72 * $script:PictureScale)
     $hPx = [int][math]::Ceiling($HeightPt * 96 / 72 * $script:PictureScale)
     $emfType = 'ItsmDash.EmfClip4' -as [type]
+    if ($script:TestClipboard) { $emfType = $script:TestClipboard }   # test hook
     $attempts = 0
     while ($attempts -lt 2) {
         $attempts = $attempts + 1
-        # 1) Excel's own screen image of the range (identical to what Excel shows; resolution follows
+        # 1) print-quality vector picture (xlPrinter): letter positions at printer precision, no gridlines
+        if ($PrintQuality -and $emfType) {
+            try {
+                $err = $null
+                $copied = Get-ClipboardPicture -Target $Range -Appearance 2 -Format -4147 -ErrorText ([ref]$err)   # xlPrinter, xlPicture
+                if ($copied -and $emfType::SavePng($Path, $wPx, $hPx)) {
+                    $script:PictureMethods['print-quality picture'] = 1 + [int]$script:PictureMethods['print-quality picture']
+                    $ErrorText.Value = $null
+                    return $true
+                }
+                $why = 'picture could not be read'
+                if ($err) { $why = [string]$err }
+                $errs.Add('print-quality: ' + $why)
+            }
+            catch { $errs.Add('print-quality: ' + $_.Exception.Message) }
+        }
+        # 2) Excel's own screen image of the range (identical to what Excel shows; resolution follows
         #    the hidden window's zoom, which Add-PagePictures raises)
         try {
             $err = $null
@@ -859,7 +880,7 @@ function Export-RangePicture {
             $errs.Add('screen image: ' + $err)
         }
         catch { $errs.Add('screen image: ' + $_.Exception.Message) }
-        # 2) fallback: vector picture drawn with GDI+
+        # 3) fallback: screen-layout vector picture drawn with GDI+
         if ($emfType) {
             try {
                 $err = $null
@@ -945,8 +966,42 @@ function Add-PagePictures {
         Write-Log ("'{0}' runs past the end of page {1}: page {1} extended to show it whole; it is hidden from the next page's picture." -f $o.Name, $o.Page)
     }
 
+    $printOk = $true
+    try {
+        $ps = $Ws.PageSetup
+        if ((Test-MsoTrue $ps.BlackAndWhite) -or (Test-MsoTrue $ps.Draft)) {
+            $printOk = $false
+            Write-Log 'Wkly_Report prints in black & white or draft mode; using screen pictures.' 'WARN'
+        }
+    }
+    catch { }
+    $noPrint = New-Object System.Collections.Generic.List[object]
+    if ($printOk) {
+        try {
+            $n = [int]$Ws.Shapes.Count
+            for ($k = 1; $k -le $n; $k++) {
+                try {
+                    $s = $Ws.Shapes.Item($k)
+                    if ((Test-MsoTrue $s.Visible) -and ($s.DrawingObject.PrintObject -eq $false)) {
+                        $noPrint.Add([pscustomobject]@{ Name = [string]$s.Name; Top = [double]$s.Top; Bottom = [double]$s.Top + [double]$s.Height })
+                    }
+                }
+                catch { }
+            }
+        }
+        catch { }
+    }
+
     $ok = 0
     foreach ($p in $Pages) {
+        $usePrint = $printOk
+        foreach ($np in $noPrint) {
+            if ($np.Bottom -gt $p.StartY -and $np.Top -lt $p.EndY) {
+                $usePrint = $false
+                Write-Log ("Page {0}: '{1}' is set not to print, so this page uses Excel's screen picture." -f $p.Index, $np.Name)
+                break
+            }
+        }
         $hidden = New-Object System.Collections.Generic.List[object]
         foreach ($o in $overhang) {
             if ($o.Page -ne $p.Index -and $o.Bottom -gt $p.StartY -and $o.Top -lt $p.EndY) {
@@ -964,11 +1019,11 @@ function Add-PagePictures {
             $addr = (ConvertTo-ColumnLetter $c1) + [string]$p.StartRow + ':' + (ConvertTo-ColumnLetter $c2) + [string]$p.EndRow
             $file = 'page-{0:D2}.png' -f $p.Index
             $err = $null
-            $done = (Export-RangePicture -Range $Ws.Range($addr) -Path (Join-Path $AssetsDir $file) -WidthPt $W -HeightPt $H -ErrorText ([ref]$err)) -eq $true
+            $done = (Export-RangePicture -Range $Ws.Range($addr) -Path (Join-Path $AssetsDir $file) -WidthPt $W -HeightPt $H -ErrorText ([ref]$err) -PrintQuality $usePrint) -eq $true
             if (-not $done) {
                 Write-Log ("Page {0}: picture not captured yet ({1}); trying again in 3 seconds." -f $p.Index, $err) 'WARN'
                 Start-Sleep -Seconds 3
-                $done = (Export-RangePicture -Range $Ws.Range($addr) -Path (Join-Path $AssetsDir $file) -WidthPt $W -HeightPt $H -ErrorText ([ref]$err)) -eq $true
+                $done = (Export-RangePicture -Range $Ws.Range($addr) -Path (Join-Path $AssetsDir $file) -WidthPt $W -HeightPt $H -ErrorText ([ref]$err) -PrintQuality $usePrint) -eq $true
             }
             if ($done) {
                 $p.Picture = [pscustomobject]@{ Kind = 'image'; L = $L; T = $T; W = $W; H = $H; Z = 0; Rot = 0; Src = "assets/$file"; Alt = ('Wkly_Report ' + $addr); IsChart = $false }
