@@ -103,7 +103,7 @@ param(
     [switch]$OpenWhenDone
 )
 
-$ScriptBuild = '2026.10.20-r23'
+$ScriptBuild = '2026.10.20-r24'
 $SheetName = 'Wkly_Report'          # fixed by design - no other worksheet is ever read
 $Inv = [System.Globalization.CultureInfo]::InvariantCulture
 $ErrRegex = '#(DIV/0!|N/A|VALUE!|REF!|NAME\?|NUM!|NULL!|SPILL!|CALC!|FIELD!|BLOCKED!|CONNECT!|BUSY!|UNKNOWN!|GETTING_DATA)'
@@ -1024,7 +1024,8 @@ function Export-SheetPdfByPages {
     $zoom = [int][math]::Floor([math]::Min(818 / $maxW, 571 / $maxH) * 100)
     if ($zoom -gt 100) { $zoom = 100 }; if ($zoom -lt 10) { $zoom = 10 }
     $area = '$' + (ConvertTo-ColumnLetter $c1) + '$1:$' + (ConvertTo-ColumnLetter $c2) + '$' + [string]$lastRow
-    try { $script:XlApp.PrintCommunication = $false } catch { }
+    # set with printer communication ON: with it off, Excel kept the workbook's own scale (r23)
+    try { $script:XlApp.PrintCommunication = $true } catch { }
     $ps = $Ws.PageSetup
     try { $ps.PaperSize = 9 } catch { }                                  # A4
     try { $ps.Orientation = 2 } catch { }                                # landscape
@@ -1033,8 +1034,16 @@ function Export-SheetPdfByPages {
     try { $ps.PrintGridlines = $false; $ps.PrintHeadings = $false; $ps.BlackAndWhite = $false; $ps.Draft = $false } catch { }
     try { $ps.CenterHorizontally = $true; $ps.CenterVertically = $false } catch { }
     $ps.PrintArea = $area
+    try { $ps.FitToPagesWide = $false; $ps.FitToPagesTall = $false } catch { }
     $ps.Zoom = $zoom                                                     # a fixed zoom keeps the manual page breaks
-    try { $script:XlApp.PrintCommunication = $true } catch { }
+    $readZoom = ''
+    try { $readZoom = [string]$ps.Zoom } catch { }
+    if ($readZoom -ne [string]$zoom) {
+        try { $ps.Zoom = $zoom; $readZoom = [string]$ps.Zoom } catch { }
+    }
+    $paper = ''; $orient = ''
+    try { $paper = [string]$ps.PaperSize; $orient = [string]$ps.Orientation } catch { }
+    Write-Log ("Wkly_Report PDF layout: print area {0}, zoom wanted {1}% / Excel uses {2}%, paper {3}, orientation {4} (2 = landscape), page sizes up to {5} x {6} pt." -f $area, $zoom, $readZoom, $paper, $orient, [int]$maxW, [int]$maxH)
     try { $null = $Ws.ResetAllPageBreaks() } catch { }
     foreach ($p in $Pages) {
         if ($p.StartRow -gt 1) { try { $null = $Ws.HPageBreaks.Add($Ws.Cells.Item($p.StartRow, $c1)) } catch { } }
