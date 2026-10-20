@@ -1,6 +1,8 @@
 # Export-WklyReportDashboard.ps1 — ITSM executive dashboard from `Wkly_Report`
 
-Turns the `Wkly_Report` worksheet of the weekly ITSM workbook into an HTML dashboard.
+Turns the `Wkly_Report` worksheet of the weekly ITSM workbook into **one self-contained HTML
+file**: styling, buttons and every page picture are embedded, so the file works on its own when
+sent by email or Teams, offline, in Edge or Chrome. No PDF and no assets folder are produced.
 It is **read-only**: no worksheet, formula, chart, PivotTable or value is changed.
 
 ## 1. How it works
@@ -8,8 +10,10 @@ It is **read-only**: no worksheet, formula, chart, PivotTable or value is change
 - The workbook is copied to a temporary folder and only that copy is opened, read-only, in a
   separate hidden Excel instance. Your own Excel windows are not touched, and the copy is closed
   without saving and deleted.
-- Each report page is shown as **Excel's own picture of that page**, so every value, chart, colour,
-  text box and table looks exactly as Excel draws it.
+- Each report page is shown as **Excel's own rendering of that page**: Excel exports the page to a
+  temporary PDF (vector text, as sharp as Excel's own PDF), Windows' built-in PDF renderer turns it
+  into a picture at 2x screen resolution, and the temporary PDF is deleted. If that fails for a page,
+  Excel's screen picture of the page is used instead (the log says which and why).
 - Formulas are calculated as when you open the file in Excel, so time-based values (`NOW()`,
   `TODAY()`, ages) are current. External links are not updated and PivotTables/queries are not
   refreshed — save the workbook after your normal refresh.
@@ -55,12 +59,10 @@ while it runs (it uses the clipboard briefly for the page pictures and restores 
 | `-MinPageHeightPt` | `250` | Title candidates closer than this belong to the same page |
 | `-DashboardTitle` | `ITSM Executive Dashboard` | Top-bar text |
 | `-Classification` | `CONFIDENTIAL` | Marking on top bar and every page footer |
-| `-SkipSheetPdf` | off | Skip `Wkly_Report (Excel export).pdf` |
-| `-ExportDashboardPdf` | off | Also save `<workbook name> (Dashboard).pdf` using Edge (headless, local) |
 | `-OpenWhenDone` | off | Open the dashboard at the end |
 
-Output folder contents: `<workbook name>.html`, `assets\` (page pictures, charts, CSS/JS),
-`Wkly_Report (Excel export).pdf`, `extraction-log.txt`, and optionally `<workbook name> (Dashboard).pdf`.
+Output: exactly one file, `<workbook name>.html`. Working files go to a private temporary folder that
+is deleted at the end. The log is written to `%TEMP%\ITSM_Dashboard_logs\` (its path is printed at the end).
 
 ## 4. Using the dashboard
 
@@ -73,10 +75,12 @@ Output folder contents: `<workbook name>.html`, `assets\` (page pictures, charts
 
 1. The console's first line shows the expected build.
 2. The log says *Original workbook unchanged (SHA-256 identical before and after)*.
-3. The log says *Excel page pictures: N of N pages captured*.
-4. The page list has one entry per page of Wkly_Report this week.
-5. Open `Wkly_Report (Excel export).pdf` or the workbook and compare a few KPI values, a chart and
-   a table with the dashboard.
+3. The log says *Excel page pictures: N of N pages captured (Excel PDF: N)* and
+   *Validation: N page(s) in the file (expected N) … 0 external reference(s)*.
+4. The output folder contains only the `.html`. Copy it alone to another PC (or send it by email/Teams),
+   download it and open it in Edge or Chrome: pages, zoom, page list and Present all work.
+5. The page list has one entry per page of Wkly_Report this week; compare a few KPI values, a chart
+   and a table with the workbook.
 
 ## 6. Troubleshooting
 
@@ -92,10 +96,15 @@ Output folder contents: `<workbook name>.html`, `assets\` (page pictures, charts
 | `Fingerprint could not be compared (file locked)` | Informational: the file was locked by another program; the script only reads it. |
 | An `EXCEL.EXE` process remains | The script closes only the Excel it started (and stops it by its own process ID if it hangs). Your other Excel windows are never touched. |
 
-Always attach `extraction-log.txt` (in the output folder) when reporting a problem.
+Always attach the log (path printed at the end of the run) when reporting a problem.
 
 ## 7. Known limitations
 
-- Page pictures and charts are images: they look identical to Excel but are not hover-interactive.
+- Pages are high-resolution pictures of Excel's rendering, not vector graphics: they stay sharp at
+  Full HD and 4K at normal zoom, but zooming far beyond 200% shows pixels. Charts are not
+  hover-interactive. Excel's PDF rendering uses print layout, which can differ very slightly from screen.
+- The file is larger than a plain web page (roughly 10–30 MB, logged each run) because the pictures
+  are embedded; some email systems reject attachments above ~20 MB — use Teams/OneDrive then.
+- Outlook/Teams previews may not run the page's script; download the file and open it in a browser.
 - `.xlsb`/`.xls` files: pictures inside the sheet may be shown as placeholders on pages that fall
   back to the re-drawn view.

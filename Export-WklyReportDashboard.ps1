@@ -65,10 +65,10 @@
     No longer used (per-page Excel view PDFs are not produced); kept so older command lines still run.
 
 .PARAMETER SkipSheetPdf
-    Do not export the full "Wkly_Report (Excel export).pdf".
+    No longer used (no PDF is produced); kept so older command lines still run.
 
 .PARAMETER ExportDashboardPdf
-    Also print the dashboard to "<workbook name> (Dashboard).pdf" with Microsoft Edge (headless, local).
+    No longer used (no PDF is produced); kept so older command lines still run.
 
 .PARAMETER OpenWhenDone
     Open the dashboard in the default browser when finished.
@@ -77,7 +77,7 @@
     .\Export-WklyReportDashboard.ps1
 
 .EXAMPLE
-    .\Export-WklyReportDashboard.ps1 -OutputDirectory 'C:\Temp\ITSM_Dashboard' -ExportDashboardPdf -OpenWhenDone
+    .\Export-WklyReportDashboard.ps1 -OutputDirectory 'C:\Temp\ITSM_Dashboard' -OpenWhenDone
 
 .EXAMPLE
     .\Export-WklyReportDashboard.ps1 -PageMode Manual -PageStartRows 1,40,72,105,140
@@ -103,7 +103,7 @@ param(
     [switch]$OpenWhenDone
 )
 
-$ScriptBuild = '2026.10.20-r25'
+$ScriptBuild = '2026.10.20-r26'
 $SheetName = 'Wkly_Report'          # fixed by design - no other worksheet is ever read
 $Inv = [System.Globalization.CultureInfo]::InvariantCulture
 $ErrRegex = '#(DIV/0!|N/A|VALUE!|REF!|NAME\?|NUM!|NULL!|SPILL!|CALC!|FIELD!|BLOCKED!|CONNECT!|BUSY!|UNKNOWN!|GETTING_DATA)'
@@ -120,6 +120,8 @@ $script:ChartMode = $null
 $script:XlMadeVisible = $false
 $script:ThemeMinor = 'Calibri'
 $script:ThemeMajor = 'Calibri Light'
+$script:WorkDir = $null
+$script:LogPath = Join-Path (Join-Path ([System.IO.Path]::GetTempPath()) 'ITSM_Dashboard_logs') ('extraction-log ' + (Get-Date -Format 'yyyy-MM-dd HHmmss') + '.txt')
 $script:Clip = $null
 $script:TestClipboard = $null
 $script:PictureScale = 3
@@ -1005,77 +1007,6 @@ function Export-PagePdfPicture {
     catch { $ErrorText.Value = $_.Exception.Message; return $false }
 }
 
-function Export-SheetPdfByPages {
-    # One PDF page per report page, nothing cut: A4 landscape, no margins/headers, a page break before
-    # each report page and one zoom for all pages so the largest page fits whole (temporary copy only).
-    param($Ws, $Pages, $Geo, [string]$Path)
-    try { $null = $Ws.Activate(); $null = $Ws.Range('A1').Select() } catch { }   # a selected chart would export alone
-    $maxW = 0.0; $maxH = 0.0; $c1 = $Geo.LastCol; $c2 = 1; $lastRow = 1
-    foreach ($p in $Pages) {
-        $c = 1; for ($k = 1; $k -le $Geo.LastCol; $k++) { if ($Geo.ColLefts[$k] -le $p.OffsetX + 0.5) { $c = $k } }
-        $d = $c; for ($k = $c; $k -le $Geo.LastCol; $k++) { if ($Geo.ColLefts[$k] -lt $p.OffsetX + $p.Width - 0.5) { $d = $k } }
-        if ($c -lt $c1) { $c1 = $c }; if ($d -gt $c2) { $c2 = $d }
-        if ($p.EndRow -gt $lastRow) { $lastRow = $p.EndRow }
-        $h = $Geo.RowTops[$p.EndRow + 1] - $Geo.RowTops[$p.StartRow]
-        if ($h -gt $maxH) { $maxH = $h }
-    }
-    $maxW = $Geo.ColLefts[$c2 + 1] - $Geo.ColLefts[$c1]
-    # A4 landscape 842 x 595 pt, keeping 12 pt for printer edges
-    $zoom = [int][math]::Floor([math]::Min(818 / $maxW, 571 / $maxH) * 100)
-    if ($zoom -gt 100) { $zoom = 100 }; if ($zoom -lt 10) { $zoom = 10 }
-    $area = '$' + (ConvertTo-ColumnLetter $c1) + '$1:$' + (ConvertTo-ColumnLetter $c2) + '$' + [string]$lastRow
-    # set with printer communication ON: with it off, Excel kept the workbook's own scale (r23)
-    try { $script:XlApp.PrintCommunication = $true } catch { }
-    $ps = $Ws.PageSetup
-    try { $ps.PaperSize = 9 } catch { }                                  # A4
-    try { $ps.Orientation = 2 } catch { }                                # landscape
-    foreach ($prop in 'LeftMargin', 'RightMargin', 'TopMargin', 'BottomMargin', 'HeaderMargin', 'FooterMargin') { try { $ps.$prop = 0 } catch { } }
-    foreach ($prop in 'LeftHeader', 'CenterHeader', 'RightHeader', 'LeftFooter', 'CenterFooter', 'RightFooter') { try { $ps.$prop = '' } catch { } }
-    try { $ps.PrintGridlines = $false; $ps.PrintHeadings = $false; $ps.BlackAndWhite = $false; $ps.Draft = $false } catch { }
-    try { $ps.CenterHorizontally = $true; $ps.CenterVertically = $false } catch { }
-    $ps.PrintArea = $area
-    try { $ps.FitToPagesWide = $false; $ps.FitToPagesTall = $false } catch { }
-    $ps.Zoom = $zoom                                                     # a fixed zoom keeps the manual page breaks
-    $readZoom = ''
-    try { $readZoom = [string]$ps.Zoom } catch { }
-    if ($readZoom -ne [string]$zoom) {
-        try { $ps.Zoom = $zoom; $readZoom = [string]$ps.Zoom } catch { }
-    }
-    $paper = ''; $orient = ''
-    try { $paper = [string]$ps.PaperSize; $orient = [string]$ps.Orientation } catch { }
-    Write-Log ("Wkly_Report PDF layout: print area {0}, zoom wanted {1}% / Excel uses {2}%, paper {3}, orientation {4} (2 = landscape), page sizes up to {5} x {6} pt." -f $area, $zoom, $readZoom, $paper, $orient, [int]$maxW, [int]$maxH)
-    try { $null = $Ws.ResetAllPageBreaks() } catch { }
-    foreach ($p in $Pages) {
-        if ($p.StartRow -gt 1) { try { $null = $Ws.HPageBreaks.Add($Ws.Cells.Item($p.StartRow, $c1)) } catch { } }
-    }
-    if (Test-Path -LiteralPath $Path) {
-        try { Remove-Item -LiteralPath $Path -Force -ErrorAction Stop }
-        catch {
-            # the previous PDF is still open (e.g. in Acrobat): write this one under a new name instead
-            $dir = [System.IO.Path]::GetDirectoryName($Path)
-            $base = [System.IO.Path]::GetFileNameWithoutExtension($Path)
-            $Path = Join-Path $dir ('{0} {1}.pdf' -f $base, (Get-Date -Format 'yyyy-MM-dd HHmmss'))
-            Write-Log ("The previous Wkly_Report PDF is open in another program, so this one is saved as: {0}" -f $Path) 'WARN'
-        }
-    }
-    $null = $Ws.ExportAsFixedFormat(0, $Path, 0, $true, $false)
-    $count = ''
-    if (Initialize-PdfRenderer) {
-        try {
-            $f = Wait-WinRt ([Windows.Storage.StorageFile]::GetFileFromPathAsync($Path)) ([Windows.Storage.StorageFile])
-            $doc = Wait-WinRt ([Windows.Data.Pdf.PdfDocument]::LoadFromFileAsync($f)) ([Windows.Data.Pdf.PdfDocument])
-            $count = [string]$doc.PageCount
-        }
-        catch { }
-    }
-    if ($count -and [int]$count -ne $Pages.Count) {
-        Write-Log ("Wkly_Report PDF has {0} PDF pages for {1} report pages (print area {2}, zoom {3}%)." -f $count, $Pages.Count, $area, $zoom) 'WARN'
-    }
-    $pagesNote = ''
-    if ($count) { $pagesNote = ', ' + $count + ' PDF pages' }
-    Write-Log ("Excel PDF of Wkly_Report written: {0} - one A4 landscape page per report page, zoom {1}%{2}." -f $Path, $zoom, $pagesNote) 'OK'
-}
-
 function Get-OverhangingObjects {
     # Objects (charts, shapes, pictures) that start on one page but run a little past its last row.
     # Their page is extended to show them whole, and they are hidden while the next page's picture
@@ -1808,11 +1739,9 @@ function ConvertTo-ItemHtml {
 }
 
 function New-DashboardSite {
-    param($Pages, [string]$OutDir, $Meta, $Issues)
-
-    $assets = Join-Path $OutDir 'assets'
-    [System.IO.File]::WriteAllText((Join-Path $assets 'dashboard.css'), $DashboardCss, (New-Object System.Text.UTF8Encoding($false)))
-    [System.IO.File]::WriteAllText((Join-Path $assets 'dashboard.js'), $DashboardJs, (New-Object System.Text.UTF8Encoding($false)))
+    # Writes ONE self-contained .html to $OutDir; pictures are read from $WorkDir\assets and embedded.
+    param($Pages, [string]$OutDir, $Meta, $Issues, [string]$WorkDir)
+    if (-not $WorkDir) { $WorkDir = $OutDir }
 
     foreach ($iss in $Issues) {
         if ($iss.Y -lt 0) { continue }
@@ -1905,14 +1834,18 @@ function New-DashboardSite {
     foreach ($m in [regex]::Matches($html, 'src="(assets/[^"]+)"')) {
         $rel = $m.Groups[1].Value
         if ($embedded.ContainsKey($rel)) { continue }
-        $file = Join-Path $OutDir ($rel.Replace('/', [string][System.IO.Path]::DirectorySeparatorChar))
-        if (-not (Test-Path -LiteralPath $file)) { continue }
+        $file = Join-Path $WorkDir ($rel.Replace('/', [string][System.IO.Path]::DirectorySeparatorChar))
+        if (-not (Test-Path -LiteralPath $file)) { Write-Log ("Picture {0} is missing and could not be embedded." -f $rel) 'WARN'; continue }
         $ext = [System.IO.Path]::GetExtension($file).ToLowerInvariant().TrimStart('.')
         $mime = 'image/png'
         if ($ext -eq 'jpg' -or $ext -eq 'jpeg') { $mime = 'image/jpeg' } elseif ($ext -eq 'gif') { $mime = 'image/gif' } elseif ($ext -eq 'svg') { $mime = 'image/svg+xml' } elseif ($ext -eq 'bmp') { $mime = 'image/bmp' } elseif ($ext -eq 'webp') { $mime = 'image/webp' }
         $embedded[$rel] = 'data:' + $mime + ';base64,' + [System.Convert]::ToBase64String([System.IO.File]::ReadAllBytes($file))
     }
     foreach ($rel in $embedded.Keys) { $html = $html.Replace('src="' + $rel + '"', 'src="' + $embedded[$rel] + '"') }
+    # anything still pointing outside the file is a defect: report it instead of shipping a broken page
+    $external = [regex]::Matches($html, '(?:src|href)="assets/[^"]*"').Count
+    if ($external -gt 0) { Add-Issue -Severity Error -Location 'Dashboard file' -Message ("{0} reference(s) to the assets folder could not be embedded." -f $external) }
+    if ([regex]::IsMatch($html, '(?:src|href)="https?://')) { Add-Issue -Severity Warning -Location 'Dashboard file' -Message 'The dashboard references an internet address.' }
     [System.IO.File]::WriteAllText($index, $html, (New-Object System.Text.UTF8Encoding($false)))
     $mb = [math]::Round((Get-Item -LiteralPath $index).Length / 1MB, 1)
     Write-Log ("Dashboard is a single self-contained file ({0} MB, {1} pictures embedded) - it can be sent by email or Teams on its own." -f $mb, $embedded.Count)
@@ -2187,29 +2120,6 @@ $DashboardJs = @'
 #  Edge headless PDF of the dashboard (optional, local only)
 # ======================================================================================
 
-function Export-DashboardPdf {
-    param([string]$IndexPath, [string]$PdfPath)
-    $edge = @(
-        (Join-Path ${env:ProgramFiles(x86)} 'Microsoft\Edge\Application\msedge.exe'),
-        (Join-Path $env:ProgramFiles 'Microsoft\Edge\Application\msedge.exe')
-    ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
-    if (-not $edge) { Add-Issue -Severity Warning -Location 'Dashboard PDF' -Message 'Microsoft Edge was not found; dashboard PDF not created. Use Print / PDF in the browser instead.'; return }
-    $profileDir = Join-Path $env:TEMP ('ITSMDash_Edge_' + [guid]::NewGuid().ToString('N'))
-    $uri = ([System.Uri](Resolve-Path -LiteralPath $IndexPath).ProviderPath).AbsoluteUri
-    $argList = @('--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
-        "--user-data-dir=`"$profileDir`"", '--no-pdf-header-footer', '--virtual-time-budget=10000',
-        "--print-to-pdf=`"$PdfPath`"", $uri)
-    try {
-        if (Test-Path -LiteralPath $PdfPath) { Remove-Item -LiteralPath $PdfPath -Force }
-        $proc = Start-Process -FilePath $edge -ArgumentList $argList -PassThru -WindowStyle Hidden
-        if (-not $proc.WaitForExit(120000)) { try { $proc.Kill() } catch { } }
-        if (Test-Path -LiteralPath $PdfPath) { Write-Log "Dashboard PDF written: $PdfPath" 'OK' }
-        else { Add-Issue -Severity Warning -Location 'Dashboard PDF' -Message 'Edge did not produce the PDF. Use Print / PDF in the browser instead.' }
-    }
-    catch { Add-Issue -Severity Warning -Location 'Dashboard PDF' -Message ("Edge PDF export failed: {0}" -f $_.Exception.Message) }
-    finally { Remove-Item -LiteralPath $profileDir -Recurse -Force -ErrorAction SilentlyContinue }
-}
-
 # ======================================================================================
 #  Main
 # ======================================================================================
@@ -2227,14 +2137,16 @@ function Invoke-Main {
     if (-not (Test-Path -LiteralPath $OutputDirectory)) { New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null }
     $outDir = (Resolve-Path -LiteralPath $OutputDirectory).ProviderPath
     if ($outDir.TrimEnd('\') -ieq $sourceInfo.DirectoryName.TrimEnd('\')) { throw 'Choose an OutputDirectory different from the workbook folder.' }
-    $assets = Join-Path $outDir 'assets'
-    if (Test-Path -LiteralPath $assets) {
-        if (Test-Path -LiteralPath (Join-Path $assets $GeneratedMarker)) { Remove-Item -LiteralPath $assets -Recurse -Force }
-        else { throw "'$assets' exists but was not created by this script. Choose another -OutputDirectory." }
+    # an assets folder left in the output folder by builds up to r25 is removed (only if this script made it)
+    $oldAssets = Join-Path $outDir 'assets'
+    if ((Test-Path -LiteralPath $oldAssets) -and (Test-Path -LiteralPath (Join-Path $oldAssets $GeneratedMarker))) {
+        Remove-Item -LiteralPath $oldAssets -Recurse -Force -ErrorAction SilentlyContinue
     }
+    if ($SkipSheetPdf -or $ExportDashboardPdf -or $SkipExcelView) { Write-Log 'Note: -SkipSheetPdf / -ExportDashboardPdf / -SkipExcelView no longer do anything; the only output is the HTML file.' }
+    # working files (pictures, charts) go to a private temp folder that is deleted at the end
+    $script:WorkDir = Join-Path ([System.IO.Path]::GetTempPath()) ('ITSMDash_work_' + [guid]::NewGuid().ToString('N'))
+    $assets = Join-Path $script:WorkDir 'assets'
     New-Item -ItemType Directory -Path $assets -Force | Out-Null
-    New-Item -ItemType Directory -Path (Join-Path $assets 'excel-view') -Force | Out-Null
-    Set-Content -LiteralPath (Join-Path $assets $GeneratedMarker) -Value "Generated by Export-WklyReportDashboard.ps1 $ScriptBuild - safe to delete." -Encoding ASCII
 
     # ---- hash + private temp copy (the original is never opened)
     $hashBefore = Get-SourceHash $source
@@ -2377,27 +2289,6 @@ function Invoke-Main {
             $pictureNote = '{0} of {1} pages shown as Excel''s own picture' -f $pc, $result.Pages.Count
         }
         catch { Add-Issue -Severity Warning -Location 'Page pictures' -Message ("Page pictures failed; the re-drawn view is shown: {0}" -f (Format-ErrorDetail $_)) }
-        if (-not $SkipSheetPdf) {
-            $sheetPdf = Join-Path $outDir 'Wkly_Report (Excel export).pdf'
-            try { Export-SheetPdfByPages -Ws $ws -Pages $result.Pages -Geo $geo -Path $sheetPdf }
-            catch {
-                $why = $_.Exception.Message
-                Add-Issue -Severity Warning -Location 'Wkly_Report PDF' -Message ("Excel could not export the worksheet PDF: {0}" -f $why)
-            }
-        }
-        if ($false) {   # per-page Excel view PDFs: no longer shown in the dashboard
-            $ok = 0
-            foreach ($p in $result.Pages) {
-                $pdf = Join-Path $assets ('excel-view\page-{0:D2}.pdf' -f $p.Index)
-                try {
-                    $rng = $ws.Range(('A{0}:{1}{2}' -f $p.StartRow, $lastColLetter, $p.EndRow))
-                    $null = $rng.ExportAsFixedFormat(0, $pdf, 0, $true, $true)
-                    if (Test-Path -LiteralPath $pdf) { $p.ExcelView = 'assets/excel-view/page-{0:D2}.pdf' -f $p.Index; $ok++ }
-                }
-                catch { Add-Issue -Severity Warning -Location ("Page {0}" -f $p.Index) -Message ("Excel view PDF could not be exported: {0}" -f $_.Exception.Message) -Y $p.StartY }
-            }
-            $excelViewNote = '{0} of {1} pages exported as PDF by Excel' -f $ok, $result.Pages.Count
-        }
     }
     finally {
         Restore-Clipboard
@@ -2443,14 +2334,21 @@ function Invoke-Main {
         ReportingPeriod = (Find-LabelValue -Items $items -Label 'Reporting Period')
         ReportDate      = (Find-LabelValue -Items $items -Label 'Report Date')
     }
-    $index = New-DashboardSite -Pages $result.Pages -OutDir $outDir -Meta $meta -Issues $script:Issues
+    $index = New-DashboardSite -Pages $result.Pages -OutDir $outDir -Meta $meta -Issues $script:Issues -WorkDir $script:WorkDir
+    # validation of the single output file
+    $validLevel = 'OK'
+    $written = Get-Content -LiteralPath $index -Raw -Encoding UTF8
+    $sections = [regex]::Matches($written, '<section class="page').Count
+    $pictures = [regex]::Matches($written, 'class="lay-pic"><img').Count
+    $externalRefs = [regex]::Matches($written, '(?:src|href)="(?!data:|#)[^"]+"').Count
+    if ($sections -ne $result.Pages.Count -or $externalRefs -ne 0) { $validLevel = 'WARN' }
+    Write-Log ("Validation: {0} page(s) in the file (expected {1}), {2} page(s) as Excel picture, {3} external reference(s) (expected 0), no PDF written." -f $sections, $result.Pages.Count, $pictures, $externalRefs) $validLevel
     Write-Log "Dashboard written: $index" 'OK'
 
-    if ($ExportDashboardPdf) { Export-DashboardPdf -IndexPath $index -PdfPath (Join-Path $outDir ($meta.BaseName + ' (Dashboard).pdf')) }
 
     $errs = @($script:Issues | Where-Object { $_.Severity -eq 'Error' }).Count
     $warns = @($script:Issues | Where-Object { $_.Severity -eq 'Warning' }).Count
-    Write-Log ("Done: {0} page(s), {1} chart(s), {2} Excel error value(s)/error(s), {3} warning(s). Details: extraction-log.txt in the output folder." -f $result.Pages.Count, $script:ChartIndex, $errs, $warns) 'OK'
+    Write-Log ("Done: {0} page(s), {1} chart(s), {2} Excel error value(s)/error(s), {3} warning(s). Log: {4}" -f $result.Pages.Count, $script:ChartIndex, $errs, $warns, $script:LogPath) 'OK'
     if ($OpenWhenDone) { Start-Process -FilePath $index }
     return $outDir
 }
@@ -2465,8 +2363,15 @@ if ($MyInvocation.InvocationName -ne '.') {
         $exitCode = 1
     }
     finally {
-        $logDir = if ($outForLog) { $outForLog } elseif (Test-Path -LiteralPath $OutputDirectory) { $OutputDirectory } else { $env:TEMP }
-        try { [System.IO.File]::WriteAllLines((Join-Path $logDir 'extraction-log.txt'), $script:LogLines, (New-Object System.Text.UTF8Encoding($false))) } catch { }
+        if ($script:WorkDir -and (Test-Path -LiteralPath $script:WorkDir)) { Remove-Item -LiteralPath $script:WorkDir -Recurse -Force -ErrorAction SilentlyContinue }
+        # the log is kept outside the output folder so the HTML stays the only output
+        try {
+            $logDir = Split-Path -Parent $script:LogPath
+            if (-not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
+            [System.IO.File]::WriteAllLines($script:LogPath, $script:LogLines, (New-Object System.Text.UTF8Encoding($false)))
+            Write-Host ("Log file: {0}" -f $script:LogPath) -ForegroundColor Gray
+        }
+        catch { }
     }
     if ($exitCode) { exit $exitCode }
 }
