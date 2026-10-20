@@ -109,7 +109,7 @@ Output folder contents: `<workbook name>.html`, `assets\` (charts, pictures, CSS
 | A cell shows `####` | The column is too narrow in Excel itself; widen it in the workbook. |
 | A shape looks rectangular but is a different shape in Excel | Uncommon outlines are drawn as rectangles (text and colours kept); listed under *Info*. |
 | Excel view is empty or the button is disabled | Excel's PDF export needs a printer driver (the built-in *Microsoft Print to PDF* is enough). Check Data check for the error. |
-| Values differ from what you saw in Excel | The script shows values as last **saved**. Save the workbook (after any refresh) before running. |
+| Values differ from what you saw in Excel | Time-based values change minute by minute; refreshed data (PivotTables, queries) appears only after you save the workbook. Save before running. |
 | An `EXCEL.EXE` process remains | The script closes only the Excel it started (and stops it by its own process ID if it hangs). Your other Excel windows are never touched. |
 
 Always attach `extraction-log.txt` (in the output folder) when reporting a problem.
@@ -119,9 +119,8 @@ Always attach `extraction-log.txt` (in the output folder) when reporting a probl
 - Fonts are rendered by the browser, so text wrapping can differ slightly from Excel. Use
   Excel view when exact pixel layout matters.
 - Charts are images: they look identical but are not hover-interactive.
-- Calculation is set to Manual before the copy is opened, so formulas (including `TODAY()`)
-  show their last saved values. PivotTables or queries set to "refresh on open" may still try
-  to refresh in the hidden copy; save the workbook after your normal refresh so the saved
-  values are current.
+- Formulas are calculated as when you open the file in Excel, so time-based formulas (`NOW()`,
+  `TODAY()`, ages) show current values, the same as Excel shows you. External links are not
+  updated and PivotTables/queries are not refreshed; save the workbook after your normal refresh.
 - Picture cropping set in Excel is not applied (listed under *Info*). `.xlsb`/`.xls` files:
   pictures are shown as placeholders (charts and values are unaffected).

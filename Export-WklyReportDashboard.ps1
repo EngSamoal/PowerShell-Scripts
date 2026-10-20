@@ -9,8 +9,8 @@
     SAFETY - the script never changes anything:
       * The original workbook is never opened. It is copied to a private temp folder and
         only the copy is opened, read-only, in a separate hidden Excel instance.
-      * Links are not updated, calculation is set to Manual before the copy is opened (so
-        Excel shows the values cached at the last save), macros/events are disabled, and the
+      * Links are not updated, formulas are calculated exactly as when you open the file in Excel
+        (time-based formulas such as NOW()/TODAY() show current values), macros/events are disabled, and the
         copy is closed WITHOUT saving and then deleted.
       * Only the "Wkly_Report" worksheet is read. No other tab is read or changed, and
         nothing is ever written to Wkly_Report itself.
@@ -103,7 +103,7 @@ param(
     [switch]$OpenWhenDone
 )
 
-$ScriptBuild = '2026.10.20-r12'
+$ScriptBuild = '2026.10.20-r13'
 $SheetName = 'Wkly_Report'          # fixed by design - no other worksheet is ever read
 $Inv = [System.Globalization.CultureInfo]::InvariantCulture
 $ErrRegex = '#(DIV/0!|N/A|VALUE!|REF!|NAME\?|NUM!|NULL!|SPILL!|CALC!|FIELD!|BLOCKED!|CONNECT!|BUSY!|UNKNOWN!|GETTING_DATA)'
@@ -1594,7 +1594,7 @@ function New-DashboardSite {
     & $add '<p class="lead">Everything the dashboard could not reproduce exactly is listed here, so nothing is silently replaced. Values themselves are never changed.</p>'
     & $add '<h5>SOURCE</h5><ul>'
     & $add ('<li>{0}</li>' -f (& $enc $Meta.SourcePath))
-    & $add '<li>A temporary copy was opened read-only in a separate Excel instance: links not updated, calculation Manual (values as last saved), macros disabled, closed without saving, copy deleted.</li>'
+    & $add '<li>A temporary copy was opened read-only in a separate Excel instance: links not updated, formulas calculated as when the file is opened in Excel, macros disabled, closed without saving, copy deleted.</li>'
     $hashState = if ($Meta.HashBefore -eq $Meta.HashAfter) { '<span class="ok">unchanged</span>' } else { '<span class="er">CHANGED during the run - the file was modified by someone else (this script never writes to it)</span>' }
     & $add ('<li>Original file SHA-256 before / after: {0}<br><code>{1}</code></li>' -f $hashState, $Meta.HashBefore)
     & $add '</ul><h5>CAPTURED</h5><ul>'
@@ -2015,11 +2015,16 @@ function Invoke-Main {
         $excel.EnableEvents = $false
         try { $excel.AutomationSecurity = 3 } catch { }                 # msoAutomationSecurityForceDisable
         $blank = $excel.Workbooks.Add()
-        try { $excel.Calculation = -4135 } catch { Write-Log 'Could not switch calculation to Manual.' 'WARN' }   # xlCalculationManual
+        # Calculate like a normal Excel open, so time-based formulas show the same values the user sees.
+        # (In Manual mode Excel 365 shows out-of-date values struck through - "Format Stale Values".)
+        try { $excel.Calculation = -4105 } catch { }                    # xlCalculationAutomatic
+        try { $excel.FormatStaleValues = $false } catch { }             # Excel 365 only; ignored elsewhere
 
         $m = [Type]::Missing
         Write-Log 'Opening the temporary copy read-only (links not updated)...'
         $wb = $excel.Workbooks.Open($tempCopy, 0, $true, $m, $m, $m, $true, $m, $m, $false, $false, $m, $false)
+        try { $null = $excel.Calculate(); Write-Log 'Formulas calculated as in a normal Excel open.' }
+        catch { Write-Log ("Formulas could not be recalculated ({0}); values are as last saved." -f $_.Exception.Message) 'WARN' }
 
         try {
             $script:ThemeMinor = [string]$wb.Theme.ThemeFontScheme.MinorFont.Item(1).Name
