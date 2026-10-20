@@ -52,7 +52,7 @@ while it runs (it uses the clipboard briefly for the page pictures and restores 
 | Parameter | Default | Purpose |
 |---|---|---|
 | `-WorkbookPath` | `C:\Temp\Bi_Wkly_Report-Daily Data.xlsx` | Workbook to read |
-| `-OutputDirectory` | `C:\Temp\ITSM_Dashboard` | Where `<workbook name>.html` + `assets\` go (only its own earlier output is replaced) |
+| `-OutputDirectory` | `C:\Temp\ITSM_Dashboard` | Folder for the single `<workbook name>.html` |
 | `-PageMode` | `Auto` | `Auto`, `Titles`, `PageBreaks`, `Manual` |
 | `-PageStartRows` | – | With `-PageMode Manual`: e.g. `1,40,72,105` |
 | `-TitleMinFontSize` | `20` | Font size that counts as a page title |
