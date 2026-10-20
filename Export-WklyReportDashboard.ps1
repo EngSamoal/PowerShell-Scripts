@@ -103,7 +103,7 @@ param(
     [switch]$OpenWhenDone
 )
 
-$ScriptBuild = '2026.10.20-r19'
+$ScriptBuild = '2026.10.20-r20'
 $SheetName = 'Wkly_Report'          # fixed by design - no other worksheet is ever read
 $Inv = [System.Globalization.CultureInfo]::InvariantCulture
 $ErrRegex = '#(DIV/0!|N/A|VALUE!|REF!|NAME\?|NUM!|NULL!|SPILL!|CALC!|FIELD!|BLOCKED!|CONNECT!|BUSY!|UNKNOWN!|GETTING_DATA)'
@@ -123,6 +123,8 @@ $script:ThemeMajor = 'Calibri Light'
 $script:Clip = $null
 $script:TestClipboard = $null
 $script:PictureScale = 3
+$script:PdfScale = 2.5
+$script:PdfReady = $null
 $script:PictureMethods = @{}
 $script:BitmapScales = New-Object System.Collections.Generic.List[double]
 
@@ -911,6 +913,92 @@ function Export-RangePicture {
     return $false
 }
 
+function Initialize-PdfRenderer {
+    # Windows' built-in PDF renderer (Windows.Data.Pdf, Windows 10/11). Returns $true when usable.
+    if ($script:PdfReady -ne $null) { return $script:PdfReady }
+    $script:PdfReady = $false
+    try {
+        Add-Type -AssemblyName System.Runtime.WindowsRuntime
+        $null = [Windows.Storage.StorageFile, Windows.Storage, ContentType = WindowsRuntime]
+        $null = [Windows.Data.Pdf.PdfDocument, Windows.Data.Pdf, ContentType = WindowsRuntime]
+        $null = [Windows.Data.Pdf.PdfPageRenderOptions, Windows.Data.Pdf, ContentType = WindowsRuntime]
+        $null = [Windows.Storage.Streams.InMemoryRandomAccessStream, Windows.Storage.Streams, ContentType = WindowsRuntime]
+        $methods = [System.WindowsRuntimeSystemExtensions].GetMethods()
+        $script:AsTaskOp = $methods | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' } | Select-Object -First 1
+        $script:AsTaskAction = $methods | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncAction' } | Select-Object -First 1
+        if ($script:AsTaskOp -and $script:AsTaskAction) { $script:PdfReady = $true }
+        else { Write-Log 'Windows PDF renderer not available; pages use Excel''s screen picture.' 'WARN' }
+    }
+    catch { Write-Log ("Windows PDF renderer not available ({0}); pages use Excel's screen picture." -f $_.Exception.Message) 'WARN' }
+    return $script:PdfReady
+}
+
+function Wait-WinRt {
+    param($Operation, [Type]$ResultType)
+    if ($ResultType) {
+        $task = $script:AsTaskOp.MakeGenericMethod($ResultType).Invoke($null, @($Operation))
+        $null = $task.Wait(60000)
+        return $task.Result
+    }
+    $task = $script:AsTaskAction.Invoke($null, @($Operation))
+    $null = $task.Wait(60000)
+}
+
+function Set-PdfPageSetup {
+    # One page per export, no margins/headers, centred - on the temporary copy only (never saved).
+    param($Ws)
+    try { $script:XlApp.PrintCommunication = $false } catch { }
+    $ps = $Ws.PageSetup
+    foreach ($prop in 'LeftMargin', 'RightMargin', 'TopMargin', 'BottomMargin', 'HeaderMargin', 'FooterMargin') { try { $ps.$prop = 0 } catch { } }
+    foreach ($prop in 'LeftHeader', 'CenterHeader', 'RightHeader', 'LeftFooter', 'CenterFooter', 'RightFooter') { try { $ps.$prop = '' } catch { } }
+    try { $ps.Zoom = $false; $ps.FitToPagesWide = 1; $ps.FitToPagesTall = 1 } catch { }
+    try { $ps.CenterHorizontally = $true; $ps.CenterVertically = $true } catch { }
+    try { $ps.PrintGridlines = $false; $ps.PrintHeadings = $false; $ps.BlackAndWhite = $false; $ps.Draft = $false } catch { }
+    try { $script:XlApp.PrintCommunication = $true } catch { }
+}
+
+function Export-PagePdfPicture {
+    # Excel exports the range to PDF (real, sharp text); Windows renders it to a high-resolution PNG,
+    # cropped to the page content. Returns $true on success; $ErrorText says why not.
+    param($Ws, $Range, [string]$PdfPath, [string]$PngPath, [double]$WidthPt, [double]$HeightPt, [ref]$ErrorText)
+    try {
+        try {
+            $script:XlApp.PrintCommunication = $false
+            if ($WidthPt -ge $HeightPt) { $Ws.PageSetup.Orientation = 2 } else { $Ws.PageSetup.Orientation = 1 }
+            $script:XlApp.PrintCommunication = $true
+        }
+        catch { }
+        if (Test-Path -LiteralPath $PdfPath) { Remove-Item -LiteralPath $PdfPath -Force }
+        $null = $Range.ExportAsFixedFormat(0, $PdfPath, 0, $false, $true)
+        if (-not (Test-Path -LiteralPath $PdfPath)) { $ErrorText.Value = 'Excel did not write the PDF'; return $false }
+        $file = Wait-WinRt ([Windows.Storage.StorageFile]::GetFileFromPathAsync($PdfPath)) ([Windows.Storage.StorageFile])
+        $doc = Wait-WinRt ([Windows.Data.Pdf.PdfDocument]::LoadFromFileAsync($file)) ([Windows.Data.Pdf.PdfDocument])
+        if ([int]$doc.PageCount -ne 1) { $ErrorText.Value = ('Excel split the page into {0} PDF pages' -f $doc.PageCount); return $false }
+        $page = $doc.GetPage(0)
+        $pw = [double]$page.Size.Width; $ph = [double]$page.Size.Height
+        # content is scaled to fit the paper and centred; crop to it (full size in the limiting direction)
+        $aspect = $HeightPt / $WidthPt
+        if ($ph / $pw -ge $aspect) { $cw = $pw; $ch = [math]::Min($ph, $pw * $aspect * 1.03) }
+        else { $ch = $ph; $cw = [math]::Min($pw, $ph / $aspect * 1.03) }
+        $x = ($pw - $cw) / 2; $y = ($ph - $ch) / 2
+        $opts = New-Object Windows.Data.Pdf.PdfPageRenderOptions
+        $opts.SourceRect = New-Object Windows.Foundation.Rect -ArgumentList $x, $y, $cw, $ch
+        $targetW = [math]::Round($WidthPt * 96 / 72 * $script:PdfScale)
+        $opts.DestinationWidth = [uint32]$targetW
+        $opts.DestinationHeight = [uint32][math]::Round($targetW * $ch / $cw)
+        $mem = New-Object Windows.Storage.Streams.InMemoryRandomAccessStream
+        Wait-WinRt ($page.RenderToStreamAsync($mem, $opts)) $null
+        $in = [System.IO.WindowsRuntimeStreamExtensions]::AsStreamForRead($mem.GetInputStreamAt(0))
+        $out = [System.IO.File]::Create($PngPath)
+        try { $in.CopyTo($out) } finally { $out.Dispose(); $in.Dispose() }
+        try { $page.Dispose() } catch { }
+        if ((Get-Item -LiteralPath $PngPath).Length -lt 2000) { $ErrorText.Value = 'rendered picture is empty'; return $false }
+        $ErrorText.Value = $null
+        return $true
+    }
+    catch { $ErrorText.Value = $_.Exception.Message; return $false }
+}
+
 function Get-OverhangingObjects {
     # Objects (charts, shapes, pictures) that start on one page but run a little past its last row.
     # Their page is extended to show them whole, and they are hidden while the next page's picture
@@ -966,17 +1054,16 @@ function Add-PagePictures {
         Write-Log ("'{0}' runs past the end of page {1}: page {1} extended to show it whole; it is hidden from the next page's picture." -f $o.Name, $o.Page)
     }
 
-    # r17's print-quality picture drew light/coloured text with a printer dot pattern on the real
-    # workbook, so it is switched off: pages use Excel's screen image exactly as in r16.
-    $printOk = $false
-    if ($printOk) { try {
-        $ps = $Ws.PageSetup
-        if ((Test-MsoTrue $ps.BlackAndWhite) -or (Test-MsoTrue $ps.Draft)) {
-            $printOk = $false
-            Write-Log 'Wkly_Report prints in black & white or draft mode; using screen pictures.' 'WARN'
-        }
+    # Pages are taken from Excel's own PDF export (sharp text) when Windows can render PDFs;
+    # otherwise, or if it fails for a page, Excel's screen picture is used exactly as in r16.
+    # A selected chart would make Excel export only that chart, so a cell is selected first.
+    $printOk = Initialize-PdfRenderer
+    if ($printOk) {
+        try { $null = $Ws.Activate(); $null = $Ws.Range('A1').Select() } catch { }
+        try { Set-PdfPageSetup -Ws $Ws } catch { Write-Log ("Page setup for PDF pages failed: {0}" -f $_.Exception.Message) 'WARN' }
     }
-    catch { } }
+    $pdfDir = Join-Path ([System.IO.Path]::GetTempPath()) ('ITSMDash_pdf_' + [guid]::NewGuid().ToString('N'))
+    if ($printOk) { New-Item -ItemType Directory -Path $pdfDir -Force | Out-Null }
     $noPrint = New-Object System.Collections.Generic.List[object]
     if ($printOk) {
         try {
@@ -1000,7 +1087,7 @@ function Add-PagePictures {
         foreach ($np in $noPrint) {
             if ($np.Bottom -gt $p.StartY -and $np.Top -lt $p.EndY) {
                 $usePrint = $false
-                Write-Log ("Page {0}: '{1}' is set not to print, so this page uses Excel's screen picture." -f $p.Index, $np.Name)
+                Write-Log ("Page {0}: '{1}' is set not to print (it would be missing from the PDF), so this page uses Excel's screen picture." -f $p.Index, $np.Name)
                 break
             }
         }
@@ -1021,11 +1108,17 @@ function Add-PagePictures {
             $addr = (ConvertTo-ColumnLetter $c1) + [string]$p.StartRow + ':' + (ConvertTo-ColumnLetter $c2) + [string]$p.EndRow
             $file = 'page-{0:D2}.png' -f $p.Index
             $err = $null
-            $done = (Export-RangePicture -Range $Ws.Range($addr) -Path (Join-Path $AssetsDir $file) -WidthPt $W -HeightPt $H -ErrorText ([ref]$err) -PrintQuality $usePrint) -eq $true
+            $done = $false
+            if ($usePrint) {
+                $done = (Export-PagePdfPicture -Ws $Ws -Range $Ws.Range($addr) -PdfPath (Join-Path $pdfDir ('page-{0:D2}.pdf' -f $p.Index)) -PngPath (Join-Path $AssetsDir $file) -WidthPt $W -HeightPt $H -ErrorText ([ref]$err)) -eq $true
+                if ($done) { $script:PictureMethods['Excel PDF'] = 1 + [int]$script:PictureMethods['Excel PDF'] }
+                else { Write-Log ("Page {0}: PDF picture not used ({1}); using Excel's screen picture." -f $p.Index, $err) 'WARN' }
+            }
+            if (-not $done) { $done = (Export-RangePicture -Range $Ws.Range($addr) -Path (Join-Path $AssetsDir $file) -WidthPt $W -HeightPt $H -ErrorText ([ref]$err) -PrintQuality $false) -eq $true }
             if (-not $done) {
                 Write-Log ("Page {0}: picture not captured yet ({1}); trying again in 3 seconds." -f $p.Index, $err) 'WARN'
                 Start-Sleep -Seconds 3
-                $done = (Export-RangePicture -Range $Ws.Range($addr) -Path (Join-Path $AssetsDir $file) -WidthPt $W -HeightPt $H -ErrorText ([ref]$err) -PrintQuality $usePrint) -eq $true
+                $done = (Export-RangePicture -Range $Ws.Range($addr) -Path (Join-Path $AssetsDir $file) -WidthPt $W -HeightPt $H -ErrorText ([ref]$err) -PrintQuality $false) -eq $true
             }
             if ($done) {
                 $p.Picture = [pscustomobject]@{ Kind = 'image'; L = $L; T = $T; W = $W; H = $H; Z = 0; Rot = 0; Src = "assets/$file"; Alt = ('Wkly_Report ' + $addr); IsChart = $false }
@@ -1038,6 +1131,7 @@ function Add-PagePictures {
         catch { Add-Issue -Severity Warning -Location ("Page {0}" -f $p.Index) -Message ("Page picture failed; the re-drawn view is shown: {0}" -f (Format-ErrorDetail $_)) -Y $p.StartY }
         finally { foreach ($o in $hidden) { try { $o.Shape.Visible = -1 } catch { } } }
     }
+    if ($printOk) { Remove-Item -LiteralPath $pdfDir -Recurse -Force -ErrorAction SilentlyContinue }
     $how = ($script:PictureMethods.Keys | ForEach-Object { '{0}: {1}' -f $_, $script:PictureMethods[$_] }) -join ', '
     $res = ''
     if ($script:BitmapScales.Count) { $res = '; screen image resolution ' + (($script:BitmapScales | ForEach-Object { Format-Num $_ }) -join ', ') + 'x' }
@@ -1665,7 +1759,7 @@ function New-DashboardSite {
     & $add ('<div class="tb-title"><b>{0}</b><span>Source: {1} &middot; Wkly_Report (read-only snapshot)</span></div>' -f (& $enc $DashboardTitle), (& $enc $Meta.FileName))
     if ($Meta.ReportingPeriod) { & $add ('<span class="chip" title="Reporting Period (from Wkly_Report)">{0}</span>' -f (& $enc $Meta.ReportingPeriod)) }
     if ($Meta.ReportDate) { & $add ('<span class="chip" title="Report Date (from Wkly_Report)">Report Date: {0}</span>' -f (& $enc $Meta.ReportDate)) }
-    & $add '<div class="zoom" title="Zoom (keys + and -). Fit = whole page width"><button class="btn" id="zOut">&minus;</button><span id="zVal">Fit</span><button class="btn" id="zIn">+</button><button class="btn" id="zSharp" title="Sharpest text: shows Excel&#39;s picture pixel for pixel, exactly as Excel draws it at 100% (scroll sideways if the page is wider than the window)">Sharp 1:1</button><button class="btn" id="zFit">Fit</button></div>'
+    & $add '<div class="zoom" title="Zoom (keys + and -). Fit = whole page width"><button class="btn" id="zOut">&minus;</button><span id="zVal">Fit</span><button class="btn" id="zIn">+</button><button class="btn" id="zFit">Fit</button></div>'
     & $add '<button class="btn" id="btnPresent" title="Presentation mode (P)">&#x26F6; Present</button>'
     & $add '<button class="btn" onclick="window.print()">Print / PDF</button>'
     if ($Classification) { & $add ('<span class="conf">{0}</span>' -f (& $enc $Classification)) }
@@ -1883,7 +1977,7 @@ $DashboardJs = @'
   });
 
   var zoom = 1;
-  try { var zs = localStorage.getItem('itsmdash.zoom'); zoom = zs === 'sharp' ? 'sharp' : (parseFloat(zs) || 1); } catch (e) { }
+  try { var zs = localStorage.getItem('itsmdash.zoom'); zoom = parseFloat(zs) || 1; } catch (e) { }
   // Sharp 1:1: scale so one pixel of Excel's page picture is one screen pixel (no resampling blur)
   function sharpScale() {
     var img = document.querySelector('.lay-pic img');
@@ -1934,7 +2028,6 @@ $DashboardJs = @'
   document.getElementById('zIn').addEventListener('click', function () { setZoom(zoom + 0.25); });
   document.getElementById('zOut').addEventListener('click', function () { setZoom(zoom - 0.25); });
   document.getElementById('zFit').addEventListener('click', function () { setZoom(1); });
-  document.getElementById('zSharp').addEventListener('click', function () { setZoom('sharp'); });
   window.addEventListener('load', fit);
   setZoom(zoom);
 
@@ -2198,6 +2291,7 @@ function Invoke-Main {
             $excelViewNote = '{0} of {1} pages exported as PDF by Excel' -f $ok, $result.Pages.Count
         }
         if (-not $SkipSheetPdf) {
+            try { $null = $ws.Activate(); $null = $ws.Range('A1').Select() } catch { }   # a selected chart would export alone
             $sheetPdf = Join-Path $outDir 'Wkly_Report (Excel export).pdf'
             try { $null = $ws.ExportAsFixedFormat(0, $sheetPdf, 0, $true, $false); Write-Log "Excel PDF of Wkly_Report written: $sheetPdf" 'OK' }
             catch { Add-Issue -Severity Warning -Location 'Wkly_Report PDF' -Message ("Excel could not export the worksheet PDF: {0}" -f $_.Exception.Message) }
