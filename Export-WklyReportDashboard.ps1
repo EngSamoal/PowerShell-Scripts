@@ -103,7 +103,7 @@ param(
     [switch]$OpenWhenDone
 )
 
-$ScriptBuild = '2026.10.20-r15'
+$ScriptBuild = '2026.10.20-r16'
 $SheetName = 'Wkly_Report'          # fixed by design - no other worksheet is ever read
 $Inv = [System.Globalization.CultureInfo]::InvariantCulture
 $ErrRegex = '#(DIV/0!|N/A|VALUE!|REF!|NAME\?|NUM!|NULL!|SPILL!|CALC!|FIELD!|BLOCKED!|CONNECT!|BUSY!|UNKNOWN!|GETTING_DATA)'
@@ -890,6 +890,36 @@ function Export-RangePicture {
     return $false
 }
 
+function Get-OverhangingObjects {
+    # Objects (charts, shapes, pictures) that start on one page but run a little past its last row.
+    # Their page is extended to show them whole, and they are hidden while the next page's picture
+    # is taken. Objects taller than a page or overhanging by more than half a page (e.g. side bars,
+    # page backgrounds) are left alone.
+    param($Pages, $Ws)
+    $list = New-Object System.Collections.Generic.List[object]
+    $n = 0
+    try { $n = [int]$Ws.Shapes.Count } catch { return , $list }
+    for ($k = 1; $k -le $n; $k++) {
+        $s = $null
+        try { $s = $Ws.Shapes.Item($k) } catch { continue }
+        if ($null -eq $s) { continue }
+        $top = 0.0; $bottom = 0.0; $name = ''
+        try {
+            if (-not (Test-MsoTrue $s.Visible)) { continue }
+            $top = [double]$s.Top; $bottom = $top + [double]$s.Height; $name = [string]$s.Name
+        }
+        catch { continue }
+        $owner = $null
+        foreach ($p in $Pages) { if ($top -ge $p.StartY -and $top -lt $p.EndY) { $owner = $p; break } }
+        if ($null -eq $owner) { continue }
+        $pageHeight = $owner.EndY - $owner.StartY
+        $over = $bottom - $owner.EndY
+        if ($over -le 1 -or $over -gt 0.5 * $pageHeight -or ($bottom - $top) -gt $pageHeight) { continue }
+        $list.Add([pscustomobject]@{ Shape = $s; Name = $name; Top = $top; Bottom = $bottom; Page = $owner.Index })
+    }
+    return , $list
+}
+
 function Add-PagePictures {
     param($Pages, $Ws, $Geo, [string]$AssetsDir)
     $null = Initialize-EmfHelper
@@ -903,8 +933,26 @@ function Add-PagePictures {
     $zoomWas = 'unknown'
     try { $win = $script:XlApp.ActiveWindow; $zoomWas = [string]$win.Zoom; $win.Zoom = 200 } catch { }
     Write-Log ("Page pictures: gridlines were {0}, page-break lines were {1}, zoom was {2}; gridlines/page breaks hidden and zoom set to 200% for the pictures (temporary copy only)." -f $gridWas, $breaksWas, $zoomWas)
+
+    # keep charts/objects that run slightly past the end of their page on that page only
+    $overhang = New-Object System.Collections.Generic.List[object]
+    try { $overhang = Get-OverhangingObjects -Pages $Pages -Ws $Ws } catch { }
+    foreach ($o in $overhang) {
+        foreach ($p in $Pages) {
+            if ($p.Index -ne $o.Page) { continue }
+            if ($o.Bottom -gt $p.EndY) { $p.EndY = $o.Bottom; $p.EndRow = Get-RowAtY $Geo.RowTops $Geo.LastRow ($p.EndY - 0.5) }
+        }
+        Write-Log ("'{0}' runs past the end of page {1}: page {1} extended to show it whole; it is hidden from the next page's picture." -f $o.Name, $o.Page)
+    }
+
     $ok = 0
     foreach ($p in $Pages) {
+        $hidden = New-Object System.Collections.Generic.List[object]
+        foreach ($o in $overhang) {
+            if ($o.Page -ne $p.Index -and $o.Bottom -gt $p.StartY -and $o.Top -lt $p.EndY) {
+                try { $o.Shape.Visible = 0; $hidden.Add($o) } catch { }
+            }
+        }
         try {
             $c1 = 1
             for ($c = 1; $c -le $Geo.LastCol; $c++) { if ($Geo.ColLefts[$c] -le $p.OffsetX + 0.5) { $c1 = $c } }
@@ -931,6 +979,7 @@ function Add-PagePictures {
             }
         }
         catch { Add-Issue -Severity Warning -Location ("Page {0}" -f $p.Index) -Message ("Page picture failed; the re-drawn view is shown: {0}" -f (Format-ErrorDetail $_)) -Y $p.StartY }
+        finally { foreach ($o in $hidden) { try { $o.Shape.Visible = -1 } catch { } } }
     }
     $how = ($script:PictureMethods.Keys | ForEach-Object { '{0}: {1}' -f $_, $script:PictureMethods[$_] }) -join ', '
     $res = ''
