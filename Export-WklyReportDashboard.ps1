@@ -103,7 +103,7 @@ param(
     [switch]$OpenWhenDone
 )
 
-$ScriptBuild = '2026.10.18-r9'
+$ScriptBuild = '2026.10.20-r10'
 $SheetName = 'Wkly_Report'          # fixed by design - no other worksheet is ever read
 $Inv = [System.Globalization.CultureInfo]::InvariantCulture
 $ErrRegex = '#(DIV/0!|N/A|VALUE!|REF!|NAME\?|NUM!|NULL!|SPILL!|CALC!|FIELD!|BLOCKED!|CONNECT!|BUSY!|UNKNOWN!|GETTING_DATA)'
@@ -820,6 +820,14 @@ function Export-RangePicture {
 function Add-PagePictures {
     param($Pages, $Ws, $Geo, [string]$AssetsDir)
     $null = Initialize-EmfHelper
+    # The pictures are taken "as shown on screen". The hidden copy's window shows cell gridlines and the
+    # page-break lines Excel switches on after paginating, and both come out as dotted lines between
+    # shapes. Hide them on this temporary copy only (it is never saved).
+    $gridWas = 'unknown'; $breaksWas = 'unknown'
+    try { $null = $Ws.Parent.Activate(); $null = $Ws.Activate() } catch { }
+    try { $win = $script:XlApp.ActiveWindow; $gridWas = [string]$win.DisplayGridlines; $win.DisplayGridlines = $false } catch { }
+    try { $breaksWas = [string]$Ws.DisplayPageBreaks; $Ws.DisplayPageBreaks = $false } catch { }
+    Write-Log ("Page pictures: gridlines were {0}, page-break lines were {1}; both hidden for the pictures (temporary copy only)." -f $gridWas, $breaksWas)
     $ok = 0
     foreach ($p in $Pages) {
         try {
