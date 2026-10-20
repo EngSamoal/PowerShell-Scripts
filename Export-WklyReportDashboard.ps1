@@ -103,7 +103,7 @@ param(
     [switch]$OpenWhenDone
 )
 
-$ScriptBuild = '2026.10.20-r11'
+$ScriptBuild = '2026.10.20-r12'
 $SheetName = 'Wkly_Report'          # fixed by design - no other worksheet is ever read
 $Inv = [System.Globalization.CultureInfo]::InvariantCulture
 $ErrRegex = '#(DIV/0!|N/A|VALUE!|REF!|NAME\?|NUM!|NULL!|SPILL!|CALC!|FIELD!|BLOCKED!|CONNECT!|BUSY!|UNKNOWN!|GETTING_DATA)'
@@ -121,6 +121,7 @@ $script:XlMadeVisible = $false
 $script:ThemeMinor = 'Calibri'
 $script:ThemeMajor = 'Calibri Light'
 $script:Clip = $null
+$script:TestClipboard = $null
 $script:PictureScale = 3
 $script:PictureMethods = @{}
 $script:BitmapScales = New-Object System.Collections.Generic.List[double]
@@ -649,6 +650,56 @@ function Export-ChartImage {
     return $false
 }
 
+function Get-ClipboardPicture {
+    # Asks Excel for a picture of $Target (a range or shape) and reads it from the clipboard.
+    # Another program can hold the clipboard for a moment, so every step waits and retries; the
+    # clipboard change counter makes sure a previous picture is never taken for the new one.
+    param($Target, [int]$Appearance, [int]$Format, [ref]$ErrorText)
+    $cb = 'System.Windows.Forms.Clipboard' -as [type]
+    $helper = 'ItsmDash.EmfClip4' -as [type]
+    if ($script:TestClipboard) { $cb = $script:TestClipboard; $helper = $script:TestClipboard }   # test hook
+    $last = 'no picture on the clipboard'
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        $before = [uint32]0
+        if ($helper) { try { $before = $helper::Seq() } catch { } }
+        try { $null = $Target.CopyPicture($Appearance, $Format) }
+        catch { $last = 'Excel copy: ' + $_.Exception.Message; Start-Sleep -Milliseconds (400 * $attempt); continue }
+        if ($helper) {
+            $waited = 0
+            while ($waited -lt 30) {
+                $now = $before
+                try { $now = $helper::Seq() } catch { }
+                if ($now -ne $before) { break }
+                Start-Sleep -Milliseconds 100
+                $waited = $waited + 1
+            }
+            if ($waited -ge 30) { $last = 'Excel did not put a new picture on the clipboard'; Start-Sleep -Milliseconds (400 * $attempt); continue }
+        }
+        if ($Format -ne 2) { $ErrorText.Value = $null; return 'copied' }     # vector: read by the helper
+        $img = $null
+        $tries = 0
+        while ($tries -lt 20 -and $null -eq $img) {
+            try { $img = $cb::GetImage() } catch { $last = 'clipboard read: ' + $_.Exception.Message }
+            if ($null -eq $img) { Start-Sleep -Milliseconds 150 }
+            $tries = $tries + 1
+        }
+        if ($img) { $ErrorText.Value = $null; return $img }
+        Start-Sleep -Milliseconds (400 * $attempt)
+    }
+    $ErrorText.Value = $last
+    return $null
+}
+
+function Save-ClipboardOnce {
+    # Remember the user's clipboard text/picture once, before the first picture is copied.
+    if ($null -ne $script:Clip) { return }
+    $cb = 'System.Windows.Forms.Clipboard' -as [type]
+    $saved = [pscustomobject]@{ Text = $null; Image = $null }
+    try { if ($cb::ContainsText()) { $saved.Text = $cb::GetText() } } catch { }
+    try { if (-not $saved.Text -and $cb::ContainsImage()) { $saved.Image = $cb::GetImage() } } catch { }
+    $script:Clip = $saved
+}
+
 function Export-ShapeViaClipboard {
     # Camera/linked pictures and some objects have no image stored in the file. Excel renders them
     # with CopyPicture; the clipboard's text/picture is saved before the first use and restored at the end.
@@ -659,29 +710,19 @@ function Export-ShapeViaClipboard {
             return $false
         }
         Add-Type -AssemblyName System.Windows.Forms, System.Drawing
-        $cb = 'System.Windows.Forms.Clipboard' -as [type]
+        $null = Initialize-EmfHelper
         $png = ('System.Drawing.Imaging.ImageFormat' -as [type])::Png
-        if ($null -eq $script:Clip) {
-            $saved = [pscustomobject]@{ Text = $null; Image = $null }
-            try { if ($cb::ContainsText()) { $saved.Text = $cb::GetText() } } catch { }
-            try { if (-not $saved.Text -and $cb::ContainsImage()) { $saved.Image = $cb::GetImage() } } catch { }
-            $script:Clip = $saved
-        }
+        Save-ClipboardOnce
         $errs = New-Object System.Collections.Generic.List[string]
-        foreach ($mode in @(@(1, 2), @(2, 2))) {        # (xlScreen, xlBitmap), then (xlPrinter, xlBitmap)
-            try {
-                $cb::Clear()
-                $null = $Shape.CopyPicture($mode[0], $mode[1])
-                $img = $null
-                for ($try = 0; $try -lt 10 -and -not $img; $try++) { Start-Sleep -Milliseconds 100; $img = $cb::GetImage() }
-                if ($img) {
-                    $img.Save($Path, $png); $img.Dispose()
-                    $ErrorText.Value = $null
-                    return $true
-                }
-                $errs.Add(("mode {0}: no picture on the clipboard" -f $mode[0]))
+        foreach ($mode in @(1, 2)) {                     # xlScreen, then xlPrinter (both as bitmap)
+            $err = $null
+            $img = Get-ClipboardPicture -Target $Shape -Appearance $mode -Format 2 -ErrorText ([ref]$err)
+            if ($img) {
+                $img.Save($Path, $png); $img.Dispose()
+                $ErrorText.Value = $null
+                return $true
             }
-            catch { $errs.Add(("mode {0}: {1}" -f $mode[0], $_.Exception.Message)) }
+            $errs.Add(('mode {0}: {1}' -f $mode, $err))
         }
         $ErrorText.Value = ($errs -join ' | ')
         return $false
@@ -691,19 +732,22 @@ function Export-ShapeViaClipboard {
 
 function Initialize-EmfHelper {
     # Reads Excel's vector picture (EMF) from the clipboard and saves it as a sharp PNG.
-    if ('ItsmDash.EmfClip3' -as [type]) { return $true }
+    if ('ItsmDash.EmfClip4' -as [type]) { return $true }
     $code = @'
 using System;
 using System.Runtime.InteropServices;
 using System.Drawing;
 using System.Drawing.Imaging;
 namespace ItsmDash {
-  public static class EmfClip3 {
+  public static class EmfClip4 {
     [StructLayout(LayoutKind.Sequential)] struct RECT { public int Left, Top, Right, Bottom; }
     [DllImport("user32.dll")] static extern bool OpenClipboard(IntPtr h);
     [DllImport("user32.dll")] static extern bool CloseClipboard();
     [DllImport("user32.dll")] static extern IntPtr GetClipboardData(uint f);
     [DllImport("user32.dll")] static extern bool IsClipboardFormatAvailable(uint f);
+    [DllImport("user32.dll")] static extern uint GetClipboardSequenceNumber();
+    [DllImport("kernel32.dll")] static extern void Sleep(uint ms);
+    public static uint Seq() { return GetClipboardSequenceNumber(); }
     [DllImport("gdi32.dll")] static extern IntPtr CopyEnhMetaFile(IntPtr h, IntPtr file);
     [DllImport("gdi32.dll")] static extern bool PlayEnhMetaFile(IntPtr hdc, IntPtr hemf, ref RECT r);
     [DllImport("gdi32.dll")] static extern bool DeleteEnhMetaFile(IntPtr h);
@@ -714,7 +758,9 @@ namespace ItsmDash {
       LastMethod = "";
       if (!IsClipboardFormatAvailable(14)) return false;
       IntPtr copy = IntPtr.Zero;
-      if (!OpenClipboard(IntPtr.Zero)) return false;
+      bool opened = false;
+      for (int i = 0; i < 20 && !opened; i++) { opened = OpenClipboard(IntPtr.Zero); if (!opened) Sleep(150); }
+      if (!opened) return false;
       try { IntPtr h = GetClipboardData(14); if (h != IntPtr.Zero) copy = CopyEnhMetaFile(h, IntPtr.Zero); }
       finally { CloseClipboard(); }
       if (copy == IntPtr.Zero) return false;
@@ -762,27 +808,18 @@ function Export-RangePicture {
         return $false
     }
     Add-Type -AssemblyName System.Windows.Forms, System.Drawing
-    $cb = 'System.Windows.Forms.Clipboard' -as [type]
-    if ($null -eq $script:Clip) {
-        $saved = [pscustomobject]@{ Text = $null; Image = $null }
-        try { if ($cb::ContainsText()) { $saved.Text = $cb::GetText() } } catch { }
-        try { if (-not $saved.Text -and $cb::ContainsImage()) { $saved.Image = $cb::GetImage() } } catch { }
-        $script:Clip = $saved
-    }
+    Save-ClipboardOnce
     $wPx = [int][math]::Ceiling($WidthPt * 96 / 72 * $script:PictureScale)
     $hPx = [int][math]::Ceiling($HeightPt * 96 / 72 * $script:PictureScale)
-    $emfType = 'ItsmDash.EmfClip3' -as [type]
+    $emfType = 'ItsmDash.EmfClip4' -as [type]
     $attempts = 0
     while ($attempts -lt 2) {
         $attempts = $attempts + 1
         # 1) Excel's own screen image of the range (identical to what Excel shows; resolution follows
         #    the hidden window's zoom, which Add-PagePictures raises)
         try {
-            $cb::Clear()
-            $null = $Range.CopyPicture(1, 2)                  # xlScreen, xlBitmap
-            $img = $null
-            $tries = 0
-            while ($tries -lt 10 -and $null -eq $img) { Start-Sleep -Milliseconds 100; $img = $cb::GetImage(); $tries = $tries + 1 }
+            $err = $null
+            $img = Get-ClipboardPicture -Target $Range -Appearance 1 -Format 2 -ErrorText ([ref]$err)   # xlScreen, xlBitmap
             if ($img) {
                 $oneX = $WidthPt * 96 / 72
                 if ($oneX -gt 0) { $script:BitmapScales.Add([math]::Round($img.Width / $oneX, 2)) }
@@ -791,22 +828,23 @@ function Export-RangePicture {
                 $ErrorText.Value = $null
                 return $true
             }
-            $errs.Add('screen image: no picture on the clipboard')
+            $errs.Add('screen image: ' + $err)
         }
         catch { $errs.Add('screen image: ' + $_.Exception.Message) }
         # 2) fallback: vector picture drawn with GDI+
         if ($emfType) {
             try {
-                $cb::Clear()
-                $null = $Range.CopyPicture(1, -4147)          # xlScreen, xlPicture (vector)
-                Start-Sleep -Milliseconds 150
-                if ($emfType::SavePng($Path, $wPx, $hPx)) {
+                $err = $null
+                $copied = Get-ClipboardPicture -Target $Range -Appearance 1 -Format -4147 -ErrorText ([ref]$err)   # xlScreen, xlPicture (vector)
+                if ($copied -and $emfType::SavePng($Path, $wPx, $hPx)) {
                     $how = 'vector ' + [string]$emfType::LastMethod
                     $script:PictureMethods[$how] = 1 + [int]$script:PictureMethods[$how]
                     $ErrorText.Value = $null
                     return $true
                 }
-                $errs.Add('vector: no picture on the clipboard')
+                $why = 'picture could not be read'
+                if ($err) { $why = [string]$err }
+                $errs.Add('vector: ' + $why)
             }
             catch { $errs.Add('vector: ' + $_.Exception.Message) }
         }
@@ -851,6 +889,11 @@ function Add-PagePictures {
             $file = 'page-{0:D2}.png' -f $p.Index
             $err = $null
             $done = (Export-RangePicture -Range $Ws.Range($addr) -Path (Join-Path $AssetsDir $file) -WidthPt $W -HeightPt $H -ErrorText ([ref]$err)) -eq $true
+            if (-not $done) {
+                Write-Log ("Page {0}: picture not captured yet ({1}); trying again in 3 seconds." -f $p.Index, $err) 'WARN'
+                Start-Sleep -Seconds 3
+                $done = (Export-RangePicture -Range $Ws.Range($addr) -Path (Join-Path $AssetsDir $file) -WidthPt $W -HeightPt $H -ErrorText ([ref]$err)) -eq $true
+            }
             if ($done) {
                 $p.Picture = [pscustomobject]@{ Kind = 'image'; L = $L; T = $T; W = $W; H = $H; Z = 0; Rot = 0; Src = "assets/$file"; Alt = ('Wkly_Report ' + $addr); IsChart = $false }
                 $ok = $ok + 1
@@ -870,14 +913,18 @@ function Add-PagePictures {
 
 function Restore-Clipboard {
     if ($null -eq $script:Clip) { return }
-    try {
-        $cb = 'System.Windows.Forms.Clipboard' -as [type]
-        $cb::Clear()
-        if ($script:Clip.Text) { $cb::SetText($script:Clip.Text) }
-        elseif ($script:Clip.Image) { $cb::SetImage($script:Clip.Image) }
-        Write-Log 'Clipboard restored to what it held before the run.'
+    $cb = 'System.Windows.Forms.Clipboard' -as [type]
+    $done = $false; $last = ''
+    for ($i = 1; $i -le 10 -and -not $done; $i++) {
+        try {
+            if ($script:Clip.Text) { $cb::SetText($script:Clip.Text) }
+            elseif ($script:Clip.Image) { $cb::SetImage($script:Clip.Image) }
+            $done = $true
+        }
+        catch { $last = $_.Exception.Message; Start-Sleep -Milliseconds 200 }
     }
-    catch { Write-Log ("Clipboard could not be restored: {0}" -f $_.Exception.Message) 'WARN' }
+    if ($done) { Write-Log 'Clipboard restored to what it held before the run.' }
+    else { Write-Log ("Clipboard could not be restored: {0}" -f $last) 'WARN' }
     $script:Clip = $null
 }
 
