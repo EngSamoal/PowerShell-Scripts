@@ -103,7 +103,7 @@ param(
     [switch]$OpenWhenDone
 )
 
-$ScriptBuild = '2026.10.20-r21'
+$ScriptBuild = '2026.10.20-r22'
 $SheetName = 'Wkly_Report'          # fixed by design - no other worksheet is ever read
 $Inv = [System.Globalization.CultureInfo]::InvariantCulture
 $ErrRegex = '#(DIV/0!|N/A|VALUE!|REF!|NAME\?|NUM!|NULL!|SPILL!|CALC!|FIELD!|BLOCKED!|CONNECT!|BUSY!|UNKNOWN!|GETTING_DATA)'
@@ -1003,6 +1003,59 @@ function Export-PagePdfPicture {
         return $true
     }
     catch { $ErrorText.Value = $_.Exception.Message; return $false }
+}
+
+function Export-SheetPdfByPages {
+    # One PDF page per report page, nothing cut: A4 landscape, no margins/headers, a page break before
+    # each report page and one zoom for all pages so the largest page fits whole (temporary copy only).
+    param($Ws, $Pages, $Geo, [string]$Path)
+    try { $null = $Ws.Activate(); $null = $Ws.Range('A1').Select() } catch { }   # a selected chart would export alone
+    $maxW = 0.0; $maxH = 0.0; $c1 = $Geo.LastCol; $c2 = 1; $lastRow = 1
+    foreach ($p in $Pages) {
+        $c = 1; for ($k = 1; $k -le $Geo.LastCol; $k++) { if ($Geo.ColLefts[$k] -le $p.OffsetX + 0.5) { $c = $k } }
+        $d = $c; for ($k = $c; $k -le $Geo.LastCol; $k++) { if ($Geo.ColLefts[$k] -lt $p.OffsetX + $p.Width - 0.5) { $d = $k } }
+        if ($c -lt $c1) { $c1 = $c }; if ($d -gt $c2) { $c2 = $d }
+        if ($p.EndRow -gt $lastRow) { $lastRow = $p.EndRow }
+        $h = $Geo.RowTops[$p.EndRow + 1] - $Geo.RowTops[$p.StartRow]
+        if ($h -gt $maxH) { $maxH = $h }
+    }
+    $maxW = $Geo.ColLefts[$c2 + 1] - $Geo.ColLefts[$c1]
+    # A4 landscape 842 x 595 pt, keeping 12 pt for printer edges
+    $zoom = [int][math]::Floor([math]::Min(818 / $maxW, 571 / $maxH) * 100)
+    if ($zoom -gt 100) { $zoom = 100 }; if ($zoom -lt 10) { $zoom = 10 }
+    $area = '$' + (ConvertTo-ColumnLetter $c1) + '$1:$' + (ConvertTo-ColumnLetter $c2) + '$' + [string]$lastRow
+    try { $script:XlApp.PrintCommunication = $false } catch { }
+    $ps = $Ws.PageSetup
+    try { $ps.PaperSize = 9 } catch { }                                  # A4
+    try { $ps.Orientation = 2 } catch { }                                # landscape
+    foreach ($prop in 'LeftMargin', 'RightMargin', 'TopMargin', 'BottomMargin', 'HeaderMargin', 'FooterMargin') { try { $ps.$prop = 0 } catch { } }
+    foreach ($prop in 'LeftHeader', 'CenterHeader', 'RightHeader', 'LeftFooter', 'CenterFooter', 'RightFooter') { try { $ps.$prop = '' } catch { } }
+    try { $ps.PrintGridlines = $false; $ps.PrintHeadings = $false; $ps.BlackAndWhite = $false; $ps.Draft = $false } catch { }
+    try { $ps.CenterHorizontally = $true; $ps.CenterVertically = $false } catch { }
+    $ps.PrintArea = $area
+    $ps.Zoom = $zoom                                                     # a fixed zoom keeps the manual page breaks
+    try { $script:XlApp.PrintCommunication = $true } catch { }
+    try { $null = $Ws.ResetAllPageBreaks() } catch { }
+    foreach ($p in $Pages) {
+        if ($p.StartRow -gt 1) { try { $null = $Ws.HPageBreaks.Add($Ws.Cells.Item($p.StartRow, $c1)) } catch { } }
+    }
+    if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Force }
+    $null = $Ws.ExportAsFixedFormat(0, $Path, 0, $true, $false)
+    $count = ''
+    if (Initialize-PdfRenderer) {
+        try {
+            $f = Wait-WinRt ([Windows.Storage.StorageFile]::GetFileFromPathAsync($Path)) ([Windows.Storage.StorageFile])
+            $doc = Wait-WinRt ([Windows.Data.Pdf.PdfDocument]::LoadFromFileAsync($f)) ([Windows.Data.Pdf.PdfDocument])
+            $count = [string]$doc.PageCount
+        }
+        catch { }
+    }
+    if ($count -and [int]$count -ne $Pages.Count) {
+        Write-Log ("Wkly_Report PDF has {0} PDF pages for {1} report pages (print area {2}, zoom {3}%)." -f $count, $Pages.Count, $area, $zoom) 'WARN'
+    }
+    $pagesNote = ''
+    if ($count) { $pagesNote = ', ' + $count + ' PDF pages' }
+    Write-Log ("Excel PDF of Wkly_Report written: {0} - one A4 landscape page per report page, zoom {1}%{2}." -f $Path, $zoom, $pagesNote) 'OK'
 }
 
 function Get-OverhangingObjects {
@@ -2277,23 +2330,21 @@ function Invoke-Main {
             -Mode $PageMode -StartRows $PageStartRows -BreakRows $breakRows -MinFont $TitleMinFontSize -MinHeight $MinPageHeightPt
 
         $lastColLetter = ConvertTo-ColumnLetter ([math]::Max(1, $lastCol))
-        # full-sheet PDF first, with the workbook's own print settings (page pictures change them on the copy)
-        if (-not $SkipSheetPdf) {
-            try { $null = $ws.Activate(); $null = $ws.Range('A1').Select() } catch { }   # a selected chart would export alone
-            $sheetPdf = Join-Path $outDir 'Wkly_Report (Excel export).pdf'
-            try { $null = $ws.ExportAsFixedFormat(0, $sheetPdf, 0, $true, $false); Write-Log "Excel PDF of Wkly_Report written: $sheetPdf" 'OK' }
-            catch {
-                $why = $_.Exception.Message
-                if ($why -match 'not saved') { $why += ' - the PDF is probably still open in a PDF viewer; close it and run again' }
-                Add-Issue -Severity Warning -Location 'Wkly_Report PDF' -Message ("Excel could not export the worksheet PDF: {0}" -f $why)
-            }
-        }
         $pictureNote = 'not captured'
         try {
             $pc = Add-PagePictures -Pages $result.Pages -Ws $ws -Geo $geo -AssetsDir $assets
             $pictureNote = '{0} of {1} pages shown as Excel''s own picture' -f $pc, $result.Pages.Count
         }
         catch { Add-Issue -Severity Warning -Location 'Page pictures' -Message ("Page pictures failed; the re-drawn view is shown: {0}" -f (Format-ErrorDetail $_)) }
+        if (-not $SkipSheetPdf) {
+            $sheetPdf = Join-Path $outDir 'Wkly_Report (Excel export).pdf'
+            try { Export-SheetPdfByPages -Ws $ws -Pages $result.Pages -Geo $geo -Path $sheetPdf }
+            catch {
+                $why = $_.Exception.Message
+                if ($why -match 'not saved') { $why += ' - the PDF is probably still open in a PDF viewer; close it and run again' }
+                Add-Issue -Severity Warning -Location 'Wkly_Report PDF' -Message ("Excel could not export the worksheet PDF: {0}" -f $why)
+            }
+        }
         if ($false) {   # per-page Excel view PDFs: no longer shown in the dashboard
             $ok = 0
             foreach ($p in $result.Pages) {
