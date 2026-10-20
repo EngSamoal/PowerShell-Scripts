@@ -103,7 +103,7 @@ param(
     [switch]$OpenWhenDone
 )
 
-$ScriptBuild = '2026.10.20-r20'
+$ScriptBuild = '2026.10.20-r21'
 $SheetName = 'Wkly_Report'          # fixed by design - no other worksheet is ever read
 $Inv = [System.Globalization.CultureInfo]::InvariantCulture
 $ErrRegex = '#(DIV/0!|N/A|VALUE!|REF!|NAME\?|NUM!|NULL!|SPILL!|CALC!|FIELD!|BLOCKED!|CONNECT!|BUSY!|UNKNOWN!|GETTING_DATA)'
@@ -123,7 +123,7 @@ $script:ThemeMajor = 'Calibri Light'
 $script:Clip = $null
 $script:TestClipboard = $null
 $script:PictureScale = 3
-$script:PdfScale = 2.5
+$script:PdfScale = 2
 $script:PdfReady = $null
 $script:PictureMethods = @{}
 $script:BitmapScales = New-Object System.Collections.Generic.List[double]
@@ -975,23 +975,29 @@ function Export-PagePdfPicture {
         $doc = Wait-WinRt ([Windows.Data.Pdf.PdfDocument]::LoadFromFileAsync($file)) ([Windows.Data.Pdf.PdfDocument])
         if ([int]$doc.PageCount -ne 1) { $ErrorText.Value = ('Excel split the page into {0} PDF pages' -f $doc.PageCount); return $false }
         $page = $doc.GetPage(0)
-        $pw = [double]$page.Size.Width; $ph = [double]$page.Size.Height
-        # content is scaled to fit the paper and centred; crop to it (full size in the limiting direction)
-        $aspect = $HeightPt / $WidthPt
-        if ($ph / $pw -ge $aspect) { $cw = $pw; $ch = [math]::Min($ph, $pw * $aspect * 1.03) }
-        else { $ch = $ph; $cw = [math]::Min($pw, $ph / $aspect * 1.03) }
-        $x = ($pw - $cw) / 2; $y = ($ph - $ch) / 2
+        # render the whole PDF page (width only; Windows keeps the paper's proportions)
+        $targetW = [double][math]::Round($WidthPt * 96 / 72 * $script:PdfScale)
         $opts = New-Object Windows.Data.Pdf.PdfPageRenderOptions
-        $opts.SourceRect = New-Object Windows.Foundation.Rect -ArgumentList $x, $y, $cw, $ch
-        $targetW = [math]::Round($WidthPt * 96 / 72 * $script:PdfScale)
-        $opts.DestinationWidth = [uint32]$targetW
-        $opts.DestinationHeight = [uint32][math]::Round($targetW * $ch / $cw)
+        $opts.DestinationWidth = [uint32][math]::Round($targetW * 1.4)
         $mem = New-Object Windows.Storage.Streams.InMemoryRandomAccessStream
         Wait-WinRt ($page.RenderToStreamAsync($mem, $opts)) $null
-        $in = [System.IO.WindowsRuntimeStreamExtensions]::AsStreamForRead($mem.GetInputStreamAt(0))
-        $out = [System.IO.File]::Create($PngPath)
-        try { $in.CopyTo($out) } finally { $out.Dispose(); $in.Dispose() }
         try { $page.Dispose() } catch { }
+        $in = [System.IO.WindowsRuntimeStreamExtensions]::AsStreamForRead($mem.GetInputStreamAt(0))
+        $full = $null; $crop = $null
+        try {
+            Add-Type -AssemblyName System.Drawing
+            $full = New-Object System.Drawing.Bitmap -ArgumentList $in
+            $pw = [double]$full.Width; $ph = [double]$full.Height
+            if ($pw -lt 10 -or $ph -lt 10) { $ErrorText.Value = 'rendered picture is empty'; return $false }
+            # content is scaled to fit the paper and centred: full size in the limiting direction
+            $aspect = $HeightPt / $WidthPt
+            if ($ph / $pw -ge $aspect) { $cw = $pw; $ch = [math]::Min($ph, $pw * $aspect * 1.03) }
+            else { $ch = $ph; $cw = [math]::Min($pw, $ph / $aspect * 1.03) }
+            $rect = New-Object System.Drawing.Rectangle -ArgumentList ([int][math]::Floor(($pw - $cw) / 2)), ([int][math]::Floor(($ph - $ch) / 2)), ([int][math]::Floor($cw)), ([int][math]::Floor($ch))
+            $crop = $full.Clone($rect, $full.PixelFormat)
+            $crop.Save($PngPath, [System.Drawing.Imaging.ImageFormat]::Png)
+        }
+        finally { if ($crop) { $crop.Dispose() }; if ($full) { $full.Dispose() }; $in.Dispose() }
         if ((Get-Item -LiteralPath $PngPath).Length -lt 2000) { $ErrorText.Value = 'rendered picture is empty'; return $false }
         $ErrorText.Value = $null
         return $true
@@ -2271,6 +2277,17 @@ function Invoke-Main {
             -Mode $PageMode -StartRows $PageStartRows -BreakRows $breakRows -MinFont $TitleMinFontSize -MinHeight $MinPageHeightPt
 
         $lastColLetter = ConvertTo-ColumnLetter ([math]::Max(1, $lastCol))
+        # full-sheet PDF first, with the workbook's own print settings (page pictures change them on the copy)
+        if (-not $SkipSheetPdf) {
+            try { $null = $ws.Activate(); $null = $ws.Range('A1').Select() } catch { }   # a selected chart would export alone
+            $sheetPdf = Join-Path $outDir 'Wkly_Report (Excel export).pdf'
+            try { $null = $ws.ExportAsFixedFormat(0, $sheetPdf, 0, $true, $false); Write-Log "Excel PDF of Wkly_Report written: $sheetPdf" 'OK' }
+            catch {
+                $why = $_.Exception.Message
+                if ($why -match 'not saved') { $why += ' - the PDF is probably still open in a PDF viewer; close it and run again' }
+                Add-Issue -Severity Warning -Location 'Wkly_Report PDF' -Message ("Excel could not export the worksheet PDF: {0}" -f $why)
+            }
+        }
         $pictureNote = 'not captured'
         try {
             $pc = Add-PagePictures -Pages $result.Pages -Ws $ws -Geo $geo -AssetsDir $assets
@@ -2289,12 +2306,6 @@ function Invoke-Main {
                 catch { Add-Issue -Severity Warning -Location ("Page {0}" -f $p.Index) -Message ("Excel view PDF could not be exported: {0}" -f $_.Exception.Message) -Y $p.StartY }
             }
             $excelViewNote = '{0} of {1} pages exported as PDF by Excel' -f $ok, $result.Pages.Count
-        }
-        if (-not $SkipSheetPdf) {
-            try { $null = $ws.Activate(); $null = $ws.Range('A1').Select() } catch { }   # a selected chart would export alone
-            $sheetPdf = Join-Path $outDir 'Wkly_Report (Excel export).pdf'
-            try { $null = $ws.ExportAsFixedFormat(0, $sheetPdf, 0, $true, $false); Write-Log "Excel PDF of Wkly_Report written: $sheetPdf" 'OK' }
-            catch { Add-Issue -Severity Warning -Location 'Wkly_Report PDF' -Message ("Excel could not export the worksheet PDF: {0}" -f $_.Exception.Message) }
         }
     }
     finally {
