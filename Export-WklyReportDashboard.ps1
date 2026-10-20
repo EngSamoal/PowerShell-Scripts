@@ -103,7 +103,7 @@ param(
     [switch]$OpenWhenDone
 )
 
-$ScriptBuild = '2026.10.20-r17'
+$ScriptBuild = '2026.10.20-r18'
 $SheetName = 'Wkly_Report'          # fixed by design - no other worksheet is ever read
 $Inv = [System.Globalization.CultureInfo]::InvariantCulture
 $ErrRegex = '#(DIV/0!|N/A|VALUE!|REF!|NAME\?|NUM!|NULL!|SPILL!|CALC!|FIELD!|BLOCKED!|CONNECT!|BUSY!|UNKNOWN!|GETTING_DATA)'
@@ -966,15 +966,17 @@ function Add-PagePictures {
         Write-Log ("'{0}' runs past the end of page {1}: page {1} extended to show it whole; it is hidden from the next page's picture." -f $o.Name, $o.Page)
     }
 
-    $printOk = $true
-    try {
+    # r17's print-quality picture drew light/coloured text with a printer dot pattern on the real
+    # workbook, so it is switched off: pages use Excel's screen image exactly as in r16.
+    $printOk = $false
+    if ($printOk) { try {
         $ps = $Ws.PageSetup
         if ((Test-MsoTrue $ps.BlackAndWhite) -or (Test-MsoTrue $ps.Draft)) {
             $printOk = $false
             Write-Log 'Wkly_Report prints in black & white or draft mode; using screen pictures.' 'WARN'
         }
     }
-    catch { }
+    catch { } }
     $noPrint = New-Object System.Collections.Generic.List[object]
     if ($printOk) {
         try {
