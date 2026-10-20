@@ -103,7 +103,7 @@ param(
     [switch]$OpenWhenDone
 )
 
-$ScriptBuild = '2026.10.20-r22'
+$ScriptBuild = '2026.10.20-r23'
 $SheetName = 'Wkly_Report'          # fixed by design - no other worksheet is ever read
 $Inv = [System.Globalization.CultureInfo]::InvariantCulture
 $ErrRegex = '#(DIV/0!|N/A|VALUE!|REF!|NAME\?|NUM!|NULL!|SPILL!|CALC!|FIELD!|BLOCKED!|CONNECT!|BUSY!|UNKNOWN!|GETTING_DATA)'
@@ -1039,7 +1039,16 @@ function Export-SheetPdfByPages {
     foreach ($p in $Pages) {
         if ($p.StartRow -gt 1) { try { $null = $Ws.HPageBreaks.Add($Ws.Cells.Item($p.StartRow, $c1)) } catch { } }
     }
-    if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Force }
+    if (Test-Path -LiteralPath $Path) {
+        try { Remove-Item -LiteralPath $Path -Force -ErrorAction Stop }
+        catch {
+            # the previous PDF is still open (e.g. in Acrobat): write this one under a new name instead
+            $dir = [System.IO.Path]::GetDirectoryName($Path)
+            $base = [System.IO.Path]::GetFileNameWithoutExtension($Path)
+            $Path = Join-Path $dir ('{0} {1}.pdf' -f $base, (Get-Date -Format 'yyyy-MM-dd HHmmss'))
+            Write-Log ("The previous Wkly_Report PDF is open in another program, so this one is saved as: {0}" -f $Path) 'WARN'
+        }
+    }
     $null = $Ws.ExportAsFixedFormat(0, $Path, 0, $true, $false)
     $count = ''
     if (Initialize-PdfRenderer) {
@@ -2341,7 +2350,6 @@ function Invoke-Main {
             try { Export-SheetPdfByPages -Ws $ws -Pages $result.Pages -Geo $geo -Path $sheetPdf }
             catch {
                 $why = $_.Exception.Message
-                if ($why -match 'not saved') { $why += ' - the PDF is probably still open in a PDF viewer; close it and run again' }
                 Add-Issue -Severity Warning -Location 'Wkly_Report PDF' -Message ("Excel could not export the worksheet PDF: {0}" -f $why)
             }
         }
@@ -2410,7 +2418,7 @@ function Invoke-Main {
 
     $errs = @($script:Issues | Where-Object { $_.Severity -eq 'Error' }).Count
     $warns = @($script:Issues | Where-Object { $_.Severity -eq 'Warning' }).Count
-    Write-Log ("Done: {0} page(s), {1} chart(s), {2} Excel error value(s)/error(s), {3} warning(s). See 'Data check' in the dashboard." -f $result.Pages.Count, $script:ChartIndex, $errs, $warns) 'OK'
+    Write-Log ("Done: {0} page(s), {1} chart(s), {2} Excel error value(s)/error(s), {3} warning(s). Details: extraction-log.txt in the output folder." -f $result.Pages.Count, $script:ChartIndex, $errs, $warns) 'OK'
     if ($OpenWhenDone) { Start-Process -FilePath $index }
     return $outDir
 }
