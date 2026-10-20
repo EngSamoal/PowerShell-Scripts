@@ -103,7 +103,7 @@ param(
     [switch]$OpenWhenDone
 )
 
-$ScriptBuild = '2026.10.20-r10'
+$ScriptBuild = '2026.10.20-r11'
 $SheetName = 'Wkly_Report'          # fixed by design - no other worksheet is ever read
 $Inv = [System.Globalization.CultureInfo]::InvariantCulture
 $ErrRegex = '#(DIV/0!|N/A|VALUE!|REF!|NAME\?|NUM!|NULL!|SPILL!|CALC!|FIELD!|BLOCKED!|CONNECT!|BUSY!|UNKNOWN!|GETTING_DATA)'
@@ -123,6 +123,7 @@ $script:ThemeMajor = 'Calibri Light'
 $script:Clip = $null
 $script:PictureScale = 3
 $script:PictureMethods = @{}
+$script:BitmapScales = New-Object System.Collections.Generic.List[double]
 
 # ======================================================================================
 #  Small helpers
@@ -690,14 +691,14 @@ function Export-ShapeViaClipboard {
 
 function Initialize-EmfHelper {
     # Reads Excel's vector picture (EMF) from the clipboard and saves it as a sharp PNG.
-    if ('ItsmDash.EmfClip2' -as [type]) { return $true }
+    if ('ItsmDash.EmfClip3' -as [type]) { return $true }
     $code = @'
 using System;
 using System.Runtime.InteropServices;
 using System.Drawing;
 using System.Drawing.Imaging;
 namespace ItsmDash {
-  public static class EmfClip2 {
+  public static class EmfClip3 {
     [StructLayout(LayoutKind.Sequential)] struct RECT { public int Left, Top, Right, Bottom; }
     [DllImport("user32.dll")] static extern bool OpenClipboard(IntPtr h);
     [DllImport("user32.dll")] static extern bool CloseClipboard();
@@ -707,6 +708,7 @@ namespace ItsmDash {
     [DllImport("gdi32.dll")] static extern bool PlayEnhMetaFile(IntPtr hdc, IntPtr hemf, ref RECT r);
     [DllImport("gdi32.dll")] static extern bool DeleteEnhMetaFile(IntPtr h);
     public static string LastMethod = "";
+    public static bool UseGdi = false;
     // Native GDI playback keeps Excel's exact per-letter positions (GDI+ re-lays out text and squeezes it).
     public static bool SavePng(string path, int width, int height) {
       LastMethod = "";
@@ -717,7 +719,7 @@ namespace ItsmDash {
       finally { CloseClipboard(); }
       if (copy == IntPtr.Zero) return false;
       bool played = false;
-      try {
+      if (UseGdi) try {
         using (Bitmap bmp = new Bitmap(width, height, PixelFormat.Format24bppRgb)) {
           using (Graphics g = Graphics.FromImage(bmp)) {
             g.Clear(Color.White);
@@ -769,17 +771,37 @@ function Export-RangePicture {
     }
     $wPx = [int][math]::Ceiling($WidthPt * 96 / 72 * $script:PictureScale)
     $hPx = [int][math]::Ceiling($HeightPt * 96 / 72 * $script:PictureScale)
-    $emfType = 'ItsmDash.EmfClip2' -as [type]
+    $emfType = 'ItsmDash.EmfClip3' -as [type]
     $attempts = 0
     while ($attempts -lt 2) {
         $attempts = $attempts + 1
+        # 1) Excel's own screen image of the range (identical to what Excel shows; resolution follows
+        #    the hidden window's zoom, which Add-PagePictures raises)
+        try {
+            $cb::Clear()
+            $null = $Range.CopyPicture(1, 2)                  # xlScreen, xlBitmap
+            $img = $null
+            $tries = 0
+            while ($tries -lt 10 -and $null -eq $img) { Start-Sleep -Milliseconds 100; $img = $cb::GetImage(); $tries = $tries + 1 }
+            if ($img) {
+                $oneX = $WidthPt * 96 / 72
+                if ($oneX -gt 0) { $script:BitmapScales.Add([math]::Round($img.Width / $oneX, 2)) }
+                $img.Save($Path, ('System.Drawing.Imaging.ImageFormat' -as [type])::Png); $img.Dispose()
+                $script:PictureMethods['Excel screen image'] = 1 + [int]$script:PictureMethods['Excel screen image']
+                $ErrorText.Value = $null
+                return $true
+            }
+            $errs.Add('screen image: no picture on the clipboard')
+        }
+        catch { $errs.Add('screen image: ' + $_.Exception.Message) }
+        # 2) fallback: vector picture drawn with GDI+
         if ($emfType) {
             try {
                 $cb::Clear()
                 $null = $Range.CopyPicture(1, -4147)          # xlScreen, xlPicture (vector)
                 Start-Sleep -Milliseconds 150
                 if ($emfType::SavePng($Path, $wPx, $hPx)) {
-                    $how = [string]$emfType::LastMethod
+                    $how = 'vector ' + [string]$emfType::LastMethod
                     $script:PictureMethods[$how] = 1 + [int]$script:PictureMethods[$how]
                     $ErrorText.Value = $null
                     return $true
@@ -788,21 +810,6 @@ function Export-RangePicture {
             }
             catch { $errs.Add('vector: ' + $_.Exception.Message) }
         }
-        try {
-            $cb::Clear()
-            $null = $Range.CopyPicture(1, 2)                  # xlScreen, xlBitmap
-            $img = $null
-            $tries = 0
-            while ($tries -lt 10 -and $null -eq $img) { Start-Sleep -Milliseconds 100; $img = $cb::GetImage(); $tries = $tries + 1 }
-            if ($img) {
-                $img.Save($Path, ('System.Drawing.Imaging.ImageFormat' -as [type])::Png); $img.Dispose()
-                $script:PictureMethods['bitmap'] = 1 + [int]$script:PictureMethods['bitmap']
-                $ErrorText.Value = $null
-                return $true
-            }
-            $errs.Add('bitmap: no picture on the clipboard')
-        }
-        catch { $errs.Add('bitmap: ' + $_.Exception.Message) }
         # Some Excel builds only draw pictures while the application window exists: retry once off-screen.
         if ($script:XlMadeVisible) { break }
         try {
@@ -827,7 +834,9 @@ function Add-PagePictures {
     try { $null = $Ws.Parent.Activate(); $null = $Ws.Activate() } catch { }
     try { $win = $script:XlApp.ActiveWindow; $gridWas = [string]$win.DisplayGridlines; $win.DisplayGridlines = $false } catch { }
     try { $breaksWas = [string]$Ws.DisplayPageBreaks; $Ws.DisplayPageBreaks = $false } catch { }
-    Write-Log ("Page pictures: gridlines were {0}, page-break lines were {1}; both hidden for the pictures (temporary copy only)." -f $gridWas, $breaksWas)
+    $zoomWas = 'unknown'
+    try { $win = $script:XlApp.ActiveWindow; $zoomWas = [string]$win.Zoom; $win.Zoom = 200 } catch { }
+    Write-Log ("Page pictures: gridlines were {0}, page-break lines were {1}, zoom was {2}; gridlines/page breaks hidden and zoom set to 200% for the pictures (temporary copy only)." -f $gridWas, $breaksWas, $zoomWas)
     $ok = 0
     foreach ($p in $Pages) {
         try {
@@ -853,7 +862,9 @@ function Add-PagePictures {
         catch { Add-Issue -Severity Warning -Location ("Page {0}" -f $p.Index) -Message ("Page picture failed; the re-drawn view is shown: {0}" -f (Format-ErrorDetail $_)) -Y $p.StartY }
     }
     $how = ($script:PictureMethods.Keys | ForEach-Object { '{0}: {1}' -f $_, $script:PictureMethods[$_] }) -join ', '
-    Write-Log ("Excel page pictures: {0} of {1} pages captured at {2}x ({3})." -f $ok, $Pages.Count, $script:PictureScale, $how) 'OK'
+    $res = ''
+    if ($script:BitmapScales.Count) { $res = '; screen image resolution ' + (($script:BitmapScales | ForEach-Object { Format-Num $_ }) -join ', ') + 'x' }
+    Write-Log ("Excel page pictures: {0} of {1} pages captured ({2}{3})." -f $ok, $Pages.Count, $how, $res) 'OK'
     return $ok
 }
 
