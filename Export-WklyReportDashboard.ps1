@@ -62,7 +62,7 @@
     Marking shown on the top bar and every page footer. Default "CONFIDENTIAL".
 
 .PARAMETER SkipExcelView
-    Do not export the per-page "Excel view" PDFs (faster).
+    No longer used (per-page Excel view PDFs are not produced); kept so older command lines still run.
 
 .PARAMETER SkipSheetPdf
     Do not export the full "Wkly_Report (Excel export).pdf".
@@ -103,7 +103,7 @@ param(
     [switch]$OpenWhenDone
 )
 
-$ScriptBuild = '2026.10.20-r14'
+$ScriptBuild = '2026.10.20-r15'
 $SheetName = 'Wkly_Report'          # fixed by design - no other worksheet is ever read
 $Inv = [System.Globalization.CultureInfo]::InvariantCulture
 $ErrRegex = '#(DIV/0!|N/A|VALUE!|REF!|NAME\?|NUM!|NULL!|SPILL!|CALC!|FIELD!|BLOCKED!|CONNECT!|BUSY!|UNKNOWN!|GETTING_DATA)'
@@ -1559,11 +1559,7 @@ function New-DashboardSite {
     & $add ('<div class="tb-title"><b>{0}</b><span>Source: {1} &middot; Wkly_Report (read-only snapshot)</span></div>' -f (& $enc $DashboardTitle), (& $enc $Meta.FileName))
     if ($Meta.ReportingPeriod) { & $add ('<span class="chip" title="Reporting Period (from Wkly_Report)">{0}</span>' -f (& $enc $Meta.ReportingPeriod)) }
     if ($Meta.ReportDate) { & $add ('<span class="chip" title="Report Date (from Wkly_Report)">Report Date: {0}</span>' -f (& $enc $Meta.ReportDate)) }
-    & $add ('<button class="btn warn" id="btnLog">Data check <span class="cnt">{0}</span></button>' -f $issueTotal)
     & $add '<div class="zoom" title="Zoom (keys + and -). Fit = whole page width"><button class="btn" id="zOut">&minus;</button><span id="zVal">Fit</span><button class="btn" id="zIn">+</button><button class="btn" id="zFit">Fit</button></div>'
-    & $add '<button class="btn" id="btnView" title="Excel picture = exactly as Excel draws the page. Re-drawn = HTML version (Inspect works there).">View: Excel picture</button>'
-    & $add '<button class="btn" id="btnInspect" title="Click a text box to see what Excel reported for it">Inspect: off</button>'
-    & $add '<button class="btn" id="btnMarkers" title="Show/hide the markers on Excel errors and empty formula results">Markers: on</button>'
     & $add '<button class="btn" id="btnPresent" title="Presentation mode (P)">&#x26F6; Present</button>'
     & $add '<button class="btn" onclick="window.print()">Print / PDF</button>'
     if ($Classification) { & $add ('<span class="conf">{0}</span>' -f (& $enc $Classification)) }
@@ -1572,7 +1568,7 @@ function New-DashboardSite {
     # ---- sidebar
     & $add '<aside class="sidebar"><h4>REPORT PAGES</h4><nav><ol id="nav">'
     foreach ($p in $Pages) {
-        $flag = if ($p.IssueCount -gt 0) { '<span class="flag" title="Values needing attention on this page">&#9888; {0}</span>' -f $p.IssueCount } else { '' }
+        $flag = ''
         & $add ('<li><a href="#p{0}"><span class="n">{0}</span><span class="t">{1}</span>{2}</a></li>' -f $p.Index, (& $enc $p.Title), $flag)
     }
     & $add '</ol></nav><div class="src">'
@@ -1588,9 +1584,6 @@ function New-DashboardSite {
         $pageClass = 'page'; if ($p.Picture) { $pageClass = 'page haspic' }
         & $add ('<section class="{2}" id="p{0}" data-title="{1}">' -f $p.Index, (ConvertTo-Attr $p.Title), $pageClass)
         & $add ('<div class="pbar"><div class="pt"><span class="pn">{0:D2}</span><h2>{1}</h2><span class="rows">rows {2}&ndash;{3}</span></div><div class="tools">' -f $p.Index, (& $enc $p.Title), $p.StartRow, $p.EndRow)
-        if ($p.IssueCount -gt 0) { & $add ('<span class="badge" title="See Data check">&#9888; {0} to check</span>' -f $p.IssueCount) }
-        if ($p.ExcelView) { & $add ('<button class="btn xbtn" data-xl="{0}">Excel view</button>' -f $p.ExcelView) }
-        else { & $add '<button class="btn xbtn" disabled title="Excel view was not exported for this run">Excel view</button>' }
         & $add ('<span class="pnum">{0} / {1}</span></div></div>' -f $p.Index, $n)
         & $add ('<div class="pbody"><div class="cvwrap" style="--w:{0}pt;--h:{1}pt;--pz:{2}">' -f (Format-Num $wPt), (Format-Num $hPt), (Format-Num $pz))
         & $add ('<div class="cv" data-w="{0}" data-h="{1}" style="width:{2}pt;height:{3}pt">' -f (Format-Num ($wPt * $pt2px)), (Format-Num ($hPt * $pt2px)), (Format-Num $wPt), (Format-Num $hPt))
@@ -1609,41 +1602,15 @@ function New-DashboardSite {
             }
             if ($html) { & $add $html; & $add "`n" }
         }
-        & $add '</div></div></div><div class="xlview"><iframe title="Excel rendering of this page"></iframe></div></div>'
+        & $add '</div></div></div></div>'
         & $add ('<div class="pf"><span>{0}</span><span>Wkly_Report &middot; page {1} of {2} &middot; rows {3}&ndash;{4}</span><span class="c">{5}</span></div></section>' -f (& $enc $DashboardTitle), $p.Index, $n, $p.StartRow, $p.EndRow, (& $enc $Classification))
         & $add "`n"
     }
     & $add "</main>`n</div>`n"
 
-    # ---- data-check drawer
+    # ---- presentation controls
     & $add '<div class="present-hud"><span id="hudPos"></span><button class="btn" id="hudPrev">&#9664;</button><button class="btn" id="hudNext">&#9654;</button><button class="btn" id="hudExit">Exit (Esc)</button></div>'
-    & $add '<div id="inspectBox"><button class="btn" id="inspectClose">&#10005;</button><pre id="inspectText"></pre></div>'
-    & $add '<aside class="drawer" id="drawer"><header><b>Data check &amp; extraction log</b><button class="btn" id="btnClose">&#10005;</button></header><div class="body">'
-    & $add '<p class="lead">Everything the dashboard could not reproduce exactly is listed here, so nothing is silently replaced. Values themselves are never changed.</p>'
-    & $add '<h5>SOURCE</h5><ul>'
-    & $add ('<li>{0}</li>' -f (& $enc $Meta.SourcePath))
-    & $add '<li>A temporary copy was opened read-only in a separate Excel instance: links not updated, formulas calculated as when the file is opened in Excel, macros disabled, closed without saving, copy deleted.</li>'
-    $hashState = if (-not $Meta.HashBefore -or -not $Meta.HashAfter) { '<span class="wn">not verified (the file was locked by another program; this script only reads it)</span>' } elseif ($Meta.HashBefore -eq $Meta.HashAfter) { '<span class="ok">unchanged</span>' } else { '<span class="er">CHANGED during the run - the file was modified by someone else (this script never writes to it)</span>' }
-    & $add ('<li>Original file SHA-256 before / after: {0}<br><code>{1}</code></li>' -f $hashState, $Meta.HashBefore)
-    & $add '</ul><h5>CAPTURED</h5><ul>'
-    & $add ('<li><span class="ok">&#10004;</span> {0}</li>' -f (& $enc $Meta.PageMethod))
-    & $add ('<li><span class="ok">&#10004;</span> {0} non-empty cells, {1} shapes/text boxes, {2} charts, {3} pictures</li>' -f $Meta.CellCount, $Meta.ShapeCount, $Meta.ChartCount, $Meta.PictureCount)
-    & $add ('<li><span class="ok">&#10004;</span> Pages: {0}</li>' -f (& $enc $Meta.PictureNote))
-    & $add ('<li><span class="ok">&#10004;</span> Excel view: {0}</li>' -f (& $enc $Meta.ExcelViewNote))
-    & $add '</ul><h5>NEEDS ATTENTION</h5>'
-    $shown = @($Issues | Sort-Object @{ Expression = { if ($_.Page) { $_.Page } else { 0 } } }, @{ Expression = { switch ($_.Severity) { 'Error' { 0 } 'Warning' { 1 } default { 2 } } } })
-    if ($shown.Count -eq 0) { & $add '<p class="ok">Nothing to report.</p>' }
-    else {
-        & $add '<table class="iss"><thead><tr><th>Page</th><th>Where</th><th>What</th></tr></thead><tbody>'
-        foreach ($iss in $shown) {
-            $cls = switch ($iss.Severity) { 'Error' { 'er' } 'Warning' { 'wn' } default { 'in' } }
-            $pg = if ($iss.Page) { '<a href="#p{0}">{0}</a>' -f $iss.Page } else { '&ndash;' }
-            & $add ('<tr class="{0}"><td>{1}</td><td>{2}</td><td>{3}</td></tr>' -f $cls, $pg, (& $enc $iss.Location), (& $enc $iss.Message))
-        }
-        & $add '</tbody></table>'
-    }
-    & $add ('<h5>LOG</h5><p>Full log: <code>extraction-log.txt</code> in the output folder. Build {0}.</p>' -f $ScriptBuild)
-    & $add "</div></aside>`n<script src=`"assets/dashboard.js`"></script>`n</body>`n</html>`n"
+    & $add "<script src=`"assets/dashboard.js`"></script>`n</body>`n</html>`n"
 
     $index = Join-Path $OutDir ($Meta.BaseName + '.html')
     # an index.html left by builds r1-r5 of this script is removed so only the current dashboard remains
@@ -1859,57 +1826,6 @@ $DashboardJs = @'
     pages.forEach(function (p) { io.observe(p); });
   }
 
-  // Excel view (PDF rendered by Excel itself), loaded on first use
-  [].slice.call(document.querySelectorAll('.xbtn[data-xl]')).forEach(function (b) {
-    b.addEventListener('click', function () {
-      var p = b.closest('.page'), f = p.querySelector('.xlview iframe');
-      if (!f.getAttribute('src')) f.setAttribute('src', b.getAttribute('data-xl') + '#view=FitH');
-      p.classList.toggle('xl');
-      b.textContent = p.classList.contains('xl') ? 'Dashboard view' : 'Excel view';
-    });
-  });
-
-  // data check drawer
-  var drawer = document.getElementById('drawer');
-  document.getElementById('btnLog').addEventListener('click', function () { drawer.classList.add('open'); });
-  document.getElementById('btnClose').addEventListener('click', function () { drawer.classList.remove('open'); });
-  [].slice.call(drawer.querySelectorAll('a[href^="#p"]')).forEach(function (a) { a.addEventListener('click', function () { drawer.classList.remove('open'); }); });
-
-  // View: Excel's own picture of each page (default) or the re-drawn HTML version
-  var vb = document.getElementById('btnView');
-  try { if (localStorage.getItem('itsmdash.view') === 'redraw') body.classList.add('redraw'); } catch (e) { }
-  function viewLabel() { vb.textContent = body.classList.contains('redraw') ? 'View: Re-drawn' : 'View: Excel picture'; }
-  viewLabel();
-  vb.addEventListener('click', function () {
-    body.classList.toggle('redraw'); viewLabel();
-    try { localStorage.setItem('itsmdash.view', body.classList.contains('redraw') ? 'redraw' : 'pic'); } catch (e) { }
-  });
-
-  // Inspect: click a text box to show what Excel reported for it
-  var ib = document.getElementById('inspectBox'), insp = document.getElementById('btnInspect');
-  insp.addEventListener('click', function () {
-    body.classList.toggle('inspect');
-    insp.textContent = body.classList.contains('inspect') ? 'Inspect: on' : 'Inspect: off';
-    if (body.classList.contains('inspect') && !body.classList.contains('redraw')) { body.classList.add('redraw'); viewLabel(); }
-    if (!body.classList.contains('inspect')) ib.style.display = 'none';
-  });
-  document.getElementById('inspectClose').addEventListener('click', function () { ib.style.display = 'none'; });
-  document.addEventListener('click', function (e) {
-    if (!body.classList.contains('inspect')) return;
-    var t = e.target.closest ? e.target.closest('.shp[data-i]') : null;
-    if (!t) return;
-    e.preventDefault();
-    document.getElementById('inspectText').textContent = t.getAttribute('data-i');
-    ib.style.display = 'block';
-  });
-
-  // markers on/off
-  var mk = document.getElementById('btnMarkers');
-  mk.addEventListener('click', function () {
-    body.classList.toggle('no-markers');
-    mk.textContent = body.classList.contains('no-markers') ? 'Markers: off' : 'Markers: on';
-  });
-
   // presentation mode
   var cur = 0;
   function show(i) {
@@ -1936,7 +1852,6 @@ $DashboardJs = @'
   document.getElementById('hudExit').addEventListener('click', stopPresent);
   document.addEventListener('fullscreenchange', function () { if (!document.fullscreenElement && body.classList.contains('present')) stopPresent(); else fit(); });
   document.addEventListener('keydown', function (e) {
-    if (e.key === 'Escape') drawer.classList.remove('open');
     if (!body.classList.contains('present')) {
       if ((e.key === '+' || e.key === '=') && !e.ctrlKey) { setZoom(zoom + 0.25); return; }
       if (e.key === '-' && !e.ctrlKey) { setZoom(zoom - 0.25); return; }
@@ -2024,7 +1939,7 @@ function Invoke-Main {
     $excel = $null; $wb = $null; $blank = $null; $excelPid = 0
     $items = New-Object System.Collections.Generic.List[object]
     $result = $null; $geo = $null; $contentWidth = 0; $cellCount = 0; $shapeCount = 0
-    $excelViewNote = 'skipped (-SkipExcelView)'
+    $excelViewNote = 'not produced'
     $pictureNote = 'not captured'
     try {
         try { $excel = New-Object -ComObject Excel.Application }
@@ -2146,7 +2061,7 @@ function Invoke-Main {
             $pictureNote = '{0} of {1} pages shown as Excel''s own picture' -f $pc, $result.Pages.Count
         }
         catch { Add-Issue -Severity Warning -Location 'Page pictures' -Message ("Page pictures failed; the re-drawn view is shown: {0}" -f (Format-ErrorDetail $_)) }
-        if (-not $SkipExcelView) {
+        if ($false) {   # per-page Excel view PDFs: no longer shown in the dashboard
             $ok = 0
             foreach ($p in $result.Pages) {
                 $pdf = Join-Path $assets ('excel-view\page-{0:D2}.pdf' -f $p.Index)
