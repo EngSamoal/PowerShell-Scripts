@@ -103,7 +103,7 @@ param(
     [switch]$OpenWhenDone
 )
 
-$ScriptBuild = '2026.10.20-r18'
+$ScriptBuild = '2026.10.20-r19'
 $SheetName = 'Wkly_Report'          # fixed by design - no other worksheet is ever read
 $Inv = [System.Globalization.CultureInfo]::InvariantCulture
 $ErrRegex = '#(DIV/0!|N/A|VALUE!|REF!|NAME\?|NUM!|NULL!|SPILL!|CALC!|FIELD!|BLOCKED!|CONNECT!|BUSY!|UNKNOWN!|GETTING_DATA)'
@@ -1665,7 +1665,7 @@ function New-DashboardSite {
     & $add ('<div class="tb-title"><b>{0}</b><span>Source: {1} &middot; Wkly_Report (read-only snapshot)</span></div>' -f (& $enc $DashboardTitle), (& $enc $Meta.FileName))
     if ($Meta.ReportingPeriod) { & $add ('<span class="chip" title="Reporting Period (from Wkly_Report)">{0}</span>' -f (& $enc $Meta.ReportingPeriod)) }
     if ($Meta.ReportDate) { & $add ('<span class="chip" title="Report Date (from Wkly_Report)">Report Date: {0}</span>' -f (& $enc $Meta.ReportDate)) }
-    & $add '<div class="zoom" title="Zoom (keys + and -). Fit = whole page width"><button class="btn" id="zOut">&minus;</button><span id="zVal">Fit</span><button class="btn" id="zIn">+</button><button class="btn" id="zFit">Fit</button></div>'
+    & $add '<div class="zoom" title="Zoom (keys + and -). Fit = whole page width"><button class="btn" id="zOut">&minus;</button><span id="zVal">Fit</span><button class="btn" id="zIn">+</button><button class="btn" id="zSharp" title="Sharpest text: shows Excel&#39;s picture pixel for pixel, exactly as Excel draws it at 100% (scroll sideways if the page is wider than the window)">Sharp 1:1</button><button class="btn" id="zFit">Fit</button></div>'
     & $add '<button class="btn" id="btnPresent" title="Presentation mode (P)">&#x26F6; Present</button>'
     & $add '<button class="btn" onclick="window.print()">Print / PDF</button>'
     if ($Classification) { & $add ('<span class="conf">{0}</span>' -f (& $enc $Classification)) }
@@ -1883,8 +1883,22 @@ $DashboardJs = @'
   });
 
   var zoom = 1;
-  try { zoom = parseFloat(localStorage.getItem('itsmdash.zoom')) || 1; } catch (e) { }
+  try { var zs = localStorage.getItem('itsmdash.zoom'); zoom = zs === 'sharp' ? 'sharp' : (parseFloat(zs) || 1); } catch (e) { }
+  // Sharp 1:1: scale so one pixel of Excel's page picture is one screen pixel (no resampling blur)
+  function sharpScale() {
+    var img = document.querySelector('.lay-pic img');
+    if (!img || !img.naturalWidth || !img.offsetWidth) return 0;
+    return img.naturalWidth / ((window.devicePixelRatio || 1) * img.offsetWidth);
+  }
   function setZoom(z) {
+    if (z === 'sharp') {
+      zoom = 'sharp';
+      document.getElementById('zVal').textContent = '1:1';
+      try { localStorage.setItem('itsmdash.zoom', 'sharp'); } catch (e) { }
+      fit();
+      return;
+    }
+    if (zoom === 'sharp' || !(z > 0)) z = 1;
     zoom = Math.max(0.5, Math.min(3, Math.round(z * 100) / 100));
     document.getElementById('zVal').textContent = zoom === 1 ? 'Fit' : Math.round(zoom * 100) + '%';
     try { localStorage.setItem('itsmdash.zoom', String(zoom)); } catch (e) { }
@@ -1898,7 +1912,8 @@ $DashboardJs = @'
       var W = parseFloat(cv.dataset.w), H = parseFloat(cv.dataset.h);
       var avail = p.querySelector('.pbody').clientWidth - 12;
       if (present) avail = window.innerWidth - 12;
-      var s = avail / W * (present ? 1 : zoom);
+      var s = avail / W * (present || zoom === 'sharp' ? 1 : zoom);
+      if (!present && zoom === 'sharp') { var ss = sharpScale(); if (ss > 0) s = ss; }
       if (present) {
         var ah = window.innerHeight - p.querySelector('.pbar').offsetHeight - p.querySelector('.pf').offsetHeight - 14;
         s = Math.min(s, ah / H);
@@ -1919,6 +1934,8 @@ $DashboardJs = @'
   document.getElementById('zIn').addEventListener('click', function () { setZoom(zoom + 0.25); });
   document.getElementById('zOut').addEventListener('click', function () { setZoom(zoom - 0.25); });
   document.getElementById('zFit').addEventListener('click', function () { setZoom(1); });
+  document.getElementById('zSharp').addEventListener('click', function () { setZoom('sharp'); });
+  window.addEventListener('load', fit);
   setZoom(zoom);
 
   // navigation highlight
