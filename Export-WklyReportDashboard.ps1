@@ -103,7 +103,7 @@ param(
     [switch]$OpenWhenDone
 )
 
-$ScriptBuild = '2026.10.20-r24'
+$ScriptBuild = '2026.10.20-r25'
 $SheetName = 'Wkly_Report'          # fixed by design - no other worksheet is ever read
 $Inv = [System.Globalization.CultureInfo]::InvariantCulture
 $ErrRegex = '#(DIV/0!|N/A|VALUE!|REF!|NAME\?|NUM!|NULL!|SPILL!|CALC!|FIELD!|BLOCKED!|CONNECT!|BUSY!|UNKNOWN!|GETTING_DATA)'
@@ -1870,7 +1870,10 @@ function New-DashboardSite {
             & $add ('<div class="lay-pic">' + $picHtml + '</div>')
         }
         & $add '<div class="lay-html">'
-        foreach ($it in $p.Items) {
+        # pages shown as Excel's picture don't need the hidden re-drawn layer (keeps the single file small)
+        $layerItems = $p.Items
+        if ($p.Picture) { $layerItems = $null }
+        foreach ($it in $layerItems) {
             $html = $null
             try { $html = ConvertTo-ItemHtml $it $p.OffsetX $p.StartY }
             catch {
@@ -1893,7 +1896,27 @@ function New-DashboardSite {
     # an index.html left by builds r1-r5 of this script is removed so only the current dashboard remains
     $old = Join-Path $OutDir 'index.html'
     if ((Test-Path -LiteralPath $old) -and (Select-String -LiteralPath $old -Pattern 'assets/dashboard.js' -SimpleMatch -Quiet)) { Remove-Item -LiteralPath $old -Force }
-    [System.IO.File]::WriteAllText($index, $sb.ToString(), (New-Object System.Text.UTF8Encoding($false)))
+    # Self-contained: styling, script and every picture are embedded, so the single .html file works
+    # when sent by email or Teams without the assets folder.
+    $html = $sb.ToString()
+    $html = $html.Replace('<link rel="stylesheet" href="assets/dashboard.css">', "<style>`n" + $DashboardCss + "`n</style>")
+    $html = $html.Replace('<script src="assets/dashboard.js"></script>', "<script>`n" + $DashboardJs + "`n</script>")
+    $embedded = @{}
+    foreach ($m in [regex]::Matches($html, 'src="(assets/[^"]+)"')) {
+        $rel = $m.Groups[1].Value
+        if ($embedded.ContainsKey($rel)) { continue }
+        $file = Join-Path $OutDir ($rel.Replace('/', [string][System.IO.Path]::DirectorySeparatorChar))
+        if (-not (Test-Path -LiteralPath $file)) { continue }
+        $ext = [System.IO.Path]::GetExtension($file).ToLowerInvariant().TrimStart('.')
+        $mime = 'image/png'
+        if ($ext -eq 'jpg' -or $ext -eq 'jpeg') { $mime = 'image/jpeg' } elseif ($ext -eq 'gif') { $mime = 'image/gif' } elseif ($ext -eq 'svg') { $mime = 'image/svg+xml' } elseif ($ext -eq 'bmp') { $mime = 'image/bmp' } elseif ($ext -eq 'webp') { $mime = 'image/webp' }
+        $embedded[$rel] = 'data:' + $mime + ';base64,' + [System.Convert]::ToBase64String([System.IO.File]::ReadAllBytes($file))
+    }
+    foreach ($rel in $embedded.Keys) { $html = $html.Replace('src="' + $rel + '"', 'src="' + $embedded[$rel] + '"') }
+    [System.IO.File]::WriteAllText($index, $html, (New-Object System.Text.UTF8Encoding($false)))
+    $mb = [math]::Round((Get-Item -LiteralPath $index).Length / 1MB, 1)
+    Write-Log ("Dashboard is a single self-contained file ({0} MB, {1} pictures embedded) - it can be sent by email or Teams on its own." -f $mb, $embedded.Count)
+    if ($mb -gt 20) { Write-Log 'The dashboard file is larger than 20 MB; some email systems reject attachments that big - share it via Teams/OneDrive instead.' 'WARN' }
     return $index
 }
 
