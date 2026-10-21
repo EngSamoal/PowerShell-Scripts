@@ -110,7 +110,7 @@ param(
     [switch]$OpenWhenDone
 )
 
-$ScriptBuild = '2026.10.21-r27'
+$ScriptBuild = '2026.10.21-r28'
 $SheetName = 'Wkly_Report'          # fixed by design - no other worksheet is ever read
 $Inv = [System.Globalization.CultureInfo]::InvariantCulture
 $ErrRegex = '#(DIV/0!|N/A|VALUE!|REF!|NAME\?|NUM!|NULL!|SPILL!|CALC!|FIELD!|BLOCKED!|CONNECT!|BUSY!|UNKNOWN!|GETTING_DATA)'
@@ -1949,7 +1949,24 @@ function New-PageTree {
     }
     $top = New-Object System.Collections.Generic.List[object]
     foreach ($n in $nodes) {
-        if ($n.Thin) { if ($n.Parent) { $n.Parent.Decor.Add($n) } else { $top.Add($n) } ; continue }
+        if ($n.Thin) {
+            # accent bar on a card edge: attach to the smallest box whose top/left edge it touches
+            $edgeBox = $null
+            foreach ($b in $boxes) {
+                $ox = [math]::Min($n.L + $n.W, $b.L + $b.W) - [math]::Max($n.L, $b.L)
+                $oy = [math]::Min($n.T + $n.H, $b.T + $b.H) - [math]::Max($n.T, $b.T)
+                $topEdge = $n.W -ge $n.H -and $ox -ge 0.6 * [math]::Min($n.W, $b.W) -and [math]::Abs($n.T - $b.T) -le 9
+                $leftEdge = $n.H -gt $n.W -and $oy -ge 0.6 * [math]::Min($n.H, $b.H) -and [math]::Abs($n.L - $b.L) -le 9
+                if ($topEdge -or $leftEdge) { $edgeBox = $b; break }
+            }
+            if ($edgeBox) {
+                $n.T = [math]::Max($n.T, $edgeBox.T); $n.L = [math]::Max($n.L, $edgeBox.L)
+                if ($n.W -ge $n.H) { $n.W = [math]::Max($n.W, 0.6 * $edgeBox.W) } else { $n.H = [math]::Max($n.H, 0.6 * $edgeBox.H) }
+                $edgeBox.Decor.Add($n); continue
+            }
+            if ($n.Parent) { $n.Parent.Children.Add($n) } else { $top.Add($n) }
+            continue
+        }
         if ($n.Parent) { $n.Parent.Children.Add($n) } else { $top.Add($n) }
     }
     return , $top
@@ -1984,49 +2001,41 @@ function Get-Bounds {
 }
 
 function ConvertTo-FlowHtml {
-    # Lays out $Nodes inside a box whose left/top edges are $BoxL/$BoxT (points).
-    param($Nodes, [double]$BoxL, [double]$BoxT, [int]$Depth = 0)
+    # Grid-normalised layout of $Nodes (XY-cut): Excel's order and proportions are kept, but rows fill
+    # the full width, side-by-side boxes get equal heights and all gaps are small and uniform.
+    param($Nodes, [int]$Depth = 0)
     if (-not $Nodes -or $Nodes.Count -eq 0) { return '' }
     $sb = New-Object System.Text.StringBuilder
-    if ($Nodes.Count -eq 1) {
-        $n = $Nodes[0]
-        [void]$sb.Append(('<div class="fl" style="margin-left:{0}pt;margin-top:{1}pt">' -f (Format-Num ([math]::Max(0, $n.L - $BoxL))), (Format-Num ([math]::Max(0, $n.T - $BoxT)))))
-        [void]$sb.Append((ConvertTo-NodeHtml $n $Depth))
-        [void]$sb.Append('</div>')
-        return $sb.ToString()
-    }
+    if ($Nodes.Count -eq 1) { return (ConvertTo-NodeHtml $Nodes[0] $Depth) }
     $rows = Split-Nodes $Nodes 'y'
     if ($rows.Count -gt 1 -and $Depth -lt 40) {
-        $prev = $BoxT
-        foreach ($r in $rows) {
-            $bd = Get-Bounds $r
-            [void]$sb.Append(('<div class="fr" style="margin-top:{0}pt">' -f (Format-Num ([math]::Max(0, $bd.T - $prev)))))
-            [void]$sb.Append((ConvertTo-FlowHtml $r $BoxL $bd.T ($Depth + 1)))
-            [void]$sb.Append('</div>')
-            $prev = $bd.T + $bd.H
-        }
+        [void]$sb.Append('<div class="gs">')
+        foreach ($r in $rows) { [void]$sb.Append('<div class="gsi">'); [void]$sb.Append((ConvertTo-FlowHtml $r ($Depth + 1))); [void]$sb.Append('</div>') }
+        [void]$sb.Append('</div>')
         return $sb.ToString()
     }
     $cols = Split-Nodes $Nodes 'x'
     if ($cols.Count -gt 1 -and $Depth -lt 40) {
-        [void]$sb.Append('<div class="fc">')
-        $x = $BoxL
+        $total = 0.0
+        foreach ($c in $cols) { $total += (Get-Bounds $c).W }
+        [void]$sb.Append('<div class="gr">')
         foreach ($c in $cols) {
             $bd = Get-Bounds $c
-            [void]$sb.Append(('<div class="fcol" style="margin-left:{0}pt;width:{1}pt">' -f (Format-Num ([math]::Max(0, $bd.L - $x))), (Format-Num $bd.W)))
-            [void]$sb.Append((ConvertTo-FlowHtml $c $bd.L $BoxT ($Depth + 1)))
+            # thin columns (side bars, separators) keep their width; others share the row by Excel proportions
+            if ($bd.W -le 14) { [void]$sb.Append(('<div class="gc gthin" style="flex:0 0 {0}pt">' -f (Format-Num $bd.W))) }
+            else { [void]$sb.Append(('<div class="gc" style="flex:{0} 1 0">' -f (Format-Num ([math]::Round($bd.W, 1))))) }
+            [void]$sb.Append((ConvertTo-FlowHtml $c ($Depth + 1)))
             [void]$sb.Append('</div>')
-            $x = $bd.L + $bd.W
         }
         [void]$sb.Append('</div>')
         return $sb.ToString()
     }
-    # overlapping objects (e.g. a value box placed inside a sentence): keep Excel's exact positions
+    # objects that genuinely overlap (e.g. a value box placed inside a sentence): keep Excel's relative positions
     $bd = Get-Bounds $Nodes
-    [void]$sb.Append(('<div class="fa" style="margin-left:{0}pt;margin-top:{1}pt;width:{2}pt;height:{3}pt">' -f (Format-Num ([math]::Max(0, $bd.L - $BoxL))), (Format-Num ([math]::Max(0, $bd.T - $BoxT))), (Format-Num $bd.W), (Format-Num $bd.H)))
+    [void]$sb.Append(('<div class="fa" style="width:{0}pt;height:{1}pt">' -f (Format-Num $bd.W), (Format-Num $bd.H)))
     foreach ($n in @($Nodes | Sort-Object Z)) {
-        [void]$sb.Append(('<div class="fabs" style="left:{0}pt;top:{1}pt">' -f (Format-Num ($n.L - $bd.L)), (Format-Num ($n.T - $bd.T))))
-        [void]$sb.Append((ConvertTo-NodeHtml $n $Depth))
+        [void]$sb.Append(('<div class="fabs" style="left:{0}pt;top:{1}pt;width:{2}pt">' -f (Format-Num ($n.L - $bd.L)), (Format-Num ($n.T - $bd.T)), (Format-Num $n.W)))
+        [void]$sb.Append((ConvertTo-NodeHtml $n $Depth -Fixed))
         [void]$sb.Append('</div>')
     }
     [void]$sb.Append('</div>')
@@ -2047,39 +2056,65 @@ function Get-BoxCss {
 }
 
 function ConvertTo-NodeHtml {
-    param($N, [int]$Depth)
+    param($N, [int]$Depth, [switch]$Fixed)
     $it = $N.Item
-    $size = 'width:{0}pt;min-height:{1}pt' -f (Format-Num $N.W), (Format-Num $N.H)
     if ($N.IsBox) {
         $sb = New-Object System.Text.StringBuilder
-        [void]$sb.Append(('<div class="rbox" style="{0}{1}">' -f $size, (Get-BoxCss $it)))
+        $hasKids = $N.Children.Count -gt 0
+        # inner margin: Excel's own inset, kept small and even
+        $pad = 6.0
+        if ($hasKids) {
+            $kb = Get-Bounds $N.Children
+            $pad = [math]::Min(12.0, [math]::Max(4.0, [math]::Min($kb.L - $N.L, $kb.T - $N.T)))
+        }
+        $style = (Get-BoxCss $it)
+        if (-not $hasKids) { $style += ';min-height:{0}pt' -f (Format-Num $N.H) }
+        if ($Fixed) { $style += ';width:{0}pt' -f (Format-Num $N.W) }
+        $style += ';padding:{0}pt' -f (Format-Num $pad)
+        # accent bars attach to the card edge they touch; other thin decorations keep their position
         foreach ($d in $N.Decor) {
             $decBg = 'transparent'
             if ($d.Item.Bg) { $decBg = $d.Item.Bg }
-            [void]$sb.Append(('<div class="rdec" style="left:{0}pt;top:{1}pt;width:{2}pt;height:{3}pt;background:{4}"></div>' -f (Format-Num ($d.L - $N.L)), (Format-Num ($d.T - $N.T)), (Format-Num $d.W), (Format-Num $d.H), $decBg))
+            if ($d.W -ge 0.6 * $N.W -and ($d.T - $N.T) -le 8) { $style += ';border-top:{0}pt solid {1}' -f (Format-Num ([math]::Max(3, $d.H))), $decBg; continue }
+            if ($d.H -ge 0.6 * $N.H -and ($d.L - $N.L) -le 8) { $style += ';border-left:{0}pt solid {1}' -f (Format-Num ([math]::Max(3, $d.W))), $decBg; continue }
+            if ($d.W -ge 0.6 * $N.W -and ($N.T + $N.H - $d.T - $d.H) -le 8) { $style += ';border-bottom:{0}pt solid {1}' -f (Format-Num ([math]::Max(2, $d.H))), $decBg; continue }
         }
+        [void]$sb.Append(('<div class="rbox" style="{0}">' -f $style.TrimStart(';')))
         if ($it.Kind -eq 'shape' -and $it.Runs) {
-            # the box's own text, drawn exactly as in Excel inside the box
             $own = [pscustomobject]@{ Kind = 'shape'; L = 0; T = 0; W = $N.W; H = $N.H; Z = 0; Rot = 0; Name = $it.Name; Bg = $null; Border = $null; Radius = '0'; Shadow = $null
                 Runs = $it.Runs; Aligns = $it.Aligns; Paras = $it.Paras; Anchor = $it.Anchor; Margins = $it.Margins; Wrap = $it.Wrap; TextOrientation = $it.TextOrientation; Formula = $it.Formula; AutoSize = $it.AutoSize; ShapeType = $it.ShapeType }
-            try { [void]$sb.Append((ConvertTo-ItemHtml $own 0 0)) } catch { }
+            try { [void]$sb.Append(('<div class="rown">{0}</div>' -f (ConvertTo-ItemHtml $own 0 0))) } catch { }
         }
-        [void]$sb.Append('<div class="rin">')
-        [void]$sb.Append((ConvertTo-FlowHtml $N.Children $N.L $N.T ($Depth + 1)))
-        [void]$sb.Append('</div></div>')
+        if ($hasKids) { [void]$sb.Append((ConvertTo-FlowHtml $N.Children ($Depth + 1))) }
+        [void]$sb.Append('</div>')
         return $sb.ToString()
     }
     if ($it.Kind -eq 'image' -and $it.IsChart -and $it.Spec -and $it.Spec.kind) {
         $json = $it.Spec | ConvertTo-Json -Depth 8 -Compress
         $fallback = ''
         if ($it.Src) { $fallback = '<img src="{0}" alt="{1}" style="width:100%;height:100%">' -f $it.Src, (ConvertTo-Attr $it.Alt) }
-        return ('<div class="rchart" data-w="{0}" data-h="{1}" data-chart="{2}" style="width:{3}pt;height:{4}pt">{5}</div>' -f (Format-Num ($N.W * 4 / 3)), (Format-Num ($N.H * 4 / 3)), [System.Net.WebUtility]::HtmlEncode($json), (Format-Num $N.W), (Format-Num $N.H), $fallback)
+        $w = 'width:100%'
+        if ($Fixed) { $w = 'width:{0}pt' -f (Format-Num $N.W) }
+        return ('<div class="rchart" data-w="{0}" data-h="{1}" data-chart="{2}" style="{3};aspect-ratio:{4} / {5}">{6}</div>' -f (Format-Num ($N.W * 4 / 3)), (Format-Num ($N.H * 4 / 3)), [System.Net.WebUtility]::HtmlEncode($json), $w, (Format-Num $N.W), (Format-Num $N.H), $fallback)
     }
-    # leaf: drawn exactly like the Excel object inside a box of its Excel size
+    if ($it.Kind -eq 'image') {
+        $w = 'width:100%'
+        if ($Fixed) { $w = 'width:{0}pt' -f (Format-Num $N.W) }
+        return ('<div class="rimg" style="{0};aspect-ratio:{1} / {2}"><img src="{3}" alt="{4}"></div>' -f $w, (Format-Num $N.W), (Format-Num $N.H), $it.Src, (ConvertTo-Attr $it.Alt))
+    }
+    # text and small shapes: drawn like the Excel object; plain text flows with its content height,
+    # shapes with a fill (pills, labels) keep their Excel size
     $copy = $it.PSObject.Copy()
     $html = ''
     try { $html = ConvertTo-ItemHtml $copy $it.L $it.T } catch { }
-    return ('<div class="rleaf" style="{0}">{1}</div>' -f $size, $html)
+    $solid = ($it.Kind -eq 'shape' -and ($it.Bg -or $it.Border)) -or ($it.Kind -eq 'cell' -and ($it.Bg -or $it.Borders)) -or $it.Kind -in 'missing', 'fill' -or $Fixed
+    if ($N.Thin) {
+        $barBg = 'transparent'
+        if ($it.Bg) { $barBg = $it.Bg }
+        return ('<div class="rleaf rbar" style="flex:1 1 auto;min-width:{0}pt;min-height:{1}pt;background:{2}"></div>' -f (Format-Num ([math]::Min($N.W, 12))), (Format-Num ([math]::Min($N.H, 12))), $barBg)
+    }
+    if ($solid) { return ('<div class="rleaf rsolid" style="width:{0}pt;height:{1}pt">{2}</div>' -f (Format-Num $N.W), (Format-Num $N.H), $html) }
+    return ('<div class="rleaf rtext">{0}</div>' -f $html)
 }
 
 function Save-PageInventory {
@@ -2114,8 +2149,7 @@ function ConvertTo-RebuiltPage {
     param($Page)
     $items = @($Page.Items | Where-Object { $_.Kind -ne 'blank' })
     $top = New-PageTree $items
-    $flow = ConvertTo-FlowHtml $top $Page.OffsetX $Page.StartY 0
-    return $flow
+    return (ConvertTo-FlowHtml $top 0)
 }
 
 function New-DashboardSite {
@@ -2347,15 +2381,26 @@ body.inspect .shp{cursor:crosshair}
 body.inspect .shp:hover{outline:2px solid #e5484d;outline-offset:-1px}
 .lay-pic,.lay-html{position:absolute;inset:0}
 .cv.rb{position:absolute;left:0;top:0;transform-origin:0 0;background:#fff;overflow:visible}
-.fr,.fl{display:block}
-.fc{display:flex;align-items:flex-start}
-.fcol{flex:none}
-.fa{position:relative}
+.cv.rb{padding:8pt}
+.gs{display:flex;flex-direction:column;gap:8pt}
+.gsi{min-width:0}
+.gr{display:flex;align-items:stretch;gap:10pt}
+.gc{min-width:0;display:flex;flex-direction:column;gap:8pt}
+.gc>.rbox,.gc>.gs,.gc>.rchart{flex:1 1 auto}
+.gthin>*{flex:1 1 auto}
+.fa{position:relative;max-width:100%}
 .fabs{position:absolute}
-.rbox{position:relative;box-sizing:border-box}
-.rbox>.rin{position:relative}
-.rdec{position:absolute}
-.rleaf{position:relative;box-sizing:border-box}
+.rbox{position:relative;box-sizing:border-box;display:flex;flex-direction:column;gap:8pt;min-width:0}
+.rbox>.gs,.rbox>.gr{flex:1 1 auto}
+.rown{position:relative;min-height:1em}
+.rown>.it{position:relative!important;left:0!important;top:0!important;width:100%!important;height:auto!important}
+.rown .tx{position:relative!important;inset:auto!important}
+.rleaf{position:relative;box-sizing:border-box;max-width:100%}
+.rleaf.rsolid{align-self:flex-start}
+.rleaf.rtext>.it{position:relative!important;left:0!important;top:0!important;width:100%!important;height:auto!important;background:none}
+.rleaf.rtext .tx{position:relative!important;inset:auto!important}
+.rleaf.rtext .cell{display:flex}
+.rimg img{width:100%;height:100%;object-fit:contain;display:block}
 .rchart{position:relative;overflow:hidden}
 .rchart svg{display:block;width:100%;height:100%}
 .rchart text{pointer-events:none}
