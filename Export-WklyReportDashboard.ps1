@@ -46,6 +46,11 @@
       PageBreaks Manual horizontal page breaks in Wkly_Report define the pages.
       Manual     Use -PageStartRows.
 
+.PARAMETER RenderMode
+    Rebuilt (default): each page is rebuilt from what Wkly_Report contains - text, KPI cards, tables,
+    colours and fonts in Excel's arrangement, charts redrawn natively from their own data (sharp,
+    values on hover). Picture: each page is a high-resolution picture of Excel's rendering (r26 behaviour).
+
 .PARAMETER PageStartRows
     Only with -PageMode Manual: first row of each page, e.g. 1,40,72,105
 
@@ -92,6 +97,8 @@ param(
     [string]$OutputDirectory = 'C:\Temp\ITSM_Dashboard',
     [ValidateSet('Auto', 'Titles', 'PageBreaks', 'Manual')]
     [string]$PageMode = 'Auto',
+    [ValidateSet('Rebuilt', 'Picture')]
+    [string]$RenderMode = 'Rebuilt',
     [int[]]$PageStartRows,
     [double]$TitleMinFontSize = 20,
     [double]$MinPageHeightPt = 250,
@@ -103,7 +110,7 @@ param(
     [switch]$OpenWhenDone
 )
 
-$ScriptBuild = '2026.10.20-r26'
+$ScriptBuild = '2026.10.21-r27'
 $SheetName = 'Wkly_Report'          # fixed by design - no other worksheet is ever read
 $Inv = [System.Globalization.CultureInfo]::InvariantCulture
 $ErrRegex = '#(DIV/0!|N/A|VALUE!|REF!|NAME\?|NUM!|NULL!|SPILL!|CALC!|FIELD!|BLOCKED!|CONNECT!|BUSY!|UNKNOWN!|GETTING_DATA)'
@@ -548,6 +555,160 @@ function Get-ShapeBackground {
         return (ConvertTo-CssColor $fill.ForeColor.RGB (1 - [double]$fill.Transparency))
     }
     catch { return $null }
+}
+
+function Get-ChartKind {
+    # Excel chart type -> native renderer family; $null = not rebuilt (Excel's chart image is shown).
+    param([int]$Type)
+    if ($Type -in 51, 52, 53, 54, 55, 56, -4100, 92, 93, 94, 99, 100, 101, 106, 107, 108) { return 'column' }
+    if ($Type -in 57, 58, 59, 60, 61, 62, 95, 96, 97, 102, 103, 104, 109, 110, 111) { return 'bar' }
+    if ($Type -in 4, 63, 64, 65, 66, 67, -4101) { return 'line' }
+    if ($Type -in 1, 76, 77, -4098) { return 'area' }
+    if ($Type -in 5, 69, -4102, 70) { return 'pie' }
+    if ($Type -in -4120, 80) { return 'doughnut' }
+    return $null
+}
+
+function Get-OleCss {
+    param($Value)
+    if ($null -eq $Value -or $Value -is [System.DBNull]) { return $null }
+    try { return (ConvertTo-CssColor ([int64][double]$Value)) } catch { return $null }
+}
+
+function Get-LegacyFont {
+    # Font of a chart element (title, legend, tick labels, data labels) as a small hashtable.
+    param($Font)
+    $f = [ordered]@{ color = $null; size = $null; bold = $false; italic = $false; name = $null }
+    if ($null -eq $Font) { return $f }
+    try { $f.color = Get-OleCss $Font.Color } catch { }
+    try { $f.size = [double]$Font.Size } catch { }
+    try { $f.bold = Test-MsoTrue $Font.Bold } catch { }
+    try { $f.italic = Test-MsoTrue $Font.Italic } catch { }
+    try { $f.name = [string]$Font.Name } catch { }
+    return $f
+}
+
+function ConvertTo-NumberList {
+    # COM array (or single value) -> list of numbers, $null for blanks / Excel errors.
+    param($Values)
+    $out = New-Object System.Collections.Generic.List[object]
+    if ($null -eq $Values) { return , $out }
+    $arr = $Values
+    if ($arr -isnot [System.Array]) { $arr = , $arr }
+    foreach ($v in $arr) {
+        if ($v -is [double] -or $v -is [single] -or $v -is [decimal] -or $v -is [int64]) { $out.Add([double]$v) }
+        elseif ($v -is [int] -and [int]$v -gt -2146826300 -and [int]$v -lt -2146826200) { $out.Add($null) }   # Excel error code
+        elseif ($v -is [int] -or $v -is [int16] -or $v -is [byte]) { $out.Add([double]$v) }
+        else { $out.Add($null) }
+    }
+    return , $out
+}
+
+function ConvertTo-TextList {
+    param($Values)
+    $out = New-Object System.Collections.Generic.List[string]
+    if ($null -eq $Values) { return , $out }
+    $arr = $Values
+    if ($arr -isnot [System.Array]) { $arr = , $arr }
+    foreach ($v in $arr) { $out.Add([string]$v) }
+    return , $out
+}
+
+function Get-AxisSpec {
+    param($Chart, [int]$Type, [int]$Group)
+    $a = [ordered]@{ show = $false; min = $null; max = $null; major = $null; format = 'General'; font = $null; grid = $null; reverse = $false }
+    try { if (-not (Test-MsoTrue $Chart.HasAxis($Type, $Group))) { return $a } } catch { return $a }
+    $ax = $null
+    try { $ax = $Chart.Axes($Type, $Group) } catch { return $a }
+    $a.show = $true
+    try { if ([int]$ax.TickLabelPosition -eq -4142) { $a.show = $false } } catch { }
+    if ($Type -eq 2) {
+        try { $a.min = [double]$ax.MinimumScale; $a.max = [double]$ax.MaximumScale; $a.major = [double]$ax.MajorUnit } catch { }
+    }
+    try { $a.format = [string]$ax.TickLabels.NumberFormat } catch { }
+    try { $a.font = Get-LegacyFont $ax.TickLabels.Font } catch { }
+    try { $a.reverse = Test-MsoTrue $ax.ReversePlotOrder } catch { }
+    try {
+        if (Test-MsoTrue $ax.HasMajorGridlines) {
+            $a.grid = ConvertTo-CssColor $ax.MajorGridlines.Format.Line.ForeColor.RGB (1 - [double]$ax.MajorGridlines.Format.Line.Transparency)
+            if (-not $a.grid) { $a.grid = '#d9d9d9' }
+        }
+    }
+    catch { }
+    return $a
+}
+
+function Get-ChartSpec {
+    # Everything needed to redraw an Excel chart natively: type, series values/categories/colours,
+    # Excel's own axis scale and number formats, labels, legend, title and background.
+    param($Shape)
+    $ch = $Shape.Chart
+    $spec = [ordered]@{ kind = $null; excelType = 0; title = $null; titleFont = $null; bg = $null; plotBg = $null; rounded = $false; shadow = $false
+        font = $null; legend = $null; legendFont = $null; gap = 150; overlap = 0; firstAngle = 0; hole = 50
+        x = $null; y = $null; y2 = $null; series = (New-Object System.Collections.Generic.List[object]) }
+    try { $spec.excelType = [int]$ch.ChartType } catch { }
+    $spec.kind = Get-ChartKind $spec.excelType
+    try { if (Test-MsoTrue $ch.HasTitle) { $spec.title = [string]$ch.ChartTitle.Text; $spec.titleFont = Get-LegacyFont $ch.ChartTitle.Font } } catch { }
+    try { $spec.bg = Get-ShapeBackground ([pscustomobject]@{ Fill = $ch.ChartArea.Format.Fill }) } catch { }
+    try { $spec.plotBg = Get-ShapeBackground ([pscustomobject]@{ Fill = $ch.PlotArea.Format.Fill }) } catch { }
+    try { $spec.rounded = Test-MsoTrue $ch.Parent.RoundedCorners } catch { }
+    try { $spec.shadow = Test-MsoTrue $ch.Parent.Shadow } catch { }
+    try { $spec.font = Get-LegacyFont $ch.ChartArea.Font } catch { }
+    try {
+        if (Test-MsoTrue $ch.HasLegend) {
+            $spec.legend = switch ([int]$ch.Legend.Position) { -4160 { 'top' } -4131 { 'left' } -4152 { 'right' } 2 { 'right' } default { 'bottom' } }
+            $spec.legendFont = Get-LegacyFont $ch.Legend.Font
+        }
+    }
+    catch { }
+    try { $g = $ch.ChartGroups(1); try { $spec.gap = [double]$g.GapWidth } catch { }; try { $spec.overlap = [double]$g.Overlap } catch { }; try { $spec.firstAngle = [double]$g.FirstSliceAngle } catch { }; try { $spec.hole = [double]$g.DoughnutHoleSize } catch { } } catch { }
+    $spec.x = Get-AxisSpec $ch 1 1
+    $spec.y = Get-AxisSpec $ch 2 1
+    $spec.y2 = Get-AxisSpec $ch 2 2
+    $n = 0
+    try { $n = [int]$ch.SeriesCollection().Count } catch { }
+    for ($i = 1; $i -le $n; $i++) {
+        $se = $null
+        try { $se = $ch.SeriesCollection($i) } catch { continue }
+        $sr = [ordered]@{ name = ''; kind = $null; axis = 1; values = $null; cats = $null; fill = $null; fillOn = $true; line = $null; lineOn = $true; width = 2
+            marker = $false; markerColor = $null; points = $null; labels = $null; stacked = $false }
+        try { $sr.name = [string]$se.Name } catch { }
+        try { $t = [int]$se.ChartType; $sr.kind = Get-ChartKind $t; $sr.stacked = ($t -in 52, 53, 55, 56, 58, 59, 61, 62, 63, 64, 66, 67, 76, 77) } catch { $sr.kind = $spec.kind }
+        if (-not $sr.kind) { $spec.kind = $null }
+        try { $sr.axis = [int]$se.AxisGroup } catch { }
+        try { $sr.values = ConvertTo-NumberList $se.Values } catch { }
+        try { $sr.cats = ConvertTo-TextList $se.XValues } catch { }
+        try { $sr.fillOn = Test-MsoTrue $se.Format.Fill.Visible; $sr.fill = ConvertTo-CssColor $se.Format.Fill.ForeColor.RGB } catch { }
+        try { $sr.lineOn = Test-MsoTrue $se.Format.Line.Visible; $sr.line = ConvertTo-CssColor $se.Format.Line.ForeColor.RGB; $sr.width = [double]$se.Format.Line.Weight } catch { }
+        try { $sr.marker = ([int]$se.MarkerStyle -ne -4142); $sr.markerColor = Get-OleCss $se.MarkerBackgroundColor } catch { }
+        if ($sr.kind -in 'column', 'bar', 'pie', 'doughnut') {
+            $cols = New-Object System.Collections.Generic.List[object]
+            $cnt = 0; if ($sr.values) { $cnt = [math]::Min(60, $sr.values.Count) }
+            for ($j = 1; $j -le $cnt; $j++) {
+                $c = $null
+                try { $pf = $se.Points($j).Format.Fill; if (Test-MsoTrue $pf.Visible) { $c = ConvertTo-CssColor $pf.ForeColor.RGB } } catch { }
+                $cols.Add($c)
+            }
+            $sr.points = $cols
+        }
+        try {
+            if (Test-MsoTrue $se.HasDataLabels) {
+                $dl = $se.DataLabels()
+                $lb = [ordered]@{ value = $true; percent = $false; category = $false; series = $false; format = 'General'; font = $null }
+                try { $lb.value = Test-MsoTrue $dl.ShowValue } catch { }
+                try { $lb.percent = Test-MsoTrue $dl.ShowPercentage } catch { }
+                try { $lb.category = Test-MsoTrue $dl.ShowCategoryName } catch { }
+                try { $lb.series = Test-MsoTrue $dl.ShowSeriesName } catch { }
+                try { $lb.format = [string]$dl.NumberFormat } catch { }
+                try { $lb.font = Get-LegacyFont $dl.Font } catch { }
+                $sr.labels = $lb
+            }
+        }
+        catch { }
+        $spec.series.Add($sr)
+    }
+    if ($spec.series.Count -eq 0) { $spec.kind = $null }
+    return $spec
 }
 
 function Get-RunInfo {
@@ -1206,11 +1367,17 @@ function Read-OneShape {
             try { if (Test-MsoTrue $Shape.Chart.HasTitle) { $title = [string]$Shape.Chart.ChartTitle.Text } } catch { }
             $exportError = $null
             $exported = (Export-ChartImage -Shape $Shape -Path $full -ErrorText ([ref]$exportError)) -eq $true
+            $spec = $null
+            try { $spec = Get-ChartSpec $Shape } catch { Write-Log ("Chart '{0}': data could not be read ({1}); Excel's chart image is used." -f $name, $_.Exception.Message) 'WARN' }
+            if ($spec -and -not $spec.kind) { Write-Log ("Chart '{0}': chart type {1} is not rebuilt natively; Excel's chart image is used." -f $name, $spec.excelType) }
             if ($exported) {
-                $Items.Add([pscustomobject]@{ Kind = 'image'; L = $L; T = $T; W = $W; H = $H; Z = $Z; Rot = $rot; Src = "assets/$file"; Alt = $title; IsChart = $true })
+                $Items.Add([pscustomobject]@{ Kind = 'image'; L = $L; T = $T; W = $W; H = $H; Z = $Z; Rot = $rot; Src = "assets/$file"; Alt = $title; IsChart = $true; Spec = $spec })
                 if ((Get-Item -LiteralPath $full).Length -lt 1500) {
                     Add-Issue -Severity Warning -Location "Chart '$name'" -Message 'Exported chart image is very small and may be blank - compare with Excel view.' -Y $T
                 }
+            }
+            elseif ($spec -and $spec.kind) {
+                $Items.Add([pscustomobject]@{ Kind = 'image'; L = $L; T = $T; W = $W; H = $H; Z = $Z; Rot = $rot; Src = $null; Alt = $title; IsChart = $true; Spec = $spec })
             }
             else {
                 $Items.Add([pscustomobject]@{ Kind = 'missing'; L = $L; T = $T; W = $W; H = $H; Z = $Z; Rot = $rot; Message = "Chart '$title' could not be exported - see Excel view" })
@@ -1738,6 +1905,219 @@ function ConvertTo-ItemHtml {
     return ''
 }
 
+# ======================================================================================
+#  Rebuilt pages: Excel page content laid out as flowing HTML (XY-cut), charts redrawn natively
+# ======================================================================================
+
+function Get-NodeArea { param($N) return [math]::Max(0.0, [double]$N.W) * [math]::Max(0.0, [double]$N.H) }
+
+function Test-Contains {
+    # $Outer contains most (>= 80%) of $Inner's area
+    param($Outer, $Inner)
+    $ix = [math]::Min($Outer.L + $Outer.W, $Inner.L + $Inner.W) - [math]::Max($Outer.L, $Inner.L)
+    $iy = [math]::Min($Outer.T + $Outer.H, $Inner.T + $Inner.H) - [math]::Max($Outer.T, $Inner.T)
+    if ($ix -le 0 -or $iy -le 0) { return $false }
+    $a = Get-NodeArea $Inner
+    if ($a -le 0) { return $false }
+    return (($ix * $iy) / $a) -ge 0.8
+}
+
+function New-PageTree {
+    # Builds containers (filled/bordered shapes and cell fills) with their children; thin bars become
+    # decorations drawn at their exact position; returns the top-level nodes of the page.
+    param($Items)
+    $nodes = New-Object System.Collections.Generic.List[object]
+    foreach ($it in $Items) {
+        if ($it.Kind -in 'blank', 'line') { continue }
+        if ($it.W -le 0.5 -or $it.H -le 0.5) { continue }
+        $hasText = ($it.Kind -eq 'cell') -or ($it.Kind -eq 'shape' -and $it.Runs -and ((($it.Runs | ForEach-Object { $_.Text }) -join '') -match '\S'))
+        $hasLook = ($it.Kind -eq 'fill') -or ($it.Kind -eq 'shape' -and ($it.Bg -or $it.Border))
+        $thin = ($it.W -le 12 -or $it.H -le 9) -and -not $hasText -and $it.Kind -in 'shape', 'fill'
+        $isBox = $hasLook -and -not $thin -and -not $hasText -and (Get-NodeArea $it) -ge 1500
+        if ($it.Kind -eq 'shape' -and $hasLook -and $hasText -and (Get-NodeArea $it) -ge 6000) { $isBox = $true }   # card with its own text
+        $nodes.Add([pscustomobject]@{ Item = $it; L = [double]$it.L; T = [double]$it.T; W = [double]$it.W; H = [double]$it.H; Z = [double]$it.Z
+                IsBox = $isBox; Thin = $thin; Children = (New-Object System.Collections.Generic.List[object]); Decor = (New-Object System.Collections.Generic.List[object]); Parent = $null })
+    }
+    $boxes = @($nodes | Where-Object { $_.IsBox } | Sort-Object { Get-NodeArea $_ })
+    foreach ($n in $nodes) {
+        foreach ($b in $boxes) {
+            if ($b -eq $n) { continue }
+            if ((Get-NodeArea $b) -le (Get-NodeArea $n)) { continue }
+            if ($n.Item.Kind -ne 'cell' -and $b.Item.Kind -ne 'fill' -and $n.Z -lt $b.Z) { continue }   # behind the box
+            if (Test-Contains $b $n) { $n.Parent = $b; break }
+        }
+    }
+    $top = New-Object System.Collections.Generic.List[object]
+    foreach ($n in $nodes) {
+        if ($n.Thin) { if ($n.Parent) { $n.Parent.Decor.Add($n) } else { $top.Add($n) } ; continue }
+        if ($n.Parent) { $n.Parent.Children.Add($n) } else { $top.Add($n) }
+    }
+    return , $top
+}
+
+function Split-Nodes {
+    # Splits nodes into groups along one axis wherever there is a clean gap (XY-cut).
+    param($Nodes, [string]$Axis)
+    $sorted = if ($Axis -eq 'y') { @($Nodes | Sort-Object T, L) } else { @($Nodes | Sort-Object L, T) }
+    $groups = New-Object System.Collections.Generic.List[object]
+    $cur = New-Object System.Collections.Generic.List[object]
+    $end = -1e9
+    foreach ($n in $sorted) {
+        $start = if ($Axis -eq 'y') { $n.T } else { $n.L }
+        $stop = if ($Axis -eq 'y') { $n.T + $n.H } else { $n.L + $n.W }
+        if ($cur.Count -gt 0 -and $start -ge $end - 2) { $groups.Add($cur); $cur = New-Object System.Collections.Generic.List[object]; $end = -1e9 }
+        $cur.Add($n)
+        if ($stop -gt $end) { $end = $stop }
+    }
+    if ($cur.Count -gt 0) { $groups.Add($cur) }
+    return , $groups
+}
+
+function Get-Bounds {
+    param($Nodes)
+    $l = 1e9; $t = 1e9; $r = -1e9; $b = -1e9
+    foreach ($n in $Nodes) {
+        if ($n.L -lt $l) { $l = $n.L }; if ($n.T -lt $t) { $t = $n.T }
+        if ($n.L + $n.W -gt $r) { $r = $n.L + $n.W }; if ($n.T + $n.H -gt $b) { $b = $n.T + $n.H }
+    }
+    return [pscustomobject]@{ L = $l; T = $t; W = $r - $l; H = $b - $t }
+}
+
+function ConvertTo-FlowHtml {
+    # Lays out $Nodes inside a box whose left/top edges are $BoxL/$BoxT (points).
+    param($Nodes, [double]$BoxL, [double]$BoxT, [int]$Depth = 0)
+    if (-not $Nodes -or $Nodes.Count -eq 0) { return '' }
+    $sb = New-Object System.Text.StringBuilder
+    if ($Nodes.Count -eq 1) {
+        $n = $Nodes[0]
+        [void]$sb.Append(('<div class="fl" style="margin-left:{0}pt;margin-top:{1}pt">' -f (Format-Num ([math]::Max(0, $n.L - $BoxL))), (Format-Num ([math]::Max(0, $n.T - $BoxT)))))
+        [void]$sb.Append((ConvertTo-NodeHtml $n $Depth))
+        [void]$sb.Append('</div>')
+        return $sb.ToString()
+    }
+    $rows = Split-Nodes $Nodes 'y'
+    if ($rows.Count -gt 1 -and $Depth -lt 40) {
+        $prev = $BoxT
+        foreach ($r in $rows) {
+            $bd = Get-Bounds $r
+            [void]$sb.Append(('<div class="fr" style="margin-top:{0}pt">' -f (Format-Num ([math]::Max(0, $bd.T - $prev)))))
+            [void]$sb.Append((ConvertTo-FlowHtml $r $BoxL $bd.T ($Depth + 1)))
+            [void]$sb.Append('</div>')
+            $prev = $bd.T + $bd.H
+        }
+        return $sb.ToString()
+    }
+    $cols = Split-Nodes $Nodes 'x'
+    if ($cols.Count -gt 1 -and $Depth -lt 40) {
+        [void]$sb.Append('<div class="fc">')
+        $x = $BoxL
+        foreach ($c in $cols) {
+            $bd = Get-Bounds $c
+            [void]$sb.Append(('<div class="fcol" style="margin-left:{0}pt;width:{1}pt">' -f (Format-Num ([math]::Max(0, $bd.L - $x))), (Format-Num $bd.W)))
+            [void]$sb.Append((ConvertTo-FlowHtml $c $bd.L $BoxT ($Depth + 1)))
+            [void]$sb.Append('</div>')
+            $x = $bd.L + $bd.W
+        }
+        [void]$sb.Append('</div>')
+        return $sb.ToString()
+    }
+    # overlapping objects (e.g. a value box placed inside a sentence): keep Excel's exact positions
+    $bd = Get-Bounds $Nodes
+    [void]$sb.Append(('<div class="fa" style="margin-left:{0}pt;margin-top:{1}pt;width:{2}pt;height:{3}pt">' -f (Format-Num ([math]::Max(0, $bd.L - $BoxL))), (Format-Num ([math]::Max(0, $bd.T - $BoxT))), (Format-Num $bd.W), (Format-Num $bd.H)))
+    foreach ($n in @($Nodes | Sort-Object Z)) {
+        [void]$sb.Append(('<div class="fabs" style="left:{0}pt;top:{1}pt">' -f (Format-Num ($n.L - $bd.L)), (Format-Num ($n.T - $bd.T))))
+        [void]$sb.Append((ConvertTo-NodeHtml $n $Depth))
+        [void]$sb.Append('</div>')
+    }
+    [void]$sb.Append('</div>')
+    return $sb.ToString()
+}
+
+function Get-BoxCss {
+    param($It)
+    $st = ''
+    if ($It.Bg) { $st += ';background:' + $It.Bg }
+    if ($It.Kind -eq 'shape') {
+        if ($It.Border) { $st += ';border:' + $It.Border }
+        if ($It.Radius -and $It.Radius -ne '0') { $st += ';border-radius:' + $It.Radius }
+        if ($It.Shadow) { $st += ';box-shadow:' + $It.Shadow }
+    }
+    elseif ($It.Kind -eq 'cell' -and $It.Borders) { $st += ';' + $It.Borders }
+    return $st
+}
+
+function ConvertTo-NodeHtml {
+    param($N, [int]$Depth)
+    $it = $N.Item
+    $size = 'width:{0}pt;min-height:{1}pt' -f (Format-Num $N.W), (Format-Num $N.H)
+    if ($N.IsBox) {
+        $sb = New-Object System.Text.StringBuilder
+        [void]$sb.Append(('<div class="rbox" style="{0}{1}">' -f $size, (Get-BoxCss $it)))
+        foreach ($d in $N.Decor) {
+            $decBg = 'transparent'
+            if ($d.Item.Bg) { $decBg = $d.Item.Bg }
+            [void]$sb.Append(('<div class="rdec" style="left:{0}pt;top:{1}pt;width:{2}pt;height:{3}pt;background:{4}"></div>' -f (Format-Num ($d.L - $N.L)), (Format-Num ($d.T - $N.T)), (Format-Num $d.W), (Format-Num $d.H), $decBg))
+        }
+        if ($it.Kind -eq 'shape' -and $it.Runs) {
+            # the box's own text, drawn exactly as in Excel inside the box
+            $own = [pscustomobject]@{ Kind = 'shape'; L = 0; T = 0; W = $N.W; H = $N.H; Z = 0; Rot = 0; Name = $it.Name; Bg = $null; Border = $null; Radius = '0'; Shadow = $null
+                Runs = $it.Runs; Aligns = $it.Aligns; Paras = $it.Paras; Anchor = $it.Anchor; Margins = $it.Margins; Wrap = $it.Wrap; TextOrientation = $it.TextOrientation; Formula = $it.Formula; AutoSize = $it.AutoSize; ShapeType = $it.ShapeType }
+            try { [void]$sb.Append((ConvertTo-ItemHtml $own 0 0)) } catch { }
+        }
+        [void]$sb.Append('<div class="rin">')
+        [void]$sb.Append((ConvertTo-FlowHtml $N.Children $N.L $N.T ($Depth + 1)))
+        [void]$sb.Append('</div></div>')
+        return $sb.ToString()
+    }
+    if ($it.Kind -eq 'image' -and $it.IsChart -and $it.Spec -and $it.Spec.kind) {
+        $json = $it.Spec | ConvertTo-Json -Depth 8 -Compress
+        $fallback = ''
+        if ($it.Src) { $fallback = '<img src="{0}" alt="{1}" style="width:100%;height:100%">' -f $it.Src, (ConvertTo-Attr $it.Alt) }
+        return ('<div class="rchart" data-w="{0}" data-h="{1}" data-chart="{2}" style="width:{3}pt;height:{4}pt">{5}</div>' -f (Format-Num ($N.W * 4 / 3)), (Format-Num ($N.H * 4 / 3)), [System.Net.WebUtility]::HtmlEncode($json), (Format-Num $N.W), (Format-Num $N.H), $fallback)
+    }
+    # leaf: drawn exactly like the Excel object inside a box of its Excel size
+    $copy = $it.PSObject.Copy()
+    $html = ''
+    try { $html = ConvertTo-ItemHtml $copy $it.L $it.T } catch { }
+    return ('<div class="rleaf" style="{0}">{1}</div>' -f $size, $html)
+}
+
+function Save-PageInventory {
+    # What was read from each page (positions, text, colours, chart data) - attach this file when
+    # something in the dashboard differs from Excel, so the exact structure can be checked.
+    param($Pages, [string]$Path)
+    try {
+        $list = New-Object System.Collections.Generic.List[object]
+        foreach ($p in $Pages) {
+            $objs = New-Object System.Collections.Generic.List[object]
+            foreach ($it in $p.Items) {
+                $text = $null
+                if ($it.Kind -eq 'cell') { $text = [string]$it.Text }
+                elseif ($it.Kind -eq 'shape' -and $it.Runs) { $text = (($it.Runs | ForEach-Object { $_.Text }) -join '') }
+                $o = [ordered]@{ kind = $it.Kind; name = [string]$it.Name; address = [string]$it.Address; L = [math]::Round($it.L, 1); T = [math]::Round($it.T, 1); W = [math]::Round($it.W, 1); H = [math]::Round($it.H, 1); Z = $it.Z
+                    bg = $it.Bg; text = $text; link = $it.Formula }
+                if ($it.Kind -eq 'shape' -and $it.Runs) { $o['runs'] = @($it.Runs | ForEach-Object { [ordered]@{ text = $_.Text; size = $_.Size; bold = $_.Bold; color = $_.Color; font = $_.Font } }) }
+                if ($it.Spec) { $o['chart'] = $it.Spec }
+                $objs.Add($o)
+            }
+            $list.Add([ordered]@{ page = $p.Index; title = $p.Title; rows = ('{0}-{1}' -f $p.StartRow, $p.EndRow); objects = $objs })
+        }
+        $dir = Split-Path -Parent $Path
+        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        [System.IO.File]::WriteAllText($Path, ($list | ConvertTo-Json -Depth 10), (New-Object System.Text.UTF8Encoding($false)))
+        Write-Log ("Page inventory (what was read from each page): {0}" -f $Path)
+    }
+    catch { Write-Log ("Page inventory could not be written: {0}" -f $_.Exception.Message) 'WARN' }
+}
+
+function ConvertTo-RebuiltPage {
+    param($Page)
+    $items = @($Page.Items | Where-Object { $_.Kind -ne 'blank' })
+    $top = New-PageTree $items
+    $flow = ConvertTo-FlowHtml $top $Page.OffsetX $Page.StartY 0
+    return $flow
+}
+
 function New-DashboardSite {
     # Writes ONE self-contained .html to $OutDir; pictures are read from $WorkDir\assets and embedded.
     param($Pages, [string]$OutDir, $Meta, $Issues, [string]$WorkDir)
@@ -1792,6 +2172,17 @@ function New-DashboardSite {
         & $add ('<div class="pbar"><div class="pt"><span class="pn">{0:D2}</span><h2>{1}</h2><span class="rows">rows {2}&ndash;{3}</span></div><div class="tools">' -f $p.Index, (& $enc $p.Title), $p.StartRow, $p.EndRow)
         & $add ('<span class="pnum">{0} / {1}</span></div></div>' -f $p.Index, $n)
         & $add ('<div class="pbody"><div class="cvwrap" style="--w:{0}pt;--h:{1}pt;--pz:{2}">' -f (Format-Num $wPt), (Format-Num $hPt), (Format-Num $pz))
+        if ($RenderMode -eq 'Rebuilt') {
+            $flow = ''
+            try { $flow = ConvertTo-RebuiltPage $p }
+            catch { Add-Issue -Severity Warning -Location ("Page {0}" -f $p.Index) -Message ("Page could not be rebuilt: {0}" -f (Format-ErrorDetail $_)) }
+            & $add ('<div class="cv rb" data-w="{0}" data-h="auto" style="width:{1}pt">' -f (Format-Num ($wPt * $pt2px)), (Format-Num $wPt))
+            & $add $flow
+            & $add '</div></div></div>'
+            & $add ('<div class="pf"><span>{0}</span><span>Wkly_Report &middot; page {1} of {2}</span><span class="c">{3}</span></div></section>' -f (& $enc $DashboardTitle), $p.Index, $n, (& $enc $Classification))
+            & $add "`n"
+            continue
+        }
         & $add ('<div class="cv" data-w="{0}" data-h="{1}" style="width:{2}pt;height:{3}pt">' -f (Format-Num ($wPt * $pt2px)), (Format-Num ($hPt * $pt2px)), (Format-Num $wPt), (Format-Num $hPt))
         if ($p.Picture) {
             $picHtml = ''
@@ -1955,6 +2346,21 @@ body.no-markers .blankcell{display:none}
 body.inspect .shp{cursor:crosshair}
 body.inspect .shp:hover{outline:2px solid #e5484d;outline-offset:-1px}
 .lay-pic,.lay-html{position:absolute;inset:0}
+.cv.rb{position:absolute;left:0;top:0;transform-origin:0 0;background:#fff;overflow:visible}
+.fr,.fl{display:block}
+.fc{display:flex;align-items:flex-start}
+.fcol{flex:none}
+.fa{position:relative}
+.fabs{position:absolute}
+.rbox{position:relative;box-sizing:border-box}
+.rbox>.rin{position:relative}
+.rdec{position:absolute}
+.rleaf{position:relative;box-sizing:border-box}
+.rchart{position:relative;overflow:hidden}
+.rchart svg{display:block;width:100%;height:100%}
+.rchart text{pointer-events:none}
+.rchart [data-tip]{pointer-events:all;cursor:default}
+.rchart .ctip{position:absolute;pointer-events:none;background:rgba(11,22,64,.92);color:#fff;font:12px "Segoe UI",sans-serif;padding:4px 8px;border-radius:4px;white-space:nowrap;display:none;z-index:5}
 .page.haspic .lay-html{display:none}
 body.redraw .page.haspic .lay-html{display:block}
 body.redraw .page.haspic .lay-pic{display:none}
@@ -2031,12 +2437,263 @@ $DashboardJs = @'
     try { localStorage.setItem('itsmdash.zoom', String(zoom)); } catch (e) { }
     fit();
   }
+
+  // ---- native charts redrawn from Excel's chart data (no external libraries) ----
+  function decimalsOf(nf) { var m = /0\.(0+)/.exec(nf || ''); return m ? m[1].length : 0; }
+  function fmt(v, nf) {
+    if (v === null || v === undefined || isNaN(v)) return '';
+    nf = nf || 'General';
+    var sec = nf.split(';');
+    if (v === 0 && sec.length > 2) { var z = sec[2].replace(/_.|\*.|["\\\s]/g, ''); if (/^[-–]$/.test(z)) return '-'; }
+    if (v < 0 && sec.length > 1) nf = sec[1]; else nf = sec[0];
+    if (/general/i.test(nf)) { var r = Math.round(v * 100) / 100; return String(r); }
+    if (/\[?h\]?:mm/i.test(nf)) {
+      var t = Math.round(Math.abs(v) * 86400), h = Math.floor(t / 3600), m = Math.floor(t % 3600 / 60), s2 = t % 60;
+      return h + ':' + (m < 10 ? '0' : '') + m + (/ss/i.test(nf) ? ':' + (s2 < 10 ? '0' : '') + s2 : '');
+    }
+    var d = decimalsOf(nf), pct = nf.indexOf('%') >= 0, x = Math.abs(pct ? v * 100 : v);
+    var str = x.toFixed(d);
+    if (nf.indexOf(',') >= 0) { var parts = str.split('.'); parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ','); str = parts.join('.'); }
+    if (v < 0 && sec.length < 2) str = '-' + str;
+    return str + (pct ? '%' : '');
+  }
+  function esc(t) { return String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+  function px(pt) { return pt * 4 / 3; }
+  function fontAttr(f, defSize, defColor) {
+    f = f || {};
+    var sz = px(f.size || defSize), col = f.color || defColor;
+    return 'font-size="' + sz.toFixed(1) + '" fill="' + col + '" font-family="' + esc(f.name || 'Calibri') + ',Calibri,Segoe UI,sans-serif"' +
+      (f.bold ? ' font-weight="700"' : '') + (f.italic ? ' font-style="italic"' : '');
+  }
+  function niceAxis(min, max) {
+    if (min > 0) min = 0;
+    if (max <= min) max = min + 1;
+    var span = max - min, step = Math.pow(10, Math.floor(Math.log10(span / 5))), f = span / 5 / step;
+    step *= f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10;
+    return { min: Math.floor(min / step) * step, max: Math.ceil(max / step) * step, major: step };
+  }
+  function axisOf(ax, vals) {
+    if (ax && ax.max !== null && ax.max !== undefined && ax.major > 0 && ax.max > ax.min) return { min: ax.min, max: ax.max, major: ax.major };
+    var lo = Math.min.apply(null, vals.concat([0])), hi = Math.max.apply(null, vals.concat([0]));
+    return niceAxis(lo, hi);
+  }
+  function wrapText(t, maxChars) {
+    var words = String(t).split(/\s+/), lines = [], cur = '';
+    words.forEach(function (w) { if ((cur + ' ' + w).trim().length > maxChars && cur) { lines.push(cur); cur = w; } else cur = (cur + ' ' + w).trim(); });
+    if (cur) lines.push(cur);
+    return lines.slice(0, 3);
+  }
+  function seriesColor(sr, i) {
+    var pal = ['#4472c4', '#ed7d31', '#a5a5a5', '#ffc000', '#5b9bd5', '#70ad47'];
+    if (sr.kind === 'line' || sr.kind === 'area') return sr.lineOn !== false && sr.line ? sr.line : (sr.fill || pal[i % 6]);
+    return sr.fillOn !== false && sr.fill ? sr.fill : (sr.line || pal[i % 6]);
+  }
+  function renderChart(el) {
+    var sp = JSON.parse(el.getAttribute('data-chart'));
+    var W = parseFloat(el.dataset.w), H = parseFloat(el.dataset.h);
+    var txt = (sp.font && sp.font.color) || '#404040';
+    var o = [], tips = [];
+    var top = 8, bottom = H - 8, left = 10, right = W - 10;
+    if (sp.bg) { el.style.background = sp.bg; }
+    if (sp.rounded) el.style.borderRadius = '14px';
+    if (sp.shadow) el.style.boxShadow = '0 3px 8px rgba(0,0,0,.35)';
+    if (sp.title) {
+      var tf = sp.titleFont || {}, tsz = px(tf.size || 14);
+      wrapText(sp.title, Math.max(10, Math.floor(W / (tsz * 0.55)))).forEach(function (ln, k) {
+        o.push('<text x="' + W / 2 + '" y="' + (top + tsz * (k + 1)) + '" text-anchor="middle" ' + fontAttr(tf, 14, txt) + '>' + esc(ln) + '</text>');
+        top += 0;
+      });
+      top += tsz * wrapText(sp.title, Math.max(10, Math.floor(W / (tsz * 0.55)))).length + 8;
+    }
+    var series = sp.series || [];
+    var cats = [];
+    series.forEach(function (s) { if (s.cats && s.cats.length > cats.length) cats = s.cats; });
+    var pie = sp.kind === 'pie' || sp.kind === 'doughnut';
+    // legend
+    var legend = [];
+    if (sp.legend) {
+      if (pie && series[0]) (series[0].cats || []).forEach(function (c, i) { legend.push({ name: c, color: (series[0].points && series[0].points[i]) || seriesColor(series[0], i), line: false }); });
+      else series.forEach(function (s, i) { legend.push({ name: s.name, color: seriesColor(s, i), line: s.kind === 'line' }); });
+    }
+    var lf = sp.legendFont || sp.font || {}, lsz = px(lf.size || 9);
+    if (legend.length && (sp.legend === 'bottom' || sp.legend === 'top')) {
+      var lx = 0, items = legend.map(function (e) { var w = e.name.length * lsz * 0.55 + lsz * 2.2; lx += w; return w; });
+      var x0 = Math.max(left, (W - lx) / 2), ly = sp.legend === 'bottom' ? bottom - lsz * 0.3 : top + lsz;
+      legend.forEach(function (e, i) {
+        o.push(e.line ? '<line x1="' + x0 + '" y1="' + (ly - lsz * 0.35) + '" x2="' + (x0 + lsz * 1.4) + '" y2="' + (ly - lsz * 0.35) + '" stroke="' + e.color + '" stroke-width="3"/>'
+          : '<rect x="' + x0 + '" y="' + (ly - lsz * 0.8) + '" width="' + lsz * 0.8 + '" height="' + lsz * 0.8 + '" fill="' + e.color + '"/>');
+        o.push('<text x="' + (x0 + lsz * 1.6) + '" y="' + ly + '" ' + fontAttr(lf, 9, txt) + '>' + esc(e.name) + '</text>');
+        x0 += items[i];
+      });
+      if (sp.legend === 'bottom') bottom -= lsz * 1.8; else top += lsz * 1.8;
+    } else if (legend.length) {
+      var ry = top + 10, lw = Math.min(W * 0.32, Math.max.apply(null, legend.map(function (e) { return e.name.length; })) * lsz * 0.55 + lsz * 2);
+      var rx = sp.legend === 'left' ? left : right - lw;
+      legend.forEach(function (e) {
+        o.push('<rect x="' + rx + '" y="' + (ry - lsz * 0.8) + '" width="' + lsz * 0.8 + '" height="' + lsz * 0.8 + '" fill="' + e.color + '"/>');
+        o.push('<text x="' + (rx + lsz * 1.4) + '" y="' + ry + '" ' + fontAttr(lf, 9, txt) + '>' + esc(e.name) + '</text>');
+        ry += lsz * 1.5;
+      });
+      if (sp.legend === 'left') left += lw + 6; else right -= lw + 6;
+    }
+    if (pie) {
+      var s0 = series[0], vals = (s0.values || []).map(function (v) { return v > 0 ? v : 0; });
+      var tot = vals.reduce(function (a, b) { return a + b; }, 0);
+      var cx = (left + right) / 2, cy = (top + bottom) / 2, R = Math.max(10, Math.min(right - left, bottom - top) / 2 - 18);
+      var r0 = sp.kind === 'doughnut' ? R * (sp.hole || 50) / 100 : 0;
+      var a = (sp.firstAngle || 0) * Math.PI / 180 - Math.PI / 2;
+      var lb = s0.labels;
+      vals.forEach(function (v, i) {
+        if (!tot) return;
+        var a2 = a + v / tot * 2 * Math.PI, col = (s0.points && s0.points[i]) || seriesColor(s0, i), big = a2 - a > Math.PI ? 1 : 0;
+        var P = function (r, ang) { return (cx + r * Math.cos(ang)).toFixed(2) + ',' + (cy + r * Math.sin(ang)).toFixed(2); };
+        var d = v / tot >= 0.9999 ? (r0 ? 'M' + P(R, 0) + ' A' + R + ',' + R + ' 0 1 1 ' + P(R, Math.PI) + ' A' + R + ',' + R + ' 0 1 1 ' + P(R, 0) + ' M' + P(r0, 0) + ' A' + r0 + ',' + r0 + ' 0 1 0 ' + P(r0, Math.PI) + ' A' + r0 + ',' + r0 + ' 0 1 0 ' + P(r0, 0) + 'Z'
+          : 'M' + P(R, 0) + ' A' + R + ',' + R + ' 0 1 1 ' + P(R, Math.PI) + ' A' + R + ',' + R + ' 0 1 1 ' + P(R, 0) + 'Z')
+          : 'M' + P(R, a) + ' A' + R + ',' + R + ' 0 ' + big + ' 1 ' + P(R, a2) + (r0 ? ' L' + P(r0, a2) + ' A' + r0 + ',' + r0 + ' 0 ' + big + ' 0 ' + P(r0, a) + 'Z' : ' L' + cx + ',' + cy + 'Z');
+        var cat = (s0.cats || [])[i] || '';
+        var vf = lb && lb.format && lb.format.indexOf('%') < 0 && !/general/i.test(lb.format) ? lb.format : '#,##0';
+        tips.push(cat + ': ' + fmt(s0.values[i], vf) + ' (' + (v / tot * 100).toFixed(2) + '%)');
+        o.push('<path d="' + d + '" fill="' + col + '" stroke="rgba(0,0,0,.25)" stroke-width="1" data-tip="' + (tips.length - 1) + '"/>');
+        if (lb && v > 0) {
+          var parts = [];
+          if (lb.category) parts.push(cat);
+          if (lb.value) parts.push(fmt(s0.values[i], lb.format));
+          if (lb.percent) parts.push(fmt(v / tot, lb.format && lb.format.indexOf('%') >= 0 ? lb.format : '0%'));
+          var mid = (a + a2) / 2, lr = r0 ? (R + r0) / 2 : (v / tot < 0.08 ? R + 14 : R * 0.65);
+          o.push('<text x="' + (cx + lr * Math.cos(mid)) + '" y="' + (cy + lr * Math.sin(mid) + 4) + '" text-anchor="middle" ' + fontAttr(lb.font, 9, txt) + '>' + esc(parts.join(', ')) + '</text>');
+        }
+        a = a2;
+      });
+      el.innerHTML = '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none">' + o.join('') + '</svg><div class="ctip"></div>';
+      bindTips(el, tips);
+      return;
+    }
+    // cartesian charts
+    var horiz = series.some(function (s) { return s.kind === 'bar'; });
+    var prim = [], sec = [];
+    series.forEach(function (s) {
+      var stackedSum = null;
+      (s.axis === 2 ? sec : prim).push.apply(s.axis === 2 ? sec : prim, (s.values || []).filter(function (v) { return v !== null; }));
+    });
+    // stacked totals
+    var stacked = series.some(function (s) { return s.stacked; });
+    if (stacked) { prim = cats.map(function (c, i) { return series.filter(function (s) { return s.axis !== 2; }).reduce(function (a, s) { return a + Math.max(0, (s.values || [])[i] || 0); }, 0); }); }
+    var A1 = axisOf(sp.y, prim.length ? prim : [0]), A2 = sec.length ? axisOf(sp.y2, sec) : null;
+    var yf = sp.y || {}, y2f = sp.y2 || {}, xf = sp.x || {};
+    var tsz = px((yf.font && yf.font.size) || 9), csz = px((xf.font && xf.font.size) || 9);
+    var n = Math.max(1, cats.length || (series[0] && series[0].values ? series[0].values.length : 1));
+    var catW = 0;
+    if (horiz) {
+      catW = Math.min((right - left) * 0.42, Math.max.apply(null, cats.map(function (c) { return String(c).length; }).concat([1])) * csz * 0.55 + 8);
+      if (xf.show !== false) left += catW;
+      if (yf.show !== false) top += tsz + 6;
+    } else {
+      if (yf.show !== false) left += Math.max.apply(null, [fmt(A1.max, yf.format), fmt(A1.min, yf.format)].map(function (t) { return t.length; })) * tsz * 0.6 + 8;
+      if (A2 && y2f.show !== false) right -= Math.max.apply(null, [fmt(A2.max, y2f.format)].map(function (t) { return t.length; })) * tsz * 0.6 + 8;
+      var maxLines = Math.max.apply(null, cats.map(function (c) { return wrapText(c, Math.max(4, Math.floor((right - left) / n / (csz * 0.55)))).length; }).concat([1]));
+      if (xf.show !== false) bottom -= csz * 1.25 * maxLines + 6;
+    }
+    var plotL = left, plotR = right, plotT = top + 6, plotB = bottom;
+    if (sp.plotBg) o.push('<rect x="' + plotL + '" y="' + plotT + '" width="' + (plotR - plotL) + '" height="' + (plotB - plotT) + '" fill="' + sp.plotBg + '"/>');
+    var V = function (v, ax) { ax = ax || A1; var f = (v - ax.min) / (ax.max - ax.min); return horiz ? plotL + f * (plotR - plotL) : plotB - f * (plotB - plotT); };
+    // gridlines + value axis
+    for (var g = A1.min; g <= A1.max + A1.major / 1000; g += A1.major) {
+      var gp = V(g);
+      if (yf.grid) o.push(horiz ? '<line x1="' + gp + '" y1="' + plotT + '" x2="' + gp + '" y2="' + plotB + '" stroke="' + yf.grid + '" stroke-width="1"/>' : '<line x1="' + plotL + '" y1="' + gp + '" x2="' + plotR + '" y2="' + gp + '" stroke="' + yf.grid + '" stroke-width="1"/>');
+      if (yf.show !== false) o.push(horiz ? '<text x="' + gp + '" y="' + (plotT - 6) + '" text-anchor="middle" ' + fontAttr(yf.font, 9, txt) + '>' + esc(fmt(g, yf.format)) + '</text>'
+        : '<text x="' + (plotL - 6) + '" y="' + (gp + tsz * 0.35) + '" text-anchor="end" ' + fontAttr(yf.font, 9, txt) + '>' + esc(fmt(g, yf.format)) + '</text>');
+    }
+    if (A2 && y2f.show !== false) for (var g2 = A2.min; g2 <= A2.max + A2.major / 1000; g2 += A2.major) {
+      o.push('<text x="' + (plotR + 6) + '" y="' + (V(g2, A2) + tsz * 0.35) + '" ' + fontAttr(y2f.font, 9, txt) + '>' + esc(fmt(g2, y2f.format)) + '</text>');
+    }
+    // category axis
+    var band = (horiz ? plotB - plotT : plotR - plotL) / n;
+    var order = function (i) { return horiz ? (xf.reverse ? i : n - 1 - i) : (xf.reverse ? n - 1 - i : i); };
+    var C = function (i) { return (horiz ? plotT : plotL) + band * (order(i) + 0.5); };
+    if (xf.show !== false) cats.forEach(function (c, i) {
+      if (horiz) o.push('<text x="' + (plotL - 6) + '" y="' + (C(i) + csz * 0.35) + '" text-anchor="end" ' + fontAttr(xf.font, 9, txt) + '>' + esc(c) + '</text>');
+      else wrapText(c, Math.max(4, Math.floor(band / (csz * 0.55)))).forEach(function (ln, k) {
+        o.push('<text x="' + C(i) + '" y="' + (plotB + csz * (k + 1.1)) + '" text-anchor="middle" ' + fontAttr(xf.font, 9, txt) + '>' + esc(ln) + '</text>');
+      });
+    });
+    o.push(horiz ? '<line x1="' + V(0) + '" y1="' + plotT + '" x2="' + V(0) + '" y2="' + plotB + '" stroke="#8c8c8c"/>' : '<line x1="' + plotL + '" y1="' + V(Math.max(A1.min, 0)) + '" x2="' + plotR + '" y2="' + V(Math.max(A1.min, 0)) + '" stroke="#8c8c8c"/>');
+    // bars
+    var barSeries = series.filter(function (s) { return s.kind === 'column' || s.kind === 'bar'; });
+    var gap = (sp.gap === undefined ? 150 : sp.gap) / 100, groupW = band / (1 + gap);
+    var nb = stacked ? 1 : Math.max(1, barSeries.length), ov = (sp.overlap || 0) / 100;
+    var bw = groupW / (nb - (nb - 1) * ov);
+    var stackBase = cats.map(function () { return 0; });
+    var labelsOut = [];
+    barSeries.forEach(function (s, si) {
+      (s.values || []).forEach(function (v, i) {
+        if (v === null) return;
+        var col = (s.points && s.points[i]) || seriesColor(s, series.indexOf(s));
+        var base = stacked ? stackBase[i] : 0, end = base + v;
+        if (stacked) stackBase[i] = end;
+        var c0 = C(i) - groupW / 2 + (stacked ? 0 : si * bw * (1 - ov));
+        var p0 = V(Math.max(A1.min, Math.min(A1.max, base))), p1 = V(Math.max(A1.min, Math.min(A1.max, end)));
+        var outline = s.fillOn === false;
+        var attrs = outline ? 'fill="none" stroke="' + (s.line || col) + '" stroke-width="1.5"' : 'fill="' + col + '"';
+        tips.push((cats[i] || '') + ' - ' + (s.name || '') + ': ' + fmt(v, (s.labels && s.labels.format) || yf.format));
+        if (horiz) o.push('<rect x="' + Math.min(p0, p1) + '" y="' + c0 + '" width="' + Math.abs(p1 - p0) + '" height="' + bw + '" ' + attrs + ' data-tip="' + (tips.length - 1) + '"/>');
+        else o.push('<rect x="' + c0 + '" y="' + Math.min(p0, p1) + '" width="' + bw + '" height="' + Math.abs(p1 - p0) + '" ' + attrs + ' data-tip="' + (tips.length - 1) + '"/>');
+        if (s.labels) {
+          var t = [];
+          if (s.labels.value) t.push(fmt(v, s.labels.format));
+          if (s.labels.category) t.push(cats[i] || '');
+          if (s.labels.series) t.push(s.name || '');
+          if (t.length) labelsOut.push(horiz ? '<text x="' + (Math.max(p0, p1) + 4) + '" y="' + (c0 + bw / 2 + tsz * 0.35) + '" ' + fontAttr(s.labels.font, 9, txt) + '>' + esc(t.join(', ')) + '</text>'
+            : '<text x="' + (c0 + bw / 2) + '" y="' + (Math.min(p0, p1) - 4) + '" text-anchor="middle" ' + fontAttr(s.labels.font, 9, txt) + '>' + esc(t.join(', ')) + '</text>');
+        }
+      });
+    });
+    // lines / areas
+    series.forEach(function (s, si) {
+      if (s.kind !== 'line' && s.kind !== 'area') return;
+      var ax = s.axis === 2 && A2 ? A2 : A1, col = seriesColor(s, si), pts = [];
+      (s.values || []).forEach(function (v, i) { if (v !== null) pts.push([C(i), V(Math.max(ax.min, Math.min(ax.max, v)), ax), v, i]); });
+      if (!pts.length) return;
+      var d = 'M' + pts.map(function (q) { return q[0].toFixed(2) + ',' + q[1].toFixed(2); }).join(' L');
+      if (s.kind === 'area') o.push('<path d="' + d + ' L' + pts[pts.length - 1][0] + ',' + V(Math.max(ax.min, 0), ax) + ' L' + pts[0][0] + ',' + V(Math.max(ax.min, 0), ax) + 'Z" fill="' + (s.fill || col) + '" opacity=".6"/>');
+      if (s.lineOn !== false) o.push('<path d="' + d + '" fill="none" stroke="' + col + '" stroke-width="' + Math.max(1, px(s.width || 1.5)) + '" stroke-linejoin="round" stroke-linecap="round"/>');
+      pts.forEach(function (q) {
+        tips.push((cats[q[3]] || '') + ' - ' + (s.name || '') + ': ' + fmt(q[2], (s.labels && s.labels.format) || (s.axis === 2 ? y2f.format : yf.format)));
+        o.push('<circle cx="' + q[0] + '" cy="' + q[1] + '" r="' + (s.marker ? 4 : 6) + '" fill="' + (s.marker ? (s.markerColor || col) : 'transparent') + '" data-tip="' + (tips.length - 1) + '"/>');
+        if (s.labels && s.labels.value) labelsOut.push('<text x="' + (q[0] + 4) + '" y="' + (q[1] - 6) + '" ' + fontAttr(s.labels.font, 9, txt) + '>' + esc(fmt(q[2], s.labels.format)) + '</text>');
+      });
+    });
+    o = o.concat(labelsOut);
+    el.innerHTML = '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none">' + o.join('') + '</svg><div class="ctip"></div>';
+    bindTips(el, tips);
+  }
+  function bindTips(el, tips) {
+    var tip = el.querySelector('.ctip');
+    el.addEventListener('mousemove', function (e) {
+      var t = e.target.getAttribute && e.target.getAttribute('data-tip');
+      if (t === null || t === undefined) { tip.style.display = 'none'; return; }
+      var r = el.getBoundingClientRect(), sc = r.width / el.offsetWidth || 1;
+      tip.textContent = tips[+t]; tip.style.display = 'block';
+      tip.style.left = ((e.clientX - r.left) / sc + 12) + 'px'; tip.style.top = ((e.clientY - r.top) / sc + 12) + 'px';
+    });
+    el.addEventListener('mouseleave', function () { tip.style.display = 'none'; });
+  }
+  [].slice.call(document.querySelectorAll('.rchart[data-chart]')).forEach(function (el) {
+    try { renderChart(el); }
+    catch (e) { el.setAttribute('data-error', String(e)); }   // Excel's chart image stays as fallback
+  });
+
   function fit() {
     var present = body.classList.contains('present');
     pages.forEach(function (p) {
       var wrap = p.querySelector('.cvwrap'), cv = p.querySelector('.cv');
       if (!wrap || !cv) return;
       var W = parseFloat(cv.dataset.w), H = parseFloat(cv.dataset.h);
+      if (cv.dataset.h === 'auto') {
+        H = cv.offsetHeight;
+        var wPt = W * 0.75, hPt = H * 0.75;
+        wrap.style.setProperty('--w', wPt + 'pt'); wrap.style.setProperty('--h', hPt + 'pt');
+        wrap.style.setProperty('--pz', Math.min(1, 790 / wPt, 520 / hPt));
+      }
       var avail = p.querySelector('.pbody').clientWidth - 12;
       if (present) avail = window.innerWidth - 12;
       var s = avail / W * (present || zoom === 'sharp' ? 1 : zoom);
@@ -2285,7 +2942,9 @@ function Invoke-Main {
         $lastColLetter = ConvertTo-ColumnLetter ([math]::Max(1, $lastCol))
         $pictureNote = 'not captured'
         try {
-            $pc = Add-PagePictures -Pages $result.Pages -Ws $ws -Geo $geo -AssetsDir $assets
+            $pc = 0
+            if ($RenderMode -eq 'Picture') { $pc = Add-PagePictures -Pages $result.Pages -Ws $ws -Geo $geo -AssetsDir $assets }
+            else { Write-Log 'Render mode Rebuilt: pages are rebuilt from the worksheet content; charts are redrawn from their data.' }
             $pictureNote = '{0} of {1} pages shown as Excel''s own picture' -f $pc, $result.Pages.Count
         }
         catch { Add-Issue -Severity Warning -Location 'Page pictures' -Message ("Page pictures failed; the re-drawn view is shown: {0}" -f (Format-ErrorDetail $_)) }
@@ -2334,6 +2993,7 @@ function Invoke-Main {
         ReportingPeriod = (Find-LabelValue -Items $items -Label 'Reporting Period')
         ReportDate      = (Find-LabelValue -Items $items -Label 'Report Date')
     }
+    Save-PageInventory -Pages $result.Pages -Path ($script:LogPath -replace 'extraction-log', 'page-inventory' -replace '\.txt$', '.json')
     $index = New-DashboardSite -Pages $result.Pages -OutDir $outDir -Meta $meta -Issues $script:Issues -WorkDir $script:WorkDir
     # validation of the single output file
     $validLevel = 'OK'
@@ -2342,7 +3002,8 @@ function Invoke-Main {
     $pictures = [regex]::Matches($written, 'class="lay-pic"><img').Count
     $externalRefs = [regex]::Matches($written, '(?:src|href)="(?!data:|#)[^"]+"').Count
     if ($sections -ne $result.Pages.Count -or $externalRefs -ne 0) { $validLevel = 'WARN' }
-    Write-Log ("Validation: {0} page(s) in the file (expected {1}), {2} page(s) as Excel picture, {3} external reference(s) (expected 0), no PDF written." -f $sections, $result.Pages.Count, $pictures, $externalRefs) $validLevel
+    $nativeCharts = [regex]::Matches($written, 'class="rchart"').Count
+    Write-Log ("Validation: {0} page(s) in the file (expected {1}), {2} page(s) as Excel picture, {4} chart(s) redrawn from data, {3} external reference(s) (expected 0), no PDF written." -f $sections, $result.Pages.Count, $pictures, $externalRefs, $nativeCharts) $validLevel
     Write-Log "Dashboard written: $index" 'OK'
 
 

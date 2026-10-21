@@ -9,19 +9,22 @@ It is **read-only**: no worksheet, formula, chart, PivotTable or value is change
 
 - The workbook is copied to a temporary folder and only that copy is opened, read-only, in a
   separate hidden Excel instance. Your own Excel windows are not touched, and the copy is closed
-  without saving and deleted.
-- Each report page is shown as **Excel's own rendering of that page**: Excel exports the page to a
-  temporary PDF (vector text, as sharp as Excel's own PDF), Windows' built-in PDF renderer turns it
-  into a picture at 2x screen resolution, and the temporary PDF is deleted. If that fails for a page,
-  Excel's screen picture of the page is used instead (the log says which and why).
-- Formulas are calculated as when you open the file in Excel, so time-based values (`NOW()`,
-  `TODAY()`, ages) are current. External links are not updated and PivotTables/queries are not
-  refreshed — save the workbook after your normal refresh.
-- **Pages are detected on every run**, so the dashboard follows the workbook when pages are added
-  or removed. A new page starts at each large-font page title on the left of the sheet. You can
-  also set the start rows yourself (see section 3).
-- If Excel's picture of a page can't be captured, that page is shown re-drawn in HTML instead and
-  the reason is written to `extraction-log.txt`.
+  without saving and deleted. Only the `Wkly_Report` tab is read.
+- **Pages are detected on every run** from their large titles, so the dashboard follows the workbook
+  when pages are added or removed.
+- **Each page is rebuilt from what it contains** (default `-RenderMode Rebuilt`):
+  - every text box, KPI card, cell, colour, font, accent bar and panel is read with its exact text
+    and formatting (values exactly as Excel displays them - nothing is recalculated);
+  - the page is laid out in Excel's arrangement (header band, card rows, chart panels) as flowing
+    HTML, so boxes keep their spacing but can no longer overlap;
+  - **charts are redrawn natively from their own data** - series values, categories, Excel's axis
+    scale and number formats, colours (per bar where set), data labels, legend and title - so they are
+    sharp at any zoom and show values on hover. Blank and error values stay gaps, never 0. A chart
+    type that is not supported is shown as Excel's own image of that chart instead.
+- `-RenderMode Picture` shows each page as a high-resolution picture of Excel's rendering instead
+  (the previous behaviour).
+- Each run writes a **page inventory** (`page-inventory <date>.json`, next to the log) listing what
+  was read from every page - attach it when something differs from Excel.
 
 ## 2. Run it
 
@@ -53,6 +56,7 @@ while it runs (it uses the clipboard briefly for the page pictures and restores 
 |---|---|---|
 | `-WorkbookPath` | `C:\Temp\Bi_Wkly_Report-Daily Data.xlsx` | Workbook to read |
 | `-OutputDirectory` | `C:\Temp\ITSM_Dashboard` | Folder for the single `<workbook name>.html` |
+| `-RenderMode` | `Rebuilt` | `Rebuilt` (pages rebuilt from content, native charts) or `Picture` (Excel's rendering as pictures) |
 | `-PageMode` | `Auto` | `Auto`, `Titles`, `PageBreaks`, `Manual` |
 | `-PageStartRows` | – | With `-PageMode Manual`: e.g. `1,40,72,105` |
 | `-TitleMinFontSize` | `20` | Font size that counts as a page title |
@@ -100,11 +104,10 @@ Always attach the log (path printed at the end of the run) when reporting a prob
 
 ## 7. Known limitations
 
-- Pages are high-resolution pictures of Excel's rendering, not vector graphics: they stay sharp at
-  Full HD and 4K at normal zoom, but zooming far beyond 200% shows pixels. Charts are not
-  hover-interactive. Excel's PDF rendering uses print layout, which can differ very slightly from screen.
-- The file is larger than a plain web page (roughly 10–30 MB, logged each run) because the pictures
-  are embedded; some email systems reject attachments above ~20 MB — use Teams/OneDrive then.
-- Outlook/Teams previews may not run the page's script; download the file and open it in a browser.
-- `.xlsb`/`.xls` files: pictures inside the sheet may be shown as placeholders on pages that fall
-  back to the re-drawn view.
+- Rebuilt pages use the same text, colours and arrangement as Excel, but text is drawn by the browser,
+  so line breaks can differ slightly; uncommon shape outlines are drawn as rectangles.
+- Native charts reproduce data, colours, scale, labels and legend; Excel's special effects (3D,
+  bevels, glow, gradients inside bars) are drawn flat. Multi-level category labels show one level.
+- Linked/camera pictures (e.g. a picture of a table on another tab) are shown as Excel's picture.
+- The file includes all page content and is typically a few MB; Outlook/Teams previews may not run the
+  page's script - download the file and open it in Edge or Chrome.
