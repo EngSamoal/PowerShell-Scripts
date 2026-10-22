@@ -24,7 +24,7 @@ cd C:\Temp
 .\Export-WklyReportDashboardB.ps1 -OpenWhenDone
 ```
 
-The first line printed shows the build, for example `Export-WklyReportDashboardB (Design B) build 2026.10.22-B1`.
+The first line printed shows the build, for example `Export-WklyReportDashboardB (Design B) build 2026.10.22-B2`.
 
 | Parameter | Default |
 |---|---|
@@ -86,6 +86,14 @@ Pages are detected on every run, so the dashboard follows the workbook when page
 - **Print** prints one page per A4 landscape sheet.
 
 ## Known limitations
+
+- Build B2 follows the approved sample page by page: each page of the sample is filled with the
+  workbook's own labels, figures and charts. Wording follows the workbook, so a label can read slightly
+  differently from the sample.
+- Helper cells outside the report panels are used only to fill tiles (e.g. totals); they are not shown.
+- Rows of the weekly update log that contain only `[]` placeholders are skipped (the log says how many).
+- The assignment-groups table is shown as Excel's own picture of it.
+- A chart that has no place in the sample is added at the end of its page, so nothing is dropped.
 
 - The arrangement comes from Excel's positions. A page with unusual overlapping objects may group cards
   differently from the sample design. The log line for each page shows what was found.

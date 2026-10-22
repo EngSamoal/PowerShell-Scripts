@@ -15,8 +15,16 @@ It is **read-only**: no worksheet, formula, chart, PivotTable or value is change
 - **Each page is rebuilt from what it contains** (default `-RenderMode Rebuilt`):
   - every text box, KPI card, cell, colour, font, accent bar and panel is read with its exact text
     and formatting (values exactly as Excel displays them - nothing is recalculated);
-  - the page is laid out in Excel's arrangement (header band, card rows, chart panels) as flowing
-    HTML, so boxes keep their spacing but can no longer overlap;
+  - every object is placed at **Excel's exact position and size** (build r29 and later), and each page
+    is cleaned up first:
+    - every object belongs to one page only (no repeats across pages, no empty frames);
+    - each page is cropped to its own content (no shared width, so no empty side margins);
+    - helper cells outside the report panels (e.g. lookup values next to a card) are not shown;
+    - empty and duplicate text boxes are skipped;
+    - figures that sit as separate boxes on top of a sentence ("Team responds in ___ min") are joined
+      into that sentence, so they can no longer overlap or drift;
+    - text uses Excel's line spacing; wrapped text that still needs slightly more room than its box is
+      shrunk by at most 15% instead of running over the next object;
   - **charts are redrawn natively from their own data** - series values, categories, Excel's axis
     scale and number formats, colours (per bar where set), data labels, legend and title - so they are
     sharp at any zoom and show values on hover. Blank and error values stay gaps, never 0. A chart
@@ -59,7 +67,7 @@ while it runs (it uses the clipboard briefly for the page pictures and restores 
 | `-RenderMode` | `Rebuilt` | `Rebuilt` (pages rebuilt from content, native charts) or `Picture` (Excel's rendering as pictures) |
 | `-PageMode` | `Auto` | `Auto`, `Titles`, `PageBreaks`, `Manual` |
 | `-PageStartRows` | – | With `-PageMode Manual`: e.g. `1,40,72,105` |
-| `-TitleMinFontSize` | `20` | Font size that counts as a page title |
+| `-TitleMinFontSize` | `17` | Font size that counts as a page title |
 | `-MinPageHeightPt` | `250` | Title candidates closer than this belong to the same page |
 | `-DashboardTitle` | `ITSM Executive Dashboard` | Top-bar text |
 | `-Classification` | `CONFIDENTIAL` | Marking on top bar and every page footer |
@@ -104,8 +112,11 @@ Always attach the log (path printed at the end of the run) when reporting a prob
 
 ## 7. Known limitations
 
-- Rebuilt pages use the same text, colours and arrangement as Excel, but text is drawn by the browser,
-  so line breaks can differ slightly; uncommon shape outlines are drawn as rectangles.
+- Rebuilt pages use the same text, colours and positions as Excel, but text is drawn by the browser,
+  so line breaks can differ slightly; uncommon shape outlines are drawn as rectangles. Text that
+  overflows its box in Excel itself can still touch the object below it (shrinking stops at 15%).
+- The page inventory written by r29 also records text alignment and inner margins. If any page still
+  differs from Excel, send the new `page-inventory` file and the log from the same run.
 - Native charts reproduce data, colours, scale, labels and legend; Excel's special effects (3D,
   bevels, glow, gradients inside bars) are drawn flat. Multi-level category labels show one level.
 - Linked/camera pictures (e.g. a picture of a table on another tab) are shown as Excel's picture.

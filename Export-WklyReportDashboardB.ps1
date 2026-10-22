@@ -19,22 +19,15 @@
       * The SHA-256 hash of the original file is compared before and after the run (see the log).
 
     WHAT IS SHOWN:
-      * Every page of Wkly_Report is detected on every run (pages may be added or removed weekly).
-      * Page 1 becomes the full-screen cover (title, the text around it, its "Label: value" details and
-        any KPI cards on it). Every other page gets a coloured header bar (title + the text in Excel's
-        header band) and its content as cards, kept in Excel's arrangement:
-          - a card whose largest text is a figure  -> KPI tile (label, figure, details)
-          - a chart                                -> redrawn natively from the chart's own data, with
-                                                      Excel's axis scale and number formats
-          - a block of cells                        -> table
-          - other text                              -> text card
-      * Values are shown exactly as Excel displays them (cell .Text / text-box text); nothing is
-        recalculated. Excel errors such as #DIV/0! are shown as-is and outlined. Blank chart values
-        stay gaps, never 0.
-      * Colours follow the dashboard palette: Excel's chart colours are mapped by hue (reds stay red,
-        greens -> green, yellows/oranges -> gold, greys -> grey, others -> the next free palette colour).
-        Status words (Met, Breached, Open, High, Low, ...) get a coloured pill; the word is unchanged.
-      * A chart type that is not redrawn natively is shown as Excel's own picture of that chart.
+      * The approved Design B sample layout: full-screen cover, one panel per report page with a
+        coloured header bar, KPI tiles, charts in the sample's style, tables and text cards.
+      * Every number, chart, table and sentence is taken from Wkly_Report: KPI cards are found by their
+        label, charts by their title, tables and cards by their position on the page. Values are shown
+        exactly as Excel displays them; nothing is recalculated. Anything that cannot be found is shown
+        as "Not found in Wkly_Report" - never invented.
+      * Values that Excel places over gaps in a sentence (separate text boxes) are joined into that
+        sentence. A workbook chart that the sample has no card for is still shown, as an extra card.
+      * A page that is added to the workbook later is shown in the same style (its KPI cards, charts and text).
 
 .PARAMETER WorkbookPath
     The weekly workbook. Default: C:\Temp\Bi_Wkly_Report-Daily Data.xlsx
@@ -51,7 +44,7 @@
     Only with -PageMode Manual: first row of each page, e.g. 1,40,72,105
 
 .PARAMETER TitleMinFontSize
-    Smallest font size (pt) that counts as a page title. Default 20.
+    Smallest font size (pt) that counts as a page title. Default 17 (the Executive Summary title is 17pt).
 
 .PARAMETER MinPageHeightPt
     Two title candidates closer than this (points) belong to the same page. Default 250.
@@ -79,14 +72,14 @@ param(
     [ValidateSet('Auto', 'Titles', 'PageBreaks', 'Manual')]
     [string]$PageMode = 'Auto',
     [int[]]$PageStartRows,
-    [double]$TitleMinFontSize = 20,
+    [double]$TitleMinFontSize = 17,
     [double]$MinPageHeightPt = 250,
     [string]$DashboardTitle = 'IT Service Management',
     [string]$Classification = 'CONFIDENTIAL',
     [switch]$OpenWhenDone
 )
 
-$ScriptBuild = '2026.10.22-B1'
+$ScriptBuild = '2026.10.22-B2'
 $SheetName = 'Wkly_Report'          # fixed by design - no other worksheet is ever read
 $Inv = [System.Globalization.CultureInfo]::InvariantCulture
 $ErrRegex = '#(DIV/0!|N/A|VALUE!|REF!|NAME\?|NUM!|NULL!|SPILL!|CALC!|FIELD!|BLOCKED!|CONNECT!|BUSY!|UNKNOWN!|GETTING_DATA)'
@@ -111,6 +104,7 @@ $script:PdfScale = 2
 $script:PdfReady = $null
 $script:PictureMethods = @{}
 $script:BitmapScales = New-Object System.Collections.Generic.List[double]
+$script:ItemSeq = 0
 
 # ======================================================================================
 #  Small helpers
@@ -537,7 +531,7 @@ function Get-ChartKind {
     param([int]$Type)
     if ($Type -in 51, 52, 53, 54, 55, 56, -4100, 92, 93, 94, 99, 100, 101, 106, 107, 108) { return 'column' }
     if ($Type -in 57, 58, 59, 60, 61, 62, 95, 96, 97, 102, 103, 104, 109, 110, 111) { return 'bar' }
-    if ($Type -in 4, 63, 64, 65, 66, 67, -4101) { return 'line' }
+    if ($Type -in 4, 63, 64, 65, 66, 67, -4101, 72, 73, 74, 75) { return 'line' }
     if ($Type -in 1, 76, 77, -4098) { return 'area' }
     if ($Type -in 5, 69, -4102, 70) { return 'pie' }
     if ($Type -in -4120, 80) { return 'doughnut' }
@@ -683,7 +677,25 @@ function Get-ChartSpec {
         $spec.series.Add($sr)
     }
     if ($spec.series.Count -eq 0) { $spec.kind = $null }
+    Repair-ChartSpec $spec
     return $spec
+}
+
+function Repair-ChartSpec {
+    # A combination chart (bars + line) has no single Excel chart type; it is drawn natively when
+    # every series is a kind the dashboard can draw.
+    param($Spec)
+    if ($null -eq $Spec -or $Spec.kind) { return }
+    $kinds = New-Object System.Collections.Generic.List[string]
+    foreach ($sr in $Spec.series) {
+        $k = $sr.kind
+        if (-not $k -and [int]$Spec.excelType -in 72, 73, 74, 75) { $k = 'line'; $sr.kind = 'line' }
+        if (-not $k) { return }
+        $kinds.Add([string]$k)
+    }
+    if ($kinds.Count -eq 0) { return }
+    if ($kinds.Contains('pie') -or $kinds.Contains('doughnut')) { return }
+    if ($kinds.Contains('bar')) { $Spec.kind = 'bar' } elseif ($kinds.Contains('column')) { $Spec.kind = 'column' } elseif ($kinds.Contains('area')) { $Spec.kind = 'area' } else { $Spec.kind = 'line' }
 }
 
 function Get-RunInfo {
@@ -1701,12 +1713,6 @@ function Find-ReportPages {
                 Items    = $pageItems; ExcelView = $null; IssueCount = 0; Picture = $null
             })
     }
-    # All pages share one horizontal crop so they have the same scale and line up with each other.
-    if ($pages.Count) {
-        $gL = ($pages | Measure-Object -Property OffsetX -Minimum).Minimum
-        $gR = ($pages | ForEach-Object { $_.OffsetX + $_.Width } | Measure-Object -Maximum).Maximum
-        foreach ($p in $pages) { $p.OffsetX = $gL; $p.Width = $gR - $gL }
-    }
     Write-Log ("Page detection - {0}. Pages: {1}" -f $method, $pages.Count) 'OK'
     foreach ($p in $pages) { Write-Log ("  page {0}: rows {1}-{2}, {3} x {4} pt, '{5}'" -f $p.Index, $p.StartRow, $p.EndRow, [int]$p.Width, [int]($p.EndY - $p.StartY), $p.Title) }
     return [pscustomobject]@{ Pages = $pages; Method = $method }
@@ -1732,6 +1738,461 @@ function Find-LabelValue {
         }
     }
     return $null
+}
+
+# ======================================================================================
+#  Page clean-up before drawing (pure logic - no Excel calls)
+#  - every object belongs to exactly one page (the one it mostly sits on)
+#  - helper cells outside the page panels are left out
+#  - values placed over gaps in a sentence (separate small text boxes) are merged into
+#    that sentence, so text can never overlap when the browser's line breaks differ
+#  - each page gets its own width (no blank strip because another page is wider)
+# ======================================================================================
+
+function Test-OpaqueBg {
+    param([string]$Bg)
+    if (-not $Bg) { return $false }
+    if ($Bg -match '^rgba\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*0(?:\.0+)?\s*\)$') { return $false }
+    return $true
+}
+
+function Get-TextWidthPt {
+    # Calibri advance widths (em) - only used to find which gap a value box fills.
+    param([string]$Text, [double]$Size)
+    if ($null -eq $script:CalibriEm) {
+        $t = @{}
+        $pairs = ' .226 a .479 b .525 c .423 d .525 e .498 f .305 g .471 h .525 i .229 j .239 k .455 l .229 m .799 n .525 o .527 p .525 q .525 r .349 s .391 t .335 u .525 v .452 w .715 x .433 y .453 z .395 ' +
+            'A .579 B .544 C .533 D .615 E .488 F .459 G .631 H .623 I .252 J .319 K .520 L .420 M .855 N .646 O .662 P .517 Q .673 R .543 S .459 T .487 U .642 V .567 W .890 X .519 Y .487 Z .468 ' +
+            ', .250 . .252 : .268 ; .268 | .460 / .386 ( .303 ) .303 % .715 & .682 + .498 - .306 _ .498 = .498 # .498 ~ .498 ! .326 ? .463 '' .221 " .401'
+        $tok = $pairs.Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)
+        for ($k = 0; $k + 1 -lt $tok.Count; $k += 2) { $t[[string]$tok[$k]] = [double]::Parse($tok[$k + 1], $Inv) }
+        $script:CalibriEm = $t
+    }
+    $w = 0.0
+    foreach ($ch in $Text.ToCharArray()) {
+        $c = [int]$ch
+        if ($ch -eq ' ') { $f = 0.226 }
+        elseif ($c -ge 48 -and $c -le 57) { $f = 0.507 }
+        elseif ($script:CalibriEm.ContainsKey([string]$ch)) { $f = $script:CalibriEm[[string]$ch] }
+        elseif ($c -eq 0x2013) { $f = 0.5 }
+        elseif ($c -eq 0x2014) { $f = 1.0 }
+        elseif ($c -eq 0xB7) { $f = 0.268 }
+        elseif ($c -ge 0xD800 -and $c -le 0xDFFF) { $f = 0.5 }
+        elseif ($c -gt 0x2000) { $f = 1.0 }
+        else { $f = 0.5 }
+        $w += $f * $Size
+    }
+    return $w
+}
+
+function Remove-ItemRef {
+    # List.Remove by reference (never by value equality)
+    param($List, $Obj)
+    for ($k = 0; $k -lt $List.Count; $k++) { if ([object]::ReferenceEquals($List[$k], $Obj)) { $List.RemoveAt($k); return $true } }
+    return $false
+}
+
+function Get-ItemId {
+    param($It)
+    if ($null -eq $It.PSObject.Properties['_id']) { $script:ItemSeq++; $It | Add-Member -NotePropertyName _id -NotePropertyValue $script:ItemSeq -Force }
+    return [string]$It._id
+}
+
+function Get-RunsText {
+    param($It)
+    if (-not $It.Runs) { return '' }
+    $s = ''
+    foreach ($r in $It.Runs) { $s += [string]$r.Text }
+    return $s
+}
+
+function Get-TextLayout {
+    # Where each gap (3+ spaces) and each paragraph end of a text box falls on the sheet,
+    # by simulating Excel's word wrap with approximate character widths.
+    param($It)
+    $text = Get-RunsText $It
+    $size = 11.0
+    foreach ($r in $It.Runs) { if ([string]$r.Text -match '\S' -and [double]$r.Size -gt 0) { $size = [double]$r.Size; break } }
+    $m = $It.Margins
+    if (-not $m -or $m.Count -lt 4) { $m = @(7.2, 3.6, 7.2, 3.6) }
+    $avail = [math]::Max(10.0, [double]$It.W - [double]$m[0] - [double]$m[2])
+    $lineH = 1.22 * $size
+    $slots = New-Object System.Collections.Generic.List[object]
+    $line = 0; $x = 0.0; $pi = 0
+    $lineStartSlot = 0
+    $lineWidths = New-Object System.Collections.Generic.List[double]
+    $i = 0; $n = $text.Length
+    $paraAlign = 'left'
+    $alignOf = { param($k) if ($It.Aligns -and $k -lt $It.Aligns.Count) { return [string]$It.Aligns[$k] } return 'left' }
+    $paraAlign = & $alignOf 0
+    $lineAlign = New-Object System.Collections.Generic.List[string]
+    $finishLine = { $lineWidths.Add($x); $lineAlign.Add($paraAlign) }
+    $noWrap = ($It.Wrap -eq $false)
+    $paraStart = $true
+    $paraLine = 0
+    while ($i -le $n) {
+        if ($paraStart) {
+            $paraStart = $false
+            $paraLine = $line
+            $lead = ''
+            if ($i -lt $n) { $lead = [string]$text[$i] }
+            if ($lead -eq ' ' -or $lead -eq '/' -or $lead -eq '·') {
+                $slots.Add([pscustomobject]@{ Kind = 'start'; Line = $line; X = 0.0; Start = $i; End = $i; Fill = (New-Object System.Collections.Generic.List[object]) })
+            }
+        }
+        if ($i -eq $n -or $text[$i] -eq "`r") {
+            $slots.Add([pscustomobject]@{ Kind = 'end'; Line = $line; X = $x; Start = $i; End = $i; ParaLine = $paraLine; Fill = (New-Object System.Collections.Generic.List[object]) })
+            & $finishLine
+            if ($i -eq $n) { break }
+            $line++; $x = 0.0; $pi++; $paraAlign = & $alignOf $pi; $i++; $paraStart = $true; continue
+        }
+        if ($text[$i] -eq "`n" -or $text[$i] -eq "`v") { & $finishLine; $line++; $x = 0.0; $i++; continue }
+        if ($text[$i] -eq ' ') {
+            $j = $i; while ($j -lt $n -and $text[$j] -eq ' ') { $j++ }
+            $runW = Get-TextWidthPt (' ' * ($j - $i)) $size
+            if ($j - $i -ge 3) {
+                $slots.Add([pscustomobject]@{ Kind = 'gap'; Line = $line; X = $x + $runW / 2; Start = $i; End = $j; Fill = (New-Object System.Collections.Generic.List[object]) })
+            }
+            $x += $runW; $i = $j; continue
+        }
+        $j = $i; while ($j -lt $n -and $text[$j] -ne ' ' -and $text[$j] -ne "`r" -and $text[$j] -ne "`n" -and $text[$j] -ne "`v") { $j++ }
+        $ww = Get-TextWidthPt $text.Substring($i, $j - $i) $size
+        if (-not $noWrap -and $x -gt 0 -and $x + $ww -gt $avail * 1.04) { & $finishLine; $line++; $x = 0.0 }
+        $x += $ww; $i = $j
+    }
+    # paragraph alignment shifts each line; absolute sheet positions
+    $nLines = [math]::Max(1, $lineWidths.Count)
+    $top = [double]$It.T + [double]$m[1]
+    if ($It.Anchor -eq 'middle') { $top = [double]$It.T + ([double]$It.H - $nLines * $lineH) / 2 }
+    elseif ($It.Anchor -eq 'bottom') { $top = [double]$It.T + [double]$It.H - [double]$m[3] - $nLines * $lineH }
+    foreach ($s in $slots) {
+        $off = 0.0
+        if ($s.Line -lt $lineWidths.Count) {
+            $lw = $lineWidths[$s.Line]
+            if ($lineAlign[$s.Line] -eq 'center') { $off = ($avail - $lw) / 2 } elseif ($lineAlign[$s.Line] -eq 'right') { $off = $avail - $lw }
+        }
+        $s | Add-Member -NotePropertyName AbsX -NotePropertyValue ([double]$It.L + [double]$m[0] + $off + $s.X)
+        $s | Add-Member -NotePropertyName AbsY -NotePropertyValue ($top + ($s.Line + 0.5) * $lineH)
+        if ($s.Kind -eq 'end') { $s | Add-Member -NotePropertyName ParaY -NotePropertyValue ($top + ($s.ParaLine + 0.5) * $lineH) }
+    }
+    return [pscustomobject]@{ Text = $text; Size = $size; LineH = $lineH; Slots = $slots; Lines = $nLines }
+}
+
+function Get-OverlayAnchor {
+    # Sheet position of the visible text of a small value box.
+    param($It)
+    $raw = Get-RunsText $It
+    $t = $raw.Trim()
+    $size = 11.0
+    foreach ($r in $It.Runs) { if ([string]$r.Text -match '\S' -and [double]$r.Size -gt 0) { $size = [double]$r.Size; break } }
+    $m = $It.Margins
+    if (-not $m -or $m.Count -lt 4) { $m = @(7.2, 3.6, 7.2, 3.6) }
+    $tw = Get-TextWidthPt $t $size
+    $lead = Get-TextWidthPt (' ' * ($raw.Length - $raw.TrimStart().Length)) $size
+    $align = 'left'
+    if ($It.Aligns -and $It.Aligns.Count) { $align = [string]$It.Aligns[0] }
+    $x = [double]$It.L + [double]$m[0] + $lead + $tw / 2
+    if ($align -eq 'center') { $x = [double]$It.L + [double]$It.W / 2 }
+    elseif ($align -eq 'right') { $x = [double]$It.L + [double]$It.W - [double]$m[2] - $tw / 2 }
+    $y = [double]$It.T + [double]$It.H / 2
+    return [pscustomobject]@{ X = $x; Y = $y; Text = $t; Size = $size; Width = $tw }
+}
+
+function Get-ContainerOf {
+    # Smallest filled card/panel under a point (so values are only joined within the same card).
+    param($Items, [double]$X, [double]$Y)
+    $best = $null; $bestA = 1e18
+    foreach ($c in $Items) {
+        if ($c.Kind -ne 'fill' -and $c.Kind -ne 'shape') { continue }
+        if (-not (Test-OpaqueBg $c.Bg)) { continue }
+        if ($X -lt $c.L -or $X -gt $c.L + $c.W -or $Y -lt $c.T -or $Y -gt $c.T + $c.H) { continue }
+        $a = [double]$c.W * [double]$c.H
+        if ($a -lt $bestA) { $bestA = $a; $best = $c }
+    }
+    if ($null -eq $best) { return '' }
+    return (Get-ItemId $best)
+}
+
+function Test-SlotHost {
+    # A sentence that has room for values Excel places over it: a run of 3+ spaces, or an ending such
+    # as "Report Date:", "1 January –", "Completion at", "(".
+    param([string]$Text)
+    if ($Text -match '\S {3,}|^ {3,}\S|\( {2,}\)') { return $true }
+    $t = $Text.TrimEnd()
+    if ($t -match '[:–—\-|(/=]$' -or $t -match '\s(at|to|of|by|is|from)$') { return $true }
+    return $false
+}
+
+function Get-SlotCost {
+    # How well a value box (anchor A) fits a slot of a sentence (layout Lay, box H); 1e12 = cannot fit.
+    param($A, $Sl, $Lay, $H)
+    $dx = $A.X - $Sl.AbsX
+    $dl = [math]::Abs(($A.Y - $Sl.AbsY) / $Lay.LineH)
+    if ($Sl.Kind -eq 'end') {
+        $right = [double]$H.L + [double]$H.W
+        if ($A.X -ge $right - 4) {
+            # placed just past the sentence's box: appended to that paragraph, whatever the wrap estimate says
+            $dlp = [math]::Abs(($A.Y - $Sl.ParaY) / $Lay.LineH)
+            $alt = 20 + ($A.X - $right) + 10 * [math]::Min($dl, $dlp)
+            if ($A.X - $right -le 130 -and ($dl -le 1.6 -or $dlp -le 1.6)) { return $alt }
+        }
+        if ($dl -gt 1.6 -or $dx -lt -15 -or $dx -gt 130) { return 1e12 }
+        return 20 + [math]::Max(0, $dx) + 10 * $dl
+    }
+    if ($dl -gt 1.6 -or [math]::Abs($dx) -gt [math]::Max(45.0, 4 * $Lay.Size)) { return 1e12 }
+    $pen = 0
+    # spaces that start a continuation paragraph are indentation rather than a value slot
+    if ($Sl.Kind -eq 'gap' -and $Sl.Start -gt 0 -and "`r`n`v".IndexOf($Lay.Text[$Sl.Start - 1]) -ge 0) { $pen = 30 }
+    return [math]::Abs($dx) + 10 * $dl + $pen
+}
+
+function Merge-OverlayText {
+    # Values that Excel shows inside a sentence by placing a separate small text box over a gap
+    # ("Report Date:  [10/22/2026]", "—  [67.66%]  of total") are written into that sentence.
+    # Values are matched to the sentence's gaps in reading order; positions only confirm the match.
+    param($Items)
+    $plain = New-Object System.Collections.Generic.List[object]
+    foreach ($it in $Items) {
+        if ($it.Kind -ne 'shape' -or -not $it.Runs) { continue }
+        if ((Test-OpaqueBg $it.Bg) -or $it.Border) { continue }
+        $plain.Add($it)
+    }
+    $hosts = New-Object System.Collections.Generic.List[object]
+    $overlays = New-Object System.Collections.Generic.List[object]
+    foreach ($it in $plain) {
+        $t = Get-RunsText $it
+        $trim = $t.Trim()
+        if ($trim.Length -gt 0 -and $trim.Length -le 32 -and $trim -notmatch '   ' -and $trim -notmatch "[`r`n`v]") { $overlays.Add($it) }
+        if ($trim.Length -ge 4 -and (Test-SlotHost $t)) { $hosts.Add($it) }
+    }
+    if ($hosts.Count -eq 0 -or $overlays.Count -eq 0) { return 0 }
+    $layouts = @{}; $boxOf = @{}
+    foreach ($h in $hosts) {
+        $hid = Get-ItemId $h
+        try { $layouts[$hid] = Get-TextLayout $h } catch { continue }
+        $boxOf[$hid] = Get-ContainerOf $Items ([double]$h.L + [math]::Min(12.0, [double]$h.W / 2)) ([double]$h.T + [math]::Min(8.0, [double]$h.H / 2))
+    }
+    # each value box goes to the one sentence it sits in (same card, inside or just right of it)
+    $byHost = @{}
+    foreach ($o in $overlays) {
+        $a = Get-OverlayAnchor $o
+        $obox = Get-ContainerOf $Items $a.X $a.Y
+        $best = $null; $bestScore = 1e9
+        foreach ($h in $hosts) {
+            $hid = Get-ItemId $h
+            if ([object]::ReferenceEquals($h, $o) -or -not $layouts.ContainsKey($hid)) { continue }
+            if ($boxOf[$hid] -ne $obox) { continue }
+            $lay = $layouts[$hid]
+            if ($a.Y -lt $h.T - 4 -or $a.Y -gt $h.T + $h.H + 4) { continue }
+            if ($a.X -lt $h.L - 8 -or $a.X -gt $h.L + $h.W + 70) { continue }
+            $dist = 0.0
+            if ($a.X -gt $h.L + $h.W) { $dist = $a.X - ($h.L + $h.W) }
+            $fit = 1e12
+            foreach ($sl in $lay.Slots) { $c = Get-SlotCost $a $sl $lay $h; if ($c -lt $fit) { $fit = $c } }
+            if ($fit -ge 1e12) { continue }
+            $score = $fit + $dist
+            if ($score -lt $bestScore) { $bestScore = $score; $best = $h }
+        }
+        if ($null -eq $best) { continue }
+        $bid = Get-ItemId $best
+        if (-not $byHost.ContainsKey($bid)) { $byHost[$bid] = New-Object System.Collections.Generic.List[object] }
+        $byHost[$bid].Add([pscustomobject]@{ O = $o; A = $a })
+    }
+    $mergedO = New-Object System.Collections.Generic.List[object]
+    foreach ($h in $hosts) {
+        $hid = Get-ItemId $h
+        if (-not $byHost.ContainsKey($hid)) { continue }
+        $lay = $layouts[$hid]
+        $top = $h.T
+        # values in reading order (same visual line -> left to right)
+        $byY = @($byHost[$hid] | Sort-Object @{ Expression = { $_.A.Y } })
+        $band = 0; $prevY = -1e9
+        foreach ($e in $byY) { if ($e.A.Y - $prevY -gt 0.75 * $lay.LineH) { $band++ }; $prevY = $e.A.Y; $e | Add-Member -NotePropertyName Band -NotePropertyValue $band -Force }
+        $ovs = @($byY | Sort-Object Band, @{ Expression = { $_.A.X } })
+        $slots = @($lay.Slots | Sort-Object Start, @{ Expression = { if ($_.Kind -eq 'start') { 0 } elseif ($_.Kind -eq 'gap') { 1 } else { 2 } } })
+        $nO = $ovs.Count; $nS = $slots.Count
+        if ($nS -eq 0) { continue }
+        # monotonic alignment of values to slots (dynamic programming): minimal total distance
+        $INF = 1e12
+        $dp = New-Object 'double[,]' ($nO + 1), ($nS + 1)
+        $bk = New-Object 'int[,]' ($nO + 1), ($nS + 1)
+        for ($i = 0; $i -le $nO; $i++) { for ($j = 0; $j -le $nS; $j++) { $dp[$i, $j] = $INF } }
+        $dp[0, 0] = 0
+        $costOf = {
+            param($i, $j)
+            $c = Get-SlotCost $ovs[$i].A $slots[$j] $lay $h
+            if ($c -ge 1e12) { return $INF }
+            return $c
+        }
+        for ($i = 0; $i -le $nO; $i++) {
+            for ($j = 0; $j -le $nS; $j++) {
+                $cur = $dp[$i, $j]
+                if ($cur -ge $INF) { continue }
+                if ($j -lt $nS -and $cur -lt $dp[$i, ($j + 1)]) { $dp[$i, ($j + 1)] = $cur; $bk[$i, ($j + 1)] = 1 }            # slot left empty
+                if ($i -lt $nO -and $cur + 200 -lt $dp[($i + 1), $j]) { $dp[($i + 1), $j] = $cur + 200; $bk[($i + 1), $j] = 2 } # value not joined
+                if ($i -lt $nO -and $j -lt $nS) {
+                    $c = & $costOf $i $j
+                    if ($c -lt $INF) {
+                        if ($slots[$j].Kind -eq 'end') {
+                            if ($cur + $c -lt $dp[($i + 1), $j]) { $dp[($i + 1), $j] = $cur + $c; $bk[($i + 1), $j] = 4 }       # several values after the text end
+                        }
+                        elseif ($cur + $c -lt $dp[($i + 1), ($j + 1)]) { $dp[($i + 1), ($j + 1)] = $cur + $c; $bk[($i + 1), ($j + 1)] = 3 }
+                    }
+                }
+            }
+        }
+        $i = $nO; $j = $nS
+        $pairs = New-Object System.Collections.Generic.List[object]
+        while ($i -gt 0 -or $j -gt 0) {
+            $b = $bk[$i, $j]
+            if ($b -eq 1) { $j-- }
+            elseif ($b -eq 2) { $i-- }
+            elseif ($b -eq 3) { $pairs.Add(@(($i - 1), ($j - 1))); $i--; $j-- }
+            elseif ($b -eq 4) { $pairs.Add(@(($i - 1), $j)); $i-- }
+            else { break }
+        }
+        if ($pairs.Count -eq 0) { continue }
+        foreach ($pr in $pairs) { $slots[$pr[1]].Fill.Add($ovs[$pr[0]]); $mergedO.Add($ovs[$pr[0]].O) }
+        # rebuild the runs: host text with the values written into their slots
+        $owner = New-Object System.Collections.Generic.List[object]
+        foreach ($r in $h.Runs) { foreach ($ch in ([string]$r.Text).ToCharArray()) { $owner.Add($r) } }
+        $at = @{}
+        foreach ($sl in $slots) { $k = [string]$sl.Start; if (-not $at.ContainsKey($k)) { $at[$k] = New-Object System.Collections.Generic.List[object] }; $at[$k].Add($sl) }
+        $out = New-Object System.Collections.Generic.List[object]
+        $emit = {
+            param($Run, [string]$Txt)
+            if ($Txt.Length -eq 0) { return }
+            if ($out.Count -gt 0 -and [object]::ReferenceEquals($out[$out.Count - 1].Src, $Run)) { $out[$out.Count - 1].Text += $Txt; return }
+            $out.Add([pscustomobject]@{ Src = $Run; Text = $Txt })
+        }
+        $valueRun = {
+            param($f)
+            $vr = $f.O.Runs[0]
+            foreach ($orr in $f.O.Runs) { if ([string]$orr.Text -match '\S') { $vr = $orr; break } }
+            return $vr
+        }
+        $text = $lay.Text
+        $i = 0
+        $hasFill = $false
+        while ($i -le $text.Length) {
+            $k = [string]$i
+            $skipTo = -1
+            if ($at.ContainsKey($k)) {
+                foreach ($sl in $at[$k]) {
+                    if ($sl.Kind -eq 'start' -and $sl.Fill.Count) {
+                        foreach ($f in $sl.Fill) { & $emit (& $valueRun $f) ((Get-RunsText $f.O).Trim() + ' ') }
+                    }
+                    elseif ($sl.Kind -eq 'end' -and $sl.Fill.Count) {
+                        foreach ($f in $sl.Fill) {
+                            $prev = ''; if ($out.Count) { $prev = $out[$out.Count - 1].Text }
+                            $sep = ' '; if ($prev.EndsWith(' ') -or $prev.Length -eq 0) { $sep = '' }
+                            & $emit (& $valueRun $f) ($sep + (Get-RunsText $f.O).Trim())
+                        }
+                    }
+                    elseif ($sl.Kind -eq 'gap') {
+                        $prevCh = ''; if ($i -gt 0) { $prevCh = [string]$text[$i - 1] }
+                        $lead = ($i -eq 0 -or $prevCh -eq "`r" -or $prevCh -eq "`n" -or $prevCh -eq "`v")
+                        if ($sl.Fill.Count) {
+                            $f = $sl.Fill[0]
+                            $nextCh = ''; if ($sl.End -lt $text.Length) { $nextCh = [string]$text[$sl.End] }
+                            if (-not $lead -and $prevCh -ne '(') { & $emit $owner[$i] ' ' }
+                            & $emit (& $valueRun $f) (Get-RunsText $f.O).Trim()
+                            if (',.;:)%'.IndexOf($nextCh) -lt 0 -or $nextCh -eq '') { & $emit $owner[$sl.End - 1] ' ' }
+                        }
+                        elseif (-not $lead) { & $emit $owner[$i] ' ' }
+                        $skipTo = $sl.End
+                    }
+                }
+            }
+            if ($i -eq $text.Length) { break }
+            if ($skipTo -ge 0) { $i = $skipTo; continue }
+            & $emit $owner[$i] ([string]$text[$i])
+            $i++
+        }
+        $newRuns = New-Object System.Collections.Generic.List[object]
+        foreach ($seg in $out) { $nr = $seg.Src.PSObject.Copy(); $nr.Text = $seg.Text; $newRuns.Add($nr) }
+        $h.Runs = $newRuns
+        # the sentence's box now also covers where the values stood, so it never wraps because of them
+        $l0 = [double]$h.L; $r0 = [double]$h.L + [double]$h.W
+        foreach ($pr in $pairs) { $ob = $ovs[$pr[0]].O; if ($ob.L -lt $l0) { $l0 = [double]$ob.L }; if ($ob.L + $ob.W -gt $r0) { $r0 = [double]$ob.L + [double]$ob.W } }
+        $h.L = $l0; $h.W = $r0 - $l0
+        $h | Add-Member -NotePropertyName MergedValues -NotePropertyValue $true -Force
+    }
+    foreach ($o in $mergedO) { [void](Remove-ItemRef $Items $o) }
+    return $mergedO.Count
+}
+
+function Optimize-ReportPages {
+    # Runs once after page detection, before any drawing. Never changes text or numbers -
+    # it only decides which page an object is shown on and joins split sentences.
+    param($Pages)
+    $all = New-Object System.Collections.Generic.List[object]
+    $seen = @{}
+    foreach ($p in $Pages) { foreach ($it in $p.Items) { $id = Get-ItemId $it; if (-not $seen.ContainsKey($id)) { $seen[$id] = $true; $all.Add($it) } } }
+    $lists = @{}
+    foreach ($p in $Pages) { $lists[$p.Index] = New-Object System.Collections.Generic.List[object] }
+    foreach ($it in $all) {
+        $best = $null; $bestOv = -1.0
+        $t0 = [double]$it.T; $t1 = [double]$it.T + [math]::Max([double]$it.H, 0.5)
+        if ($it.Kind -eq 'shape' -and -not $it.Runs -and -not (Test-OpaqueBg $it.Bg)) { $c = ($t0 + $t1) / 2; $t0 = $c - 0.25; $t1 = $c + 0.25 }
+        foreach ($p in $Pages) {
+            $ov = [math]::Min($t1, [double]$p.EndY) - [math]::Max($t0, [double]$p.StartY)
+            if ($ov -gt $bestOv) { $bestOv = $ov; $best = $p }
+        }
+        if ($best -and $bestOv -gt 0) { $lists[$best.Index].Add($it) }
+    }
+    $dropped = 0; $mergedTotal = 0; $helper = New-Object System.Collections.Generic.List[string]
+    foreach ($p in $Pages) {
+        $items = $lists[$p.Index]
+        # empty text boxes (a single space) carry nothing to show
+        foreach ($it in @($items | Where-Object { $_.Kind -eq 'shape' -and $_.Runs -and -not (Test-OpaqueBg $_.Bg) -and -not $_.Border -and (Get-RunsText $_).Trim().Length -eq 0 })) { [void](Remove-ItemRef $items $it); $dropped++ }
+        # the same value box stacked several times at one spot: keep the top one
+        $keep = @{}
+        foreach ($it in ($items | Where-Object { $_.Kind -eq 'shape' -and $_.Runs } | Sort-Object Z -Descending)) {
+            $key = '{0}|{1}|{2}' -f (Get-RunsText $it).Trim(), [math]::Round([double]$it.L / 3), [math]::Round([double]$it.T / 3)
+            if ($keep.ContainsKey($key)) { [void](Remove-ItemRef $items $it); $dropped++ } else { $keep[$key] = $true }
+        }
+        # helper cells beside the page panels (calculation area) are not part of the page design
+        $panelL = 1e9; $panelR = -1e9
+        $extR = 0.0
+        foreach ($it in $items) { if ($it.L + $it.W -gt $extR) { $extR = $it.L + $it.W } }
+        foreach ($it in $items) {
+            if ($it.Kind -ne 'shape' -or -not (Test-OpaqueBg $it.Bg)) { continue }
+            if ($it.W -lt 0.4 * $extR -or $it.H -lt 100) { continue }
+            if ($it.L -lt $panelL) { $panelL = $it.L }
+            if ($it.L + $it.W -gt $panelR) { $panelR = $it.L + $it.W }
+        }
+        $kept = New-Object System.Collections.Generic.List[object]
+        if ($panelR -gt 0) {
+            foreach ($it in @($items | Where-Object { $_.Kind -in 'cell', 'fill', 'blank' -and ($_.L -ge $panelR + 2 -or $_.L + $_.W -le $panelL - 2) })) {
+                [void](Remove-ItemRef $items $it)
+                if ($it.Kind -eq 'cell') { $helper.Add([string]$it.Address); $kept.Add($it) }
+            }
+        }
+        $p | Add-Member -NotePropertyName HelperCells -NotePropertyValue $kept -Force
+        try { $mergedTotal += Merge-OverlayText -Items $items } catch { Add-Issue -Severity Warning -Location ('Page {0}' -f $p.Index) -Message ('Values inside sentences could not be joined: {0}' -f $_.Exception.Message) }
+        # this page's own width
+        # transparent decorations (no fill, no text) may reach past the panels; they never set the page size
+        $minL = 1e9; $maxR = 0.0
+        foreach ($it in $items) {
+            if ($it.Kind -in 'blank') { continue }
+            if ($it.Kind -eq 'shape' -and -not $it.Runs -and -not (Test-OpaqueBg $it.Bg)) { continue }
+            if ($it.L -lt $minL) { $minL = [double]$it.L }
+            if ($it.L + $it.W -gt $maxR) { $maxR = [double]$it.L + [double]$it.W }
+        }
+        if ($maxR -gt $minL) { $p.OffsetX = [math]::Max(0, $minL - 4); $p.Width = $maxR + 4 - $p.OffsetX }
+        $minT = [double]$p.StartY; $maxB = [double]$p.EndY
+        foreach ($it in $items) {
+            if ($it.Kind -eq 'shape' -and -not $it.Runs -and -not (Test-OpaqueBg $it.Bg)) { continue }
+            if ($it.T -lt $minT) { $minT = [double]$it.T }; if ($it.T + $it.H -gt $maxB) { $maxB = [double]$it.T + [double]$it.H }
+        }
+        $p.StartY = $minT; $p.EndY = $maxB
+        $sorted = New-Object System.Collections.Generic.List[object]
+        foreach ($it in ($items | Sort-Object Z)) { $sorted.Add($it) }
+        $p.Items = $sorted
+    }
+    Write-Log ("Page clean-up: {0} value(s) joined into their sentences, {1} empty/duplicate text box(es) skipped, each object shown on one page only." -f $mergedTotal, $dropped)
+    if ($helper.Count) { Write-Log ("Helper cells beside the page panels are not shown: {0}" -f ($helper -join ', ')) }
 }
 
 # ======================================================================================
@@ -1858,6 +2319,7 @@ function ConvertTo-ItemHtml {
                 $inner = '<div class="tx" style="{0}">{1}</div>' -f $tx, $sb.ToString()
             }
             $cls = if ($It.Wrap) { 'it shp' } else { 'it shp nowrap' }
+            if ($It.Runs -and (Get-RunsText $It).Trim() -notmatch '\s') { $cls = 'it shp nowrap' }
             $inspect = ''
             try { $inspect = ([System.Net.WebUtility]::HtmlEncode([string](Get-InspectText $It))).Replace([string][char]10, '&#10;') }
             catch { $inspect = [System.Net.WebUtility]::HtmlEncode([string]$It.Name) + ' (details unavailable: ' + [System.Net.WebUtility]::HtmlEncode($_.Exception.Message) + ')' }
@@ -1872,6 +2334,12 @@ function ConvertTo-ItemHtml {
             return '<svg class="it" style="{0}" viewBox="0 0 {1} {2}" preserveAspectRatio="none"><line x1="{3}" y1="{4}" x2="{5}" y2="{6}" stroke="{7}" stroke-width="{8}"/></svg>' -f $st, (Format-Num $w), (Format-Num $h), (Format-Num $x1), (Format-Num $y1), (Format-Num $x2), (Format-Num $y2), $It.Color, (Format-Num $It.Weight)
         }
         'image' {
+            if ($It.IsChart -and $It.Spec -and $It.Spec.kind) {
+                $json = $It.Spec | ConvertTo-Json -Depth 8 -Compress
+                $fb = ''
+                if ($It.Src) { $fb = '<img src="{0}" alt="{1}" style="width:100%;height:100%">' -f $It.Src, (ConvertTo-Attr $It.Alt) }
+                return ('<div class="it rchart" style="{0}" data-w="{1}" data-h="{2}" data-chart="{3}">{4}</div>' -f $box, (Format-Num ([double]$It.W * 4 / 3)), (Format-Num ([double]$It.H * 4 / 3)), [System.Net.WebUtility]::HtmlEncode($json), $fb)
+            }
             $cls = if ($It.IsChart) { 'it img chart' } else { 'it img' }
             return '<img class="{0}" src="{1}" alt="{2}" title="{2}" style="{3}">' -f $cls, $It.Src, (ConvertTo-Attr $It.Alt), $box
         }
@@ -2106,7 +2574,18 @@ function Save-PageInventory {
                 elseif ($it.Kind -eq 'shape' -and $it.Runs) { $text = (($it.Runs | ForEach-Object { $_.Text }) -join '') }
                 $o = [ordered]@{ kind = $it.Kind; name = [string]$it.Name; address = [string]$it.Address; L = [math]::Round($it.L, 1); T = [math]::Round($it.T, 1); W = [math]::Round($it.W, 1); H = [math]::Round($it.H, 1); Z = $it.Z
                     bg = $it.Bg; text = $text; link = $it.Formula }
-                if ($it.Kind -eq 'shape' -and $it.Runs) { $o['runs'] = @($it.Runs | ForEach-Object { [ordered]@{ text = $_.Text; size = $_.Size; bold = $_.Bold; color = $_.Color; font = $_.Font } }) }
+                if ($it.Kind -eq 'shape' -and $it.Runs) { $o['runs'] = @($it.Runs | ForEach-Object { [ordered]@{ text = $_.Text; size = $_.Size; bold = $_.Bold; italic = $_.Italic; color = $_.Color; font = $_.Font } }) }
+                if ($it.Kind -eq 'shape') {
+                    $o['border'] = $it.Border; $o['radius'] = $it.Radius; $o['shadow'] = $it.Shadow; $o['rot'] = $it.Rot
+                    $o['anchor'] = $it.Anchor; $o['wrap'] = $it.Wrap; $o['orient'] = $it.TextOrientation
+                    if ($it.Margins) { $o['margins'] = @($it.Margins) }
+                    if ($it.Aligns) { $al = New-Object System.Collections.Generic.List[string]; foreach ($x in $it.Aligns) { $al.Add([string]$x) }; $o['aligns'] = $al.ToArray() }
+                }
+                if ($it.Kind -eq 'cell') {
+                    $o['font'] = [ordered]@{ name = $it.FontName; size = $it.FontSize; bold = $it.Bold; italic = $it.Italic; color = $it.Color }
+                    $o['align'] = $it.Align; $o['valign'] = $it.VAlign; $o['wrapText'] = $it.Wrap; $o['borders'] = $it.Borders
+                }
+                if ($it.Kind -eq 'image') { $o['isChart'] = [bool]$it.IsChart; $o['hasPicture'] = [bool]$it.Src }
                 if ($it.Spec) { $o['chart'] = $it.Spec }
                 $objs.Add($o)
             }
@@ -2127,52 +2606,473 @@ function ConvertTo-RebuiltPage {
     return (ConvertTo-FlowHtml $top 0)
 }
 
+
 # ======================================================================================
-#  Design B: each page's content becomes cards (KPI tiles, charts, tables, text) - pure logic
+#  Design B: the approved sample layout, filled from Wkly_Report (pure logic - no Excel calls)
+#  Every number, chart, table and sentence comes from the workbook. Fixed wording is limited to
+#  the sample's card headings; anything that cannot be found is shown as "Not found in Wkly_Report".
 # ======================================================================================
 
-function Get-TextPieces {
-    # Paragraphs of a cell or text box with their largest font size and boldness, in reading order.
-    param($It)
-    $out = New-Object System.Collections.Generic.List[object]
-    if ($It.Kind -eq 'cell') {
-        $t = ([string]$It.Text).Trim()
-        if ($t) { $out.Add([pscustomobject]@{ Text = $t; Size = [double]$It.FontSize; Bold = [bool]$It.Bold; T = [double]$It.T; L = [double]$It.L; Color = $It.Color }) }
-        return , $out
+function ConvertTo-BArray {
+    # A List (chart values, categories, colours) as a plain array - never @($list), which fails in
+    # Windows PowerShell 5.1 with "Argument types do not match".
+    param($X)
+    if ($null -eq $X) { return , (New-Object object[] 0) }
+    if ($X -is [string]) { return , ([object[]]@($X)) }
+    if ($X -is [System.Collections.IList]) {
+        $a = New-Object object[] $X.Count
+        for ($k = 0; $k -lt $X.Count; $k++) { $a[$k] = $X[$k] }
+        return , $a
     }
-    if ($It.Kind -ne 'shape' -or -not $It.Runs) { return , $out }
-    $buf = ''; $size = 0.0; $bold = $false; $color = $null; $k = 0
-    foreach ($r in $It.Runs) {
-        $segs = ([string]$r.Text) -split "`r"
-        for ($s = 0; $s -lt $segs.Count; $s++) {
-            if ($s -gt 0) {
-                $t = ($buf -replace "[`v`n]+", ' ').Trim()
-                if ($t) { $out.Add([pscustomobject]@{ Text = $t; Size = $size; Bold = $bold; T = [double]$It.T + $k * 0.01; L = [double]$It.L; Color = $color }); $k++ }
-                $buf = ''; $size = 0.0; $bold = $false; $color = $null
-            }
-            $seg = $segs[$s]
-            if ($seg -match '\S') {
-                if ([double]$r.Size -gt $size) { $size = [double]$r.Size }
-                if ($r.Bold) { $bold = $true }
-                if (-not $color) { $color = $r.Color }
-            }
-            $buf += $seg
+    return , ([object[]]@($X))
+}
+
+function Get-BTexts {
+    # Text objects of a page with one-line text, largest font size and centre point.
+    param($Page)
+    $list = New-Object System.Collections.Generic.List[object]
+    foreach ($it in $Page.Items) {
+        $t = ''
+        if ($it.Kind -eq 'cell') { $t = [string]$it.Text }
+        elseif ($it.Kind -eq 'shape' -and $it.Runs) { $t = Get-RunsText $it }
+        else { continue }
+        $one = (($t -replace "[`r`n`v]+", ' ') -replace '\s{2,}', ' ').Trim()
+        if (-not $one) { continue }
+        $size = Get-ItemMaxFont $it
+        $bold = $false
+        if ($it.Kind -eq 'cell') { $bold = [bool]$it.Bold } else { foreach ($r in $it.Runs) { if ($r.Bold -and ([string]$r.Text).Trim()) { $bold = $true } } }
+        $list.Add([pscustomobject]@{ Item = $it; Text = $one; Raw = $t; Size = [double]$size; Bold = $bold
+                L = [double]$it.L; T = [double]$it.T; W = [double]$it.W; H = [double]$it.H; CX = [double]$it.L + [double]$it.W / 2; CY = [double]$it.T + [double]$it.H / 2 })
+    }
+    return , $list
+}
+
+function Get-BCards {
+    # Filled shapes that look like cards (not page panels, not thin bars), smallest first.
+    param($Page, [double]$MinArea = 1500, [double]$MaxArea = 120000)
+    $list = New-Object System.Collections.Generic.List[object]
+    foreach ($it in $Page.Items) {
+        if ($it.Kind -ne 'shape' -or -not (Test-OpaqueBg $it.Bg)) { continue }
+        $a = [double]$it.W * [double]$it.H
+        if ($a -lt $MinArea -or $a -gt $MaxArea -or $it.W -lt 20 -or $it.H -lt 14) { continue }
+        $list.Add($it)
+    }
+    return , $list
+}
+
+function Test-BInside {
+    param($T, $Box, [double]$Pad = 2)
+    return ($T.CX -ge $Box.L - $Pad -and $T.CX -le $Box.L + $Box.W + $Pad -and $T.CY -ge $Box.T - $Pad -and $T.CY -le $Box.T + $Box.H + $Pad)
+}
+
+function Test-BValue {
+    param([string]$Text)
+    $t = $Text.Trim()
+    if ($t.Length -eq 0 -or $t.Length -gt 24) { return $false }
+    if ($t -match '^[A-Z]\d{1,2}$') { return $false }          # badges such as E1 / R2
+    if ($t -match $ErrRegex) { return $true }
+    if ($t -notmatch '\d') { return $false }
+    return ([regex]::Matches($t, '\p{L}').Count -le 4)
+}
+
+function Get-BTile {
+    # A KPI card: its largest figure, the label and the details, in reading order.
+    param($Texts, $Card)
+    $in = @($Texts | Where-Object { Test-BInside $_ $Card })
+    if ($in.Count -lt 2) { return $null }
+    $vals = @($in | Where-Object { Test-BValue $_.Text } | Sort-Object Size -Descending)
+    if ($vals.Count -eq 0) { return $null }
+    $v = $vals[0]
+    $others = @($in | Where-Object { -not [object]::ReferenceEquals($_, $v) } | Sort-Object T, L)
+    if ($others.Count -eq 0) { return $null }
+    $maxOther = ($others | Measure-Object -Property Size -Maximum).Maximum
+    if ($v.Size -lt $maxOther) { return $null }
+    # label: the largest non-figure text; details: everything else in reading order
+    $labelT = @($others | Where-Object { -not (Test-BValue $_.Text) -and [regex]::Matches($_.Text, '\p{L}').Count -ge 2 } | Sort-Object @{ Expression = { $_.Size }; Descending = $true }, T)
+    $label = ''; $labelObj = $null
+    if ($labelT.Count) { $labelObj = $labelT[0]; $label = $labelObj.Text }
+    $metaParts = New-Object System.Collections.Generic.List[string]
+    $rows = @($others | Where-Object { -not [object]::ReferenceEquals($_, $labelObj) } | Sort-Object @{ Expression = { [math]::Round($_.CY / 6) } }, L)
+    foreach ($o in $rows) { $metaParts.Add($o.Text) }
+    return [pscustomobject]@{ Label = $label; Value = $v.Text; Meta = (($metaParts -join ' ') -replace '\s*/\s*', ' / ').Trim(); T = [double]$Card.T; L = [double]$Card.L; Card = $Card; Texts = $in }
+}
+
+function Get-BQuarterTile {
+    # The "Q1 / Q2 / Q3 Volume" card: volumes in order and the % changes between them.
+    param($Texts, $Card)
+    $in = @($Texts | Where-Object { Test-BInside $_ $Card })
+    $qs = @($in | Where-Object { $_.Text -match '^Q\d\s+Volume$' } | Sort-Object L)
+    if ($qs.Count -lt 2) { return $null }
+    $vols = New-Object System.Collections.Generic.List[string]
+    foreach ($q in $qs) {
+        $above = @($in | Where-Object { $_.CY -lt $q.T + 2 -and [math]::Abs($_.CX - $q.CX) -lt 30 -and $_.Text -match '\d' -and $_.Text -notmatch '%' } | Sort-Object @{ Expression = { [math]::Abs($_.CX - $q.CX) } })
+        if ($above.Count) { $vols.Add($above[0].Text) } else { $vols.Add('—') }
+    }
+    $pcts = @($in | Where-Object { $_.Text -match '^-?\d+(\.\d+)?%$' } | Sort-Object L)
+    $note = @($in | Where-Object { $_.Text -match '[A-Za-z]{4}' -and $_.Text -notmatch '^Q\d\s+Volume$' } | Sort-Object T)
+    return [pscustomobject]@{ Kind = 'quarter'; Label = 'Quarterly volume'; Volumes = $vols; Pcts = @($pcts | ForEach-Object { $_.Text }); Note = (@($note | ForEach-Object { $_.Text }) -join ' '); T = [double]$Card.T; L = [double]$Card.L; Card = $Card }
+}
+
+function Get-BTiles {
+    # KPI cards of a page (or of a region of it) in Excel's order.
+    param($Page, $Texts, [double]$Top = -1e9, [double]$Bottom = 1e9)
+    $tiles = New-Object System.Collections.Generic.List[object]
+    $used = New-Object System.Collections.Generic.List[object]
+    foreach ($c in ((Get-BCards $Page 3000 60000) | Sort-Object @{ Expression = { [math]::Round([double]$_.T / 25) } }, L)) {
+        if ($c.T -lt $Top -or $c.T -gt $Bottom) { continue }
+        $inside = $false
+        foreach ($u in $used) { if ($c.L -ge $u.L - 1 -and $c.L + $c.W -le $u.L + $u.W + 1 -and $c.T -ge $u.T - 1 -and $c.T + $c.H -le $u.T + $u.H + 1) { $inside = $true } }
+        if ($inside) { continue }
+        $q = Get-BQuarterTile $Texts $c
+        if ($q) { $tiles.Add($q); $used.Add($c); continue }
+        $t = Get-BTile $Texts $c
+        if ($t) { $tiles.Add($t); $used.Add($c) }
+    }
+    return , $tiles
+}
+
+function Get-BChartItem {
+    param($Page, [string]$Pattern)
+    foreach ($it in ($Page.Items | Sort-Object T, L)) {
+        if ($it.Kind -ne 'image' -or -not $it.IsChart -or -not $it.Spec) { continue }
+        if ([string]$it.Spec.title -match $Pattern) { return $it }
+    }
+    return $null
+}
+
+function Get-BPage {
+    param($Pages, [string]$Pattern)
+    foreach ($p in $Pages) { if ([string]$p.Title -match $Pattern) { return $p } }
+    return $null
+}
+
+function Get-BSubtitle {
+    # The line under the page title in Excel's header band.
+    param($Page, $Texts)
+    $title = $null
+    foreach ($t in ($Texts | Sort-Object T)) { if ($t.Text -eq ([string]$Page.Title).Trim() -or $t.Text.StartsWith(([string]$Page.Title).Trim())) { $title = $t; break } }
+    if ($null -eq $title) { return '' }
+    $sub = @($Texts | Where-Object { $_.T -ge $title.T + $title.H * 0.6 -and $_.T -le $title.T + $title.H + 30 -and $_.L -lt $title.L + 300 -and $_.Size -lt $title.Size } | Sort-Object T, L)
+    if ($sub.Count) { return $sub[0].Text }
+    return ''
+}
+
+function ConvertTo-BNumberText {
+    # Excel's value with its own number format applied (labels in Excel use the same format).
+    param($V, [string]$Format)
+    if ($null -eq $V) { return '—' }
+    $f = [string]$Format
+    if ($f -match '%') {
+        $d = 0; if ($f -match '0\.(0+)') { $d = $Matches[1].Length }
+        return ([double]$V * 100).ToString('N' + $d, $Inv) + '%'
+    }
+    $d = 0; if ($f -match '0\.(0+)') { $d = $Matches[1].Length }
+    return ([double]$V).ToString('N' + $d, $Inv)
+}
+
+function Get-BSeries {
+    param($Spec, [string]$NamePattern, [string]$Kind)
+    foreach ($s in $Spec.series) {
+        if ($NamePattern -and [string]$s.name -notmatch $NamePattern) { continue }
+        if ($Kind -and [string]$s.kind -ne $Kind) { continue }
+        return $s
+    }
+    return $null
+}
+
+function Get-BMonthLabel {
+    param([string]$Cat)
+    $names = @('Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec')
+    if ($Cat -match '^\s*(?:Q\d\s+)?(\d{1,2})\s*$') { $m = [int]$Matches[1]; if ($m -ge 1 -and $m -le 12) { return $names[$m - 1] } }
+    return $Cat.Trim()
+}
+
+function Get-BColorFor {
+    # Dashboard colour for an Excel colour (same rule as the sample: reds stay red for problems).
+    param([string]$Hex, [int]$Index)
+    $order = @('--s1', '--s3', '--s4', '--c4', '--c5', '--c6')
+    if ($Hex -match '^#([0-9a-fA-F]{2})([0-9a-fA-F]{2})([0-9a-fA-F]{2})$') {
+        $r = [Convert]::ToInt32($Matches[1], 16) / 255.0; $g = [Convert]::ToInt32($Matches[2], 16) / 255.0; $b = [Convert]::ToInt32($Matches[3], 16) / 255.0
+        $mx = [math]::Max($r, [math]::Max($g, $b)); $mn = [math]::Min($r, [math]::Min($g, $b)); $d = $mx - $mn
+        if ($d -lt 0.12) { return '--s4' }
+        $h = 0.0
+        if ($mx -eq $r) { $h = 60 * ((($g - $b) / $d) % 6) } elseif ($mx -eq $g) { $h = 60 * (($b - $r) / $d + 2) } else { $h = 60 * (($r - $g) / $d + 4) }
+        if ($h -lt 0) { $h += 360 }
+        if ($h -lt 14 -or $h -ge 340) { return '--s8' }
+        if ($h -lt 70) { return '--s3' }
+        if ($h -lt 170) { return '--s1' }
+    }
+    return $order[$Index % $order.Count]
+}
+
+function Get-BKeywordColor {
+    param([string]$Name, [int]$Index)
+    $n = $Name.ToLowerInvariant()
+    if ($n -match 'critical|breach|fail') { return '--s8' }
+    if ($n -match 'high|resolved') { return '--s3' }
+    if ($n -match 'moderate|medium|cancel') { return '--s4' }
+    if ($n -match 'low|closed|met|within') { return '--s1' }
+    if ($n -match 'progress') { return '--c4' }
+    if ($n -match 'new') { return '--c5' }
+    if ($n -match 'hold') { return '--c6' }
+    return (@('--s1', '--s3', '--s4', '--c4', '--c5', '--c6'))[$Index % 6]
+}
+
+# ---------------------------------------------------------------- chart descriptors for the page script
+
+function New-BChart {
+    param([string]$Type, $Data)
+    $Data['type'] = $Type
+    return ('<div class="chart" data-c="{0}"></div>' -f [System.Net.WebUtility]::HtmlEncode(($Data | ConvertTo-Json -Depth 6 -Compress)))
+}
+
+function Get-BColumns {
+    # Columns: bar series of an Excel chart; a line series named Open becomes the "n open" labels,
+    # a % line becomes the share labels; per-bar Excel colours are kept (mapped to the palette).
+    param($Spec, [switch]$Stack, [switch]$MonthNames, [switch]$WeekNames)
+    $bars = @($Spec.series | Where-Object { $_.kind -in 'column', 'bar' })
+    if ($bars.Count -eq 0) { return $null }
+    $cats = New-Object System.Collections.Generic.List[string]
+    $full = New-Object System.Collections.Generic.List[string]
+    $n = 0; foreach ($s in $bars) { if ($s.values -and (ConvertTo-BArray $s.values).Count -gt $n) { $n = (ConvertTo-BArray $s.values).Count } }
+    $catSrc = (ConvertTo-BArray $bars[0].cats)
+    $keep = New-Object System.Collections.Generic.List[int]
+    for ($i = 0; $i -lt $n; $i++) {
+        $c = ''; if ($i -lt $catSrc.Count) { $c = [string]$catSrc[$i] }
+        $allZero = $true; foreach ($s in $bars) { $v = (ConvertTo-BArray $s.values)[$i]; if ($null -ne $v -and [double]$v -ne 0) { $allZero = $false } }
+        if (-not $c.Trim() -and $allZero) { continue }          # empty trailing months
+        $keep.Add($i)
+        $lab = $c.Trim()
+        if ($MonthNames) { $lab = Get-BMonthLabel $c }
+        if ($WeekNames -and $c -match '^\s*Week\s*(\d+)') { $lab = 'W' + $Matches[1] }
+        $cats.Add($lab); $full.Add($c.Trim())
+    }
+    $series = New-Object System.Collections.Generic.List[object]
+    $k = 0
+    foreach ($s in $bars) {
+        $vals = New-Object System.Collections.Generic.List[object]
+        foreach ($i in $keep) { $v = (ConvertTo-BArray $s.values)[$i]; if ($null -eq $v) { $vals.Add($null) } else { $vals.Add([double]$v) } }
+        $col = (@('--s1', '--s3', '--s4', '--c4'))[$k % 4]
+        $entry = [ordered]@{ n = [string]$s.name; c = $col; v = $vals }
+        $pts = (ConvertTo-BArray $s.points)
+        $distinct = @($pts | Where-Object { $_ } | Sort-Object -Unique)
+        if ($distinct.Count -ge 2) {
+            $cols = New-Object System.Collections.Generic.List[string]
+            foreach ($i in $keep) { $cols.Add((Get-BColorFor ([string]$pts[$i]) $k)) }
+            $entry['colors'] = $cols
+        }
+        $series.Add($entry); $k++
+    }
+    $o = [ordered]@{}
+    if ($Stack) { $o['stack'] = 1 }
+    $open = @($Spec.series | Where-Object { $_.kind -eq 'line' -and [string]$_.name -match '^open$' })
+    $pct = @($Spec.series | Where-Object { $_.kind -eq 'line' -and ([string]$_.name -match '%|percent' -or ($_.labels -and [string]$_.labels.format -match '%')) })
+    if ($open.Count) {
+        $labs = New-Object System.Collections.Generic.List[string]
+        foreach ($i in $keep) { $v = (ConvertTo-BArray $open[0].values)[$i]; if ($null -eq $v) { $labs.Add('') } else { $labs.Add(('{0} open' -f [double]$v)) } }
+        $o['labels'] = $labs
+    }
+    elseif ($pct.Count) {
+        $labs = New-Object System.Collections.Generic.List[string]
+        $fmt = '0.00%'; if ($pct[0].labels -and [string]$pct[0].labels.format -match '%') { $fmt = [string]$pct[0].labels.format }
+        foreach ($i in $keep) { $labs.Add((ConvertTo-BNumberText ((ConvertTo-BArray $pct[0].values)[$i]) $fmt)) }
+        $o['labels'] = $labs
+    }
+    $tipx = New-Object System.Collections.Generic.List[string]
+    foreach ($f in $full) { $tipx.Add($f) }
+    if ($WeekNames) { $o['tipx'] = $tipx }
+    return [ordered]@{ cats = $cats; series = $series; o = $o }
+}
+
+function Get-BHBars {
+    # Horizontal bars with "value · share" labels (share = the chart's % series, as formatted in Excel).
+    param($Spec, [string]$Color = '--s1')
+    $main = $null; $share = $null
+    foreach ($s in $Spec.series) {
+        $isPct = ([string]$s.name -match '%|percent') -or ($s.labels -and [string]$s.labels.format -match '%')
+        if ($isPct) { if (-not $share) { $share = $s } } elseif (-not $main) { $main = $s }
+    }
+    if (-not $main) { return $null }
+    $cats = New-Object System.Collections.Generic.List[string]; $vals = New-Object System.Collections.Generic.List[double]; $sh = New-Object System.Collections.Generic.List[string]
+    $mc = (ConvertTo-BArray $main.cats); $mv = (ConvertTo-BArray $main.values)
+    for ($i = 0; $i -lt $mv.Count; $i++) {
+        if ($null -eq $mv[$i]) { continue }
+        $cats.Add(([string]$mc[$i]).Trim()); $vals.Add([double]$mv[$i])
+        if ($share) { $fmt = '0.00%'; if ($share.labels -and [string]$share.labels.format -match '%') { $fmt = [string]$share.labels.format }; $sh.Add((ConvertTo-BNumberText ((ConvertTo-BArray $share.values)[$i]) $fmt)) }
+    }
+    $o = [ordered]@{ c = $Color }
+    if ($share) { $o['share'] = $sh }
+    $lw = 140; foreach ($c in $cats) { $w = 9 * $c.Length + 20; if ($w -gt $lw) { $lw = $w } }
+    $o['lw'] = [math]::Min(330, $lw)
+    return [ordered]@{ cats = $cats; vals = $vals; o = $o }
+}
+
+function Get-BDonut {
+    # Doughnut: counts are shown as counts, shares (0-1 values) as percentages; centre text given.
+    param($Spec, [string]$Center, [string]$Sub, [switch]$StripGroup)
+    $s0 = $Spec.series[0]
+    if (-not $s0) { return $null }
+    $vals = (ConvertTo-BArray $s0.values); $cats = (ConvertTo-BArray $s0.cats)
+    $sum = 0.0; foreach ($v in $vals) { if ($null -ne $v) { $sum += [double]$v } }
+    $isShare = ($sum -gt 0.98 -and $sum -lt 1.02)
+    $parts = New-Object System.Collections.Generic.List[object]
+    $best = $null
+    for ($i = 0; $i -lt $vals.Count; $i++) {
+        if ($null -eq $vals[$i]) { continue }
+        $name = ([string]$cats[$i]).Trim()
+        if ($StripGroup) { $name = $name -replace '^Group\d+\s+', '' }
+        $v = [double]$vals[$i]
+        $parts.Add(@($name, $v, (Get-BKeywordColor $name $i)))
+        if ($null -eq $best -or $v -gt $best[1]) { $best = @($name, $v) }
+    }
+    $o = [ordered]@{ pct = $isShare }
+    if ($Center) { $o['center'] = $Center } elseif ($best) {
+        if ($isShare) { $o['center'] = ([double]$best[1] * 100).ToString('N2', $Inv) + '%' } else { $o['center'] = ([double]$best[1]).ToString('N0', $Inv) }
+    }
+    if ($Sub) { $o['sub'] = $Sub } elseif ($best) { $o['sub'] = ([string]$best[0]).ToLowerInvariant() }
+    return [ordered]@{ parts = $parts; o = $o }
+}
+
+function Get-BLine {
+    param($Spec, [string]$Color = '--s3')
+    $s = $Spec.series[0]
+    if (-not $s) { return $null }
+    $cats = New-Object System.Collections.Generic.List[string]; $vals = New-Object System.Collections.Generic.List[double]
+    $c = (ConvertTo-BArray $s.cats); $v = (ConvertTo-BArray $s.values)
+    for ($i = 0; $i -lt $v.Count; $i++) { if ($null -eq $v[$i]) { continue }; $cats.Add((Get-BMonthLabel ([string]$c[$i]))); $vals.Add([double]$v[$i]) }
+    return [ordered]@{ cats = $cats; vals = $vals; o = [ordered]@{ c = $Color } }
+}
+
+# ---------------------------------------------------------------- HTML pieces
+
+function ConvertTo-BEnc { param([string]$T) return (ConvertTo-HtmlText $T) }
+
+function ConvertTo-BTileHtml {
+    param($Tile, [switch]$Big)
+    if ($null -eq $Tile) { return '<div class="card stat"><div class="lab">&nbsp;</div><div class="val miss-v">—</div><div class="meta">Not found in Wkly_Report</div></div>' }
+    if ($Tile.PSObject.Properties['Kind'] -and $Tile.Kind -eq 'quarter') {
+        $val = ($Tile.Volumes | ForEach-Object { $_ }) -join ' → '
+        $pills = ''
+        for ($i = 0; $i -lt $Tile.Pcts.Count; $i++) {
+            $p = [string]$Tile.Pcts[$i]
+            $cls = 'wn'; $arrow = '▲'
+            if ($p.StartsWith('-')) { $cls = 'bd'; $arrow = '▼' }
+            $pills += ('<span class="pill {0}">{1} {2} Q{3}→Q{4}</span>' -f $cls, $arrow, (ConvertTo-BEnc $p.TrimStart('-')), ($i + 1), ($i + 2))
+        }
+        if ($Tile.Note) { $pills += ('<span>{0}</span>' -f (ConvertTo-BEnc $Tile.Note)) }
+        return ('<div class="card stat"><div class="lab">{0}</div><div class="val" style="font-size:26px">{1}</div><div class="meta">{2}</div></div>' -f (ConvertTo-BEnc $Tile.Label), (ConvertTo-BEnc $val), $pills)
+    }
+    $meta = ConvertTo-BEnc $Tile.Meta
+    if ($Tile.Meta -match '^(.*?)\s*\bMet\b\s*(.*)$') { $meta = '<span class="pill ok">✓ Met</span>' + (ConvertTo-BEnc (($Matches[1] + ' ' + $Matches[2]).Trim())) }
+    elseif ($Tile.Label -match 'Breach') { $meta = '<span class="pill bd">! Breached</span>' + (ConvertTo-BEnc $Tile.Meta) }
+    $bar = ''
+    if ($Tile.Value -match '^(\d+(?:\.\d+)?)%$' -and $Tile.Label -match 'Rate') { $bar = ('<div class="bar"><i style="width:{0}%"></i></div>' -f $Matches[1]) }
+    return ('<div class="card stat"><div class="lab">{0}</div><div class="val">{1}</div>{2}<div class="meta">{3}</div></div>' -f (ConvertTo-BEnc $Tile.Label), (ConvertTo-BEnc $Tile.Value), $bar, $meta)
+}
+
+function ConvertTo-BGrid {
+    param($Tiles, [string]$Style = '')
+    if ($Tiles.Count -eq 0) { return '' }
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append(('<div class="grid" style="grid-template-columns:repeat({0},minmax(0,1fr));{1}">' -f [math]::Min(7, $Tiles.Count), $Style))
+    foreach ($t in $Tiles) { [void]$sb.Append((ConvertTo-BTileHtml $t)) }
+    [void]$sb.Append('</div>')
+    return $sb.ToString()
+}
+
+function ConvertTo-BChartCard {
+    param([string]$Title, [string]$Sub, [string]$Body)
+    $h = ''
+    if ($Title) { $h += '<h3>' + (ConvertTo-BEnc $Title) + '</h3>' }
+    if ($Sub) { $h += '<div class="sub">' + (ConvertTo-BEnc $Sub) + '</div>' }
+    if (-not $Body) { $Body = '<div class="miss">Not found in Wkly_Report</div>' }
+    return ('<div class="card">{0}{1}</div>' -f $h, $Body)
+}
+
+function Get-BChartHtml {
+    # A workbook chart in the sample's style; Excel's picture if it cannot be redrawn.
+    param($It, [string]$As, [hashtable]$Opt)
+    if ($null -eq $It) { return '' }
+    $sp = $It.Spec
+    $d = $null
+    try {
+        switch ($As) {
+            'columns' { $d = Get-BColumns $sp -Stack:([bool]$Opt.Stack) -MonthNames:([bool]$Opt.Months) -WeekNames:([bool]$Opt.Weeks); if ($d -and $Opt.H) { $d.o['h'] = $Opt.H } }
+            'hbars' { $c = '--s1'; if ($Opt.Color) { $c = $Opt.Color }; $d = Get-BHBars $sp $c }
+            'donut' { $d = Get-BDonut $sp $Opt.Center $Opt.Sub -StripGroup:([bool]$Opt.Strip) }
+            'line' { $c = '--s3'; if ($Opt.Color) { $c = $Opt.Color }; $d = Get-BLine $sp $c }
         }
     }
-    $t = ($buf -replace "[`v`n]+", ' ').Trim()
-    if ($t) { $out.Add([pscustomobject]@{ Text = $t; Size = $size; Bold = $bold; T = [double]$It.T + $k * 0.01; L = [double]$It.L; Color = $color }) }
+    catch { Add-Issue -Severity Warning -Location ("Chart '{0}'" -f $sp.title) -Message ('Could not be redrawn: {0}' -f $_.Exception.Message) }
+    if ($d) { return (New-BChart $As $d) }
+    if ($It.Src) { return ('<div class="bimg"><img src="{0}" alt="{1}"></div>' -f $It.Src, (ConvertTo-Attr ([string]$sp.title))) }
+    return ''
+}
+
+function ConvertTo-BNotes {
+    # Text cards (achievements, insights, summary): leading emoji in the icon box, a short head in
+    # bold and the rest of the sentence below it - all workbook text.
+    param($Items)
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($n in $Items) {
+        $head = [string]$n.Head; $body = [string]$n.Body
+        $icon = '•'
+        if ($head -match '^\s*([^\p{L}\p{N}\s]{1,4})\s*(.*)$') { $icon = $Matches[1]; $head = $Matches[2] }
+        if (-not $body -and $head.Length -gt 46) {
+            if ($head -match '^(.{12,}?)\s+[—–]\s+(.+)$') { $head = $Matches[1]; $body = $Matches[2] }
+            elseif ($head -match '^(.{12,}?):\s+(.+)$') { $head = $Matches[1]; $body = $Matches[2] }
+            elseif ($head -match '^(.{12,}?)\s+\((.+)\)\s*$') { $head = $Matches[1]; $body = $Matches[2] }
+        }
+        $cls = 'nt'
+        if ($icon -match '✅|✔|🏆|✓') { $cls = 'ok' } elseif ($icon -match '⚠|❗|!') { $cls = 'wn' } elseif ($icon -match '⚡|📈|🚀') { $cls = 'wn' }
+        [void]$sb.Append(('<div class="n"><span class="ic {0}">{1}</span><div><b>{2}</b><span>{3}</span></div></div>' -f $cls, (ConvertTo-BEnc $icon), (ConvertTo-BEnc $head), (ConvertTo-BEnc $body)))
+    }
+    return $sb.ToString()
+}
+
+function Get-BCardTexts {
+    # Text inside each white card of a row (achievements, insight cards): reading order per card.
+    param($Page, $Texts, [double]$Top, [double]$Bottom, [double]$MinW = 120)
+    $out = New-Object System.Collections.Generic.List[object]
+    foreach ($c in ((Get-BCards $Page 2000 80000) | Where-Object { $_.T -ge $Top -and $_.T -le $Bottom -and $_.W -ge $MinW } | Sort-Object L)) {
+        $in = @($Texts | Where-Object { Test-BInside $_ $c } | Sort-Object T, L)
+        if ($in.Count -eq 0) { continue }
+        $out.Add([pscustomobject]@{ Card = $c; Texts = $in })
+    }
     return , $out
 }
 
-function Test-ValueLike {
-    # Short text that reads as a figure: 16,818 / 99.60% / 2:23:48 / 16.96 min / #DIV/0! / -
-    param([string]$Text)
-    $t = $Text.Trim()
-    if ($t.Length -eq 0 -or $t.Length -gt 32) { return $false }
-    if ($t -match $ErrRegex) { return $true }
-    if ($t -match '^[-–—]$') { return $true }
-    if ($t -notmatch '\d') { return $false }
-    return ([regex]::Matches($t, '\p{L}').Count -le 12)
+function Get-BShapeTable {
+    # A table drawn with shapes: a dark header bar with column titles, then one bar per row.
+    param($Page, $Texts, $HeaderPattern)
+    $hdr = @($Texts | Where-Object { $_.Text -match $HeaderPattern } | Sort-Object T)
+    if ($hdr.Count -eq 0) { return $null }
+    $h0 = $hdr[0]
+    $heads = @($Texts | Where-Object { [math]::Abs($_.CY - $h0.CY) -le 4 } | Sort-Object L)
+    $bars = @($Page.Items | Where-Object { $_.Kind -eq 'shape' -and (Test-OpaqueBg $_.Bg) -and $_.T -gt $h0.T + 4 -and $_.W -ge 0.8 * (($heads[-1].L + $heads[-1].W) - $heads[0].L) } | Sort-Object T)
+    $rows = New-Object System.Collections.Generic.List[object]
+    foreach ($b in $bars) {
+        $in = @($Texts | Where-Object { Test-BInside $_ $b 1 })
+        if ($in.Count -eq 0) { continue }
+        $colTexts = @{}
+        foreach ($t in ($in | Sort-Object T, L)) {
+            $ci = 0
+            for ($k = 0; $k -lt $heads.Count; $k++) { if ($t.L -ge $heads[$k].L - 12) { $ci = $k } }
+            if (-not $colTexts.ContainsKey($ci)) { $colTexts[$ci] = New-Object System.Collections.Generic.List[object] }
+            $colTexts[$ci].Add($t)
+        }
+        # a real row has an ID badge or text in at least three columns (page footers do not)
+        $hasId = @($in | Where-Object { $_.Text -match '^[A-Z]\d{1,2}$' }).Count -gt 0
+        if (-not $hasId -and $colTexts.Count -lt 3) { continue }
+        $rows.Add([pscustomobject]@{ Bar = $b; Cols = $colTexts })
+    }
+    return [pscustomobject]@{ Heads = $heads; Rows = $rows }
+}
+
+function Get-BPicture {
+    param($Page)
+    foreach ($it in $Page.Items) { if ($it.Kind -eq 'image' -and -not $it.IsChart -and $it.Src) { return $it } }
+    return $null
 }
 
 function Get-StatusClass {
@@ -2187,594 +3087,469 @@ function Get-StatusClass {
 }
 
 function ConvertTo-BText {
-    # Text exactly as Excel shows it; status words wrapped in a pill.
     param([string]$Text)
     $cls = Get-StatusClass $Text
     if ($cls) { return ('<span class="pill {0}">{1}</span>' -f $cls, (ConvertTo-HtmlText $Text.Trim())) }
     return (ConvertTo-HtmlText $Text)
 }
 
-function New-Block {
-    param([string]$Type, [double]$L, [double]$T, [double]$W, [double]$H)
-    return [pscustomobject]@{ Type = $Type; L = $L; T = $T; W = $W; H = $H; Title = $null; Sub = $null
-        Spec = $null; Src = $null; Alt = $null; Label = $null; Value = $null; Meta = $null; Pieces = $null; Cells = $null }
-}
 
-function Get-RectOf {
-    param($List)
-    $l = 1e9; $t = 1e9; $r = -1e9; $b = -1e9
-    foreach ($x in $List) {
-        if ($x.L -lt $l) { $l = $x.L }; if ($x.T -lt $t) { $t = $x.T }
-        if ($x.L + $x.W -gt $r) { $r = $x.L + $x.W }; if ($x.T + $x.H -gt $b) { $b = $x.T + $x.H }
-    }
-    return [pscustomobject]@{ L = $l; T = $t; W = $r - $l; H = $b - $t }
-}
-
-function ConvertTo-KpiBlock {
-    # A card whose largest text is a figure becomes a KPI tile: label above, figure, details below.
-    param($Pieces, $Rect)
-    if ($Pieces.Count -lt 2 -or $Pieces.Count -gt 7) { return $null }
-    $best = $null
-    foreach ($p in $Pieces) { if (Test-ValueLike $p.Text) { if ($null -eq $best -or $p.Size -gt $best.Size) { $best = $p } } }
-    if ($null -eq $best) { return $null }
-    $others = 0.0
-    foreach ($p in $Pieces) { if ($p -ne $best -and $p.Size -gt $others) { $others = $p.Size } }
-    if ($best.Size -lt 1.2 * $others) { return $null }
-    $b = New-Block 'kpi' $Rect.L $Rect.T $Rect.W $Rect.H
-    $before = New-Object System.Collections.Generic.List[string]
-    $after = New-Object System.Collections.Generic.List[string]
-    $seen = $false
-    foreach ($p in $Pieces) {
-        if ($p -eq $best) { $seen = $true; continue }
-        if ($seen) { $after.Add($p.Text) } else { $before.Add($p.Text) }
-    }
-    if ($before.Count -eq 0 -and $after.Count -gt 0) { $before.Add($after[0]); $after.RemoveAt(0) }
-    $b.Label = ($before -join ' ')
-    $b.Value = $best.Text
-    $b.Meta = $after
-    return $b
-}
-
-function Test-TableShape {
-    param($Cells)
-    if ($Cells.Count -lt 4) { return $false }
-    $rows = @{}; $cols = @{}
-    foreach ($c in $Cells) { $rows[[string][math]::Round($c.T)] = 1; $cols[[string][math]::Round($c.L)] = 1 }
-    return ($rows.Count -ge 2 -and $cols.Count -ge 2)
-}
-
-function ConvertTo-TableBlock {
-    param($Cells, $Rect)
-    $b = New-Block 'table' $Rect.L $Rect.T $Rect.W $Rect.H
-    $b.Cells = $Cells
-    return $b
-}
-
-function Get-LeafItems {
-    # Everything inside a card (nested cards included), each object once.
-    param($Node, $Out)
-    $it = $Node.Item
-    if ($it.Kind -eq 'shape' -and $it.Runs) { $Out.Add($it) }
-    elseif ($it.Kind -in 'cell', 'image', 'missing') { $Out.Add($it) }
-    foreach ($c in $Node.Children) { Get-LeafItems -Node $c -Out $Out }
-}
-
-function Add-CardBlocks {
-    # One Excel card (filled/bordered shape or coloured cell area) with no cards inside it.
-    param($Node, $Blocks)
-    $leaves = New-Object System.Collections.Generic.List[object]
-    Get-LeafItems -Node $Node -Out $leaves
-    $charts = New-Object System.Collections.Generic.List[object]
-    $pics = New-Object System.Collections.Generic.List[object]
+function Get-BCellValue {
+    # A value from the helper table beside the pages (row label + column header), e.g. SAMI_AEC / Total.
+    param($Pages, [string]$Row, [string]$Col)
     $cells = New-Object System.Collections.Generic.List[object]
-    $texts = New-Object System.Collections.Generic.List[object]
-    foreach ($x in $leaves) {
-        if ($x.Kind -eq 'image' -and $x.IsChart) { $charts.Add($x) }
-        elseif ($x.Kind -in 'image', 'missing') { $pics.Add($x) }
-        elseif ($x.Kind -eq 'cell') { $cells.Add($x) }
-        else { $texts.Add($x) }
+    foreach ($p in $Pages) {
+        foreach ($c in $p.Items) { if ($c.Kind -eq 'cell') { $cells.Add($c) } }
+        if ($p.PSObject.Properties['HelperCells']) { foreach ($c in $p.HelperCells) { $cells.Add($c) } }
     }
-    $pieces = New-Object System.Collections.Generic.List[object]
-    foreach ($x in $texts) { foreach ($p in (Get-TextPieces $x)) { $pieces.Add($p) } }
-    $rect = [pscustomobject]@{ L = $Node.L; T = $Node.T; W = $Node.W; H = $Node.H }
-
-    if ($charts.Count -gt 0 -or $pics.Count -gt 0 -or (Test-TableShape $cells)) {
-        $first = $true
-        $sorted = @($pieces | Sort-Object T, L)
-        $visuals = New-Object System.Collections.Generic.List[object]
-        foreach ($x in $charts) { $visuals.Add($x) }
-        foreach ($x in $pics) { $visuals.Add($x) }
-        foreach ($x in ($visuals | Sort-Object T, L)) {
-            $kind = 'chart'; if (-not $x.IsChart) { $kind = 'image' }
-            $r = $rect; if (($charts.Count + $pics.Count) -gt 1) { $r = $x }
-            $b = New-Block $kind $r.L $r.T $r.W $r.H
-            $b.Spec = $x.Spec; $b.Src = $x.Src; $b.Alt = $x.Alt
-            if ($x.Kind -eq 'missing') { $b.Type = 'missing'; $b.Alt = $x.Message }
-            if ($first -and $sorted.Count) {
-                $b.Title = $sorted[0].Text
-                if ($sorted.Count -gt 1) { $b.Sub = (@($sorted | Select-Object -Skip 1 | ForEach-Object { $_.Text }) -join ' · ') }
-                $first = $false
-            }
-            $Blocks.Add($b)
-        }
-        if (Test-TableShape $cells) {
-            $tb = ConvertTo-TableBlock -Cells $cells -Rect (Get-RectOf $cells)
-            if ($first -and $sorted.Count) { $tb.Title = $sorted[0].Text; if ($sorted.Count -gt 1) { $tb.Sub = (@($sorted | Select-Object -Skip 1 | ForEach-Object { $_.Text }) -join ' · ') } }
-            if ($charts.Count -eq 0 -and $pics.Count -eq 0) { $tb.L = $rect.L; $tb.T = $rect.T; $tb.W = $rect.W; $tb.H = $rect.H }
-            $Blocks.Add($tb)
-        }
-        return
-    }
-    foreach ($x in $cells) { foreach ($p in (Get-TextPieces $x)) { $pieces.Add($p) } }
-    if ($pieces.Count -eq 0) { return }
-    $ordered = New-Object System.Collections.Generic.List[object]
-    foreach ($p in ($pieces | Sort-Object T, L)) { $ordered.Add($p) }
-    $kpi = ConvertTo-KpiBlock -Pieces $ordered -Rect $rect
-    if ($kpi) { $Blocks.Add($kpi); return }
-    $tb = New-Block 'text' $rect.L $rect.T $rect.W $rect.H
-    $tb.Pieces = $ordered
-    $Blocks.Add($tb)
+    $r = $null; $h = $null
+    foreach ($c in $cells) { if (([string]$c.Text).Trim() -eq $Row) { $r = $c; break } }
+    if ($null -eq $r) { return $null }
+    foreach ($c in ($cells | Sort-Object T -Descending)) { if (([string]$c.Text).Trim() -eq $Col -and $c.T -lt $r.T) { $h = $c; break } }
+    if ($null -eq $h) { return $null }
+    foreach ($c in $cells) { if ([math]::Abs($c.T - $r.T) -lt 1 -and [math]::Abs($c.L - $h.L) -lt 1) { return ([string]$c.Text).Trim() } }
+    return $null
 }
 
-function Add-NodeBlocks {
-    param($Nodes, $Blocks, $Loose, [double]$PageArea)
-    foreach ($n in $Nodes) {
-        $it = $n.Item
-        if ($n.IsBox) {
-            $hasInnerBox = $false
-            foreach ($c in $n.Children) { if ($c.IsBox) { $hasInnerBox = $true; break } }
-            if ($hasInnerBox -or (Get-NodeArea $n) -gt 0.45 * $PageArea) {
-                # a panel that holds other cards: its own text is loose, its cards are handled one by one
-                if ($it.Kind -eq 'shape' -and $it.Runs) { $Loose.Add($it) }
-                Add-NodeBlocks -Nodes $n.Children -Blocks $Blocks -Loose $Loose -PageArea $PageArea
-                continue
-            }
-            Add-CardBlocks -Node $n -Blocks $Blocks
-            continue
-        }
-        if ($it.Kind -eq 'image' -and $it.IsChart) {
-            $b = New-Block 'chart' $n.L $n.T $n.W $n.H; $b.Spec = $it.Spec; $b.Src = $it.Src; $b.Alt = $it.Alt; $Blocks.Add($b); continue
-        }
-        if ($it.Kind -eq 'image') { $b = New-Block 'image' $n.L $n.T $n.W $n.H; $b.Src = $it.Src; $b.Alt = $it.Alt; $Blocks.Add($b); continue }
-        if ($it.Kind -eq 'missing') { $b = New-Block 'missing' $n.L $n.T $n.W $n.H; $b.Alt = $it.Message; $Blocks.Add($b); continue }
-        if ($it.Kind -eq 'cell' -or ($it.Kind -eq 'shape' -and $it.Runs)) { $Loose.Add($it) }
-        if ($n.Children.Count) { Add-NodeBlocks -Nodes $n.Children -Blocks $Blocks -Loose $Loose -PageArea $PageArea }
-    }
+function Find-BTile {
+    param($Tiles, [string]$LabelPattern)
+    foreach ($t in $Tiles) { if ([string]$t.Label -match $LabelPattern) { return $t } }
+    return $null
 }
 
-function Add-LooseBlocks {
-    # Text boxes and cells that are not inside a card: grouped by distance into tables, KPI tiles or text.
-    param($Loose, $Blocks)
-    $n = $Loose.Count
-    if ($n -eq 0) { return }
-    $grp = New-Object 'int[]' $n
-    for ($i = 0; $i -lt $n; $i++) { $grp[$i] = $i }
-    $find = { param($k) while ($grp[$k] -ne $k) { $k = $grp[$k] }; return $k }
-    $gap = 10.0
-    for ($i = 0; $i -lt $n; $i++) {
-        for ($j = $i + 1; $j -lt $n; $j++) {
-            $a = $Loose[$i]; $c = $Loose[$j]
-            $ox = [math]::Min($a.L + $a.W, $c.L + $c.W) - [math]::Max($a.L, $c.L)
-            $oy = [math]::Min($a.T + $a.H, $c.T + $c.H) - [math]::Max($a.T, $c.T)
-            if ($ox -ge -$gap -and $oy -ge -$gap) {
-                $ri = & $find $i; $rj = & $find $j
-                if ($ri -ne $rj) { $grp[$rj] = $ri }
-            }
-        }
-    }
-    $groups = @{}
-    for ($i = 0; $i -lt $n; $i++) {
-        $r = & $find $i
-        if (-not $groups.ContainsKey($r)) { $groups[$r] = New-Object System.Collections.Generic.List[object] }
-        $groups[$r].Add($Loose[$i])
-    }
-    foreach ($key in $groups.Keys) {
-        $members = $groups[$key]
-        $rect = Get-RectOf $members
-        $cells = New-Object System.Collections.Generic.List[object]
-        $others = New-Object System.Collections.Generic.List[object]
-        foreach ($m in $members) { if ($m.Kind -eq 'cell') { $cells.Add($m) } else { $others.Add($m) } }
-        $pieces = New-Object System.Collections.Generic.List[object]
-        if (Test-TableShape $cells) {
-            $tb = ConvertTo-TableBlock -Cells $cells -Rect $rect
-            foreach ($m in $others) { foreach ($p in (Get-TextPieces $m)) { $pieces.Add($p) } }
-            $sorted = @($pieces | Sort-Object T, L)
-            if ($sorted.Count) { $tb.Title = $sorted[0].Text; if ($sorted.Count -gt 1) { $tb.Sub = (@($sorted | Select-Object -Skip 1 | ForEach-Object { $_.Text }) -join ' · ') } }
-            $Blocks.Add($tb)
-            continue
-        }
-        foreach ($m in $members) { foreach ($p in (Get-TextPieces $m)) { $pieces.Add($p) } }
-        if ($pieces.Count -eq 0) { continue }
-        $ordered = New-Object System.Collections.Generic.List[object]
-        foreach ($p in ($pieces | Sort-Object T, L)) { $ordered.Add($p) }
-        $kpi = ConvertTo-KpiBlock -Pieces $ordered -Rect $rect
-        if ($kpi) { $Blocks.Add($kpi); continue }
-        $tx = New-Block 'text' $rect.L $rect.T $rect.W $rect.H
-        $tx.Pieces = $ordered
-        $Blocks.Add($tx)
-    }
+function Add-BUsedChart {
+    param($Used, $It)
+    if ($It) { $Used.Add($It) }
 }
 
-function Merge-CaptionBlocks {
-    # A short text standing directly above a chart or table is that chart's / table's title.
-    param($Blocks)
-    $drop = New-Object System.Collections.Generic.List[object]
-    foreach ($t in $Blocks) {
-        if ($t.Type -ne 'text' -or $t.Pieces.Count -gt 2) { continue }
-        if ($t.Pieces[0].Text.Length -gt 90) { continue }
-        $target = $null; $bestGap = 1e9
-        foreach ($b in $Blocks) {
-            if ($b.Type -notin 'chart', 'table', 'image' -or $b.Title) { continue }
-            $gapY = $b.T - ($t.T + $t.H)
-            if ($gapY -lt -6 -or $gapY -gt 40) { continue }
-            $ox = [math]::Min($t.L + $t.W, $b.L + $b.W) - [math]::Max($t.L, $b.L)
-            if ($ox -lt 0.4 * [math]::Min($t.W, $b.W)) { continue }
-            if ($gapY -lt $bestGap) { $bestGap = $gapY; $target = $b }
-        }
-        if ($null -eq $target) { continue }
-        $target.Title = $t.Pieces[0].Text
-        if ($t.Pieces.Count -gt 1) { $target.Sub = $t.Pieces[1].Text }
-        $h = $target.T + $target.H - $t.T
-        $l = [math]::Min($t.L, $target.L); $r = [math]::Max($t.L + $t.W, $target.L + $target.W)
-        $target.T = $t.T; $target.H = $h; $target.L = $l; $target.W = $r - $l
-        $drop.Add($t)
-    }
-    foreach ($d in $drop) { [void]$Blocks.Remove($d) }
-}
-
-function Get-PageHeader {
-    # The page title and the text beside it in the page's header band; everything above
-    # $Bottom belongs to the header and is shown in the coloured header bar.
-    param($Page)
-    $titleItem = $null
-    $want = ([string]$Page.Title).Trim()
-    foreach ($it in $Page.Items) {
-        if ($it.Kind -ne 'cell' -and $it.Kind -ne 'shape') { continue }
-        $first = ((Get-ItemText $it) -split "[`r`n`v]" | Where-Object { $_.Trim() } | Select-Object -First 1)
-        if (-not $first) { continue }
-        $first = $first.Trim()
-        if ($first -eq $want -or ($want.EndsWith('...') -and $first.StartsWith($want.Substring(0, $want.Length - 3)))) {
-            if ($null -eq $titleItem -or $it.T -lt $titleItem.T) { $titleItem = $it }
-        }
-    }
-    $res = [pscustomobject]@{ Title = $want; Sub = $null; Bottom = [double]$Page.StartY - 1; TitleItem = $titleItem }
-    if ($null -eq $titleItem) { return $res }
-    $bottom = $titleItem.T + $titleItem.H
-    $band = $null
-    try { $band = Get-DarkBand -It $titleItem -Items $Page.Items -ContentWidth ([double]$Page.OffsetX + [double]$Page.Width) } catch { }
-    if ($band) { $bottom = [math]::Max($bottom, $band.T + $band.H) }
-    $res.Bottom = $bottom
-    $subs = New-Object System.Collections.Generic.List[string]
-    foreach ($it in ($Page.Items | Sort-Object T, L)) {
-        if ($it -eq $titleItem) {
-            # further paragraphs of the title box are the subtitle
-            $k = 0
-            foreach ($p in (Get-TextPieces $it)) { if ($k -gt 0) { $subs.Add($p.Text) }; $k++ }
-            continue
-        }
-        if ($it.Kind -ne 'cell' -and -not ($it.Kind -eq 'shape' -and $it.Runs)) { continue }
-        if ($it.T + $it.H -gt $bottom + 2) { continue }
-        foreach ($p in (Get-TextPieces $it)) { $subs.Add($p.Text) }
-    }
-    if ($subs.Count) { $res.Sub = ($subs -join ' · ') }
-    return $res
-}
-
-function Get-PageBlocks {
-    param($Page, [double]$HeaderBottom)
-    $items = New-Object System.Collections.Generic.List[object]
-    foreach ($it in $Page.Items) {
-        if ($it.Kind -in 'blank', 'line') { continue }
-        if ($it.T + $it.H -le $HeaderBottom + 2) { continue }
-        $items.Add($it)
-    }
-    $blocks = New-Object System.Collections.Generic.List[object]
-    $loose = New-Object System.Collections.Generic.List[object]
-    if ($items.Count -eq 0) { return , $blocks }
-    $area = [math]::Max(1.0, [double]$Page.Width * ([double]$Page.EndY - [double]$Page.StartY))
-    $top = New-PageTree $items
-    Add-NodeBlocks -Nodes $top -Blocks $blocks -Loose $loose -PageArea $area
-    Add-LooseBlocks -Loose $loose -Blocks $blocks
-    Merge-CaptionBlocks -Blocks $blocks
-    return , $blocks
-}
-
-# ---------------------------------------------------------------- HTML of one card
-
-function ConvertTo-TableHtml {
-    param($Cells)
-    $rowKeys = New-Object System.Collections.Generic.List[double]
-    $colKeys = New-Object System.Collections.Generic.List[double]
-    foreach ($c in $Cells) {
-        $rt = [math]::Round([double]$c.T, 1); $cl = [math]::Round([double]$c.L, 1)
-        if (-not $rowKeys.Contains($rt)) { $rowKeys.Add($rt) }
-        if (-not $colKeys.Contains($cl)) { $colKeys.Add($cl) }
-    }
-    $rowKeys.Sort(); $colKeys.Sort()
-    $grid = @{}
-    foreach ($c in $Cells) { $grid[('{0}|{1}' -f $rowKeys.IndexOf([math]::Round([double]$c.T, 1)), $colKeys.IndexOf([math]::Round([double]$c.L, 1)))] = $c }
-    # numeric columns are right-aligned
-    $numCol = @{}
-    for ($ci = 0; $ci -lt $colKeys.Count; $ci++) {
-        $num = 0; $all = 0
-        for ($ri = 1; $ri -lt $rowKeys.Count; $ri++) {
-            $c = $grid[('{0}|{1}' -f $ri, $ci)]
-            if ($null -eq $c) { continue }
-            $all++
-            if (([string]$c.Text).Trim() -match '^[-+(]?[\d.,:%\s]+\)?\s*%?$|^#') { $num++ }
-        }
-        $numCol[$ci] = ($all -gt 0 -and $num -ge 0.6 * $all)
-    }
-    # first row is a header when it is bold or filled (Excel's table header)
-    $header = $true
-    for ($ci = 0; $ci -lt $colKeys.Count; $ci++) {
-        $c = $grid[('0|{0}' -f $ci)]
-        if ($null -ne $c -and -not $c.Bold -and -not $c.Bg) { $header = $false }
-    }
-    if ($rowKeys.Count -lt 2) { $header = $false }
+function Get-BLeftoverCharts {
+    # Charts of the page that no card of the sample shows - added so nothing is left out.
+    param($Page, $Used)
     $sb = New-Object System.Text.StringBuilder
-    [void]$sb.Append('<div class="tblwrap"><table>')
-    for ($ri = 0; $ri -lt $rowKeys.Count; $ri++) {
-        $isHead = ($ri -eq 0 -and $header)
-        $rowBold = $true
-        for ($ci = 0; $ci -lt $colKeys.Count; $ci++) { $c = $grid[('{0}|{1}' -f $ri, $ci)]; if ($null -ne $c -and -not $c.Bold) { $rowBold = $false } }
-        $trCls = ''
-        if (-not $isHead -and $rowBold -and $ri -eq $rowKeys.Count - 1) { $trCls = ' class="total"' }
-        [void]$sb.Append('<tr' + $trCls + '>')
-        for ($ci = 0; $ci -lt $colKeys.Count; $ci++) {
-            $c = $grid[('{0}|{1}' -f $ri, $ci)]
-            $tag = 'td'; if ($isHead) { $tag = 'th' }
-            $cls = ''; if ($numCol[$ci]) { $cls = ' class="n"' }
-            if ($null -eq $c) { [void]$sb.Append('<' + $tag + $cls + '></' + $tag + '>'); continue }
-            $title = ' title="Wkly_Report!' + $c.Address + '"'
-            $txt = ConvertTo-BText ([string]$c.Text)
-            if ($isHead) { $txt = ConvertTo-HtmlText ([string]$c.Text) }
-            [void]$sb.Append('<' + $tag + $cls + $title + '>' + $txt + '</' + $tag + '>')
+    foreach ($it in ($Page.Items | Where-Object { $_.Kind -eq 'image' -and $_.IsChart -and $_.Spec } | Sort-Object T, L)) {
+        $skip = $false
+        foreach ($u in $Used) { if ([object]::ReferenceEquals($u, $it)) { $skip = $true } }
+        if ($skip) { continue }
+        $kind = [string]$it.Spec.kind
+        $as = 'columns'
+        if ($kind -eq 'bar') { $as = 'hbars' } elseif ($kind -in 'pie', 'doughnut') { $as = 'donut' } elseif ($kind -eq 'line') { $as = 'line' }
+        if ($as -eq 'columns') {
+            # long category names read better as horizontal bars
+            $len = 0; $cnt = 0
+            foreach ($c in (ConvertTo-BArray $it.Spec.series[0].cats)) { $len += ([string]$c).Length; $cnt++ }
+            if ($cnt -gt 0 -and ($len / $cnt) -gt 14) { $as = 'hbars' }
+        }
+        [void]$sb.Append('<div class="grid g1" style="margin-top:16px">' + (ConvertTo-BChartCard ([string]$it.Spec.title) '' (Get-BChartHtml $it $as @{})) + '</div>')
+    }
+    return $sb.ToString()
+}
+
+function Build-BCover {
+    param($Page, $Pages, $Meta)
+    $tx = Get-BTexts $Page
+    $title = $null
+    foreach ($t in ($tx | Sort-Object @{ Expression = { $_.Size }; Descending = $true })) { $title = $t; break }
+    $eyebrow = @($tx | Where-Object { $title -and $_.T -lt $title.T -and $_.Item.Kind -ne 'cell' } | Sort-Object T | ForEach-Object { $_.Text }) -join ' · '
+    $kv = New-Object System.Collections.Generic.List[object]
+    $tag = New-Object System.Collections.Generic.List[string]
+    $conf = $Classification
+    foreach ($t in ($tx | Where-Object { $title -and $_.T -gt $title.T + 2 -and $_.Item.Kind -ne 'cell' } | Sort-Object T, L)) {
+        if ($t.Text -match '^\s*([^:]{3,30}?)\s*:\s*(.+)$') { $kv.Add(@($Matches[1], $Matches[2])); continue }
+        if ($t.Text -match '^(CONFIDENTIAL|RESTRICTED|INTERNAL)') { $conf = $t.Text; continue }
+        if ($kv.Count -eq 0) { $tag.Add($t.Text) }
+    }
+    $exec = Get-BPage $Pages 'Executive'
+    $execTiles = New-Object System.Collections.Generic.List[object]
+    if ($exec) { $execTiles = Get-BTiles $exec (Get-BTexts $exec) }
+    $sla = Get-BPage $Pages 'SLA'
+    # stat 1: total tickets (helper table SAMI_AEC / Total), 2: resolution SLA, 3: average resolution time
+    $total = Get-BCellValue $Pages 'SAMI_AEC' 'Total'
+    $inc = Get-BCellValue $Pages 'SAMI_AEC' 'Inc'
+    $srs = Get-BCellValue $Pages 'SAMI_AEC' 'Total SR'
+    $s1 = $null
+    if ($total) { $m = ''; if ($inc -and $srs) { $m = ('{0} incidents · {1} service requests' -f $inc, $srs) }; $s1 = [pscustomobject]@{ Label = 'Total tickets (YTD)'; Value = $total; Meta = $m } }
+    $s2 = Find-BTile $execTiles 'Resolution SLA'
+    $s3 = Find-BTile $execTiles 'MTTR Resolution'
+    if ($s3 -and $sla) {
+        $st = Get-BTexts $sla
+        $resLab = @($st | Where-Object { $_.Text -eq 'RESOLUTION' } | Select-Object -First 1)
+        if ($resLab.Count) { $line = @($st | Where-Object { $_.T -gt $resLab[0].T -and $_.T -lt $resLab[0].T + 90 -and $_.Text -match 'min SLA' } | Select-Object -First 1); if ($line.Count) { $s3 = [pscustomobject]@{ Label = 'Average resolution time'; Value = $s3.Value; Meta = $line[0].Text } } }
+    }
+    if ($s2) { $s2 = [pscustomobject]@{ Label = $s2.Label; Value = $s2.Value; Meta = $s2.Meta } }
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('<div class="cover"><div class="card hero">')
+    if ($eyebrow) { [void]$sb.Append('<div class="eyebrow">' + (ConvertTo-BEnc $eyebrow) + '</div>') }
+    $tt = [string]$Page.Title; if ($title) { $tt = $title.Text }
+    [void]$sb.Append('<h1>' + (ConvertTo-BEnc $tt) + '</h1>')
+    foreach ($t in $tag) { [void]$sb.Append('<div class="tg">' + (ConvertTo-BEnc $t) + '</div>') }
+    if ($kv.Count) {
+        [void]$sb.Append('<dl class="kv">')
+        foreach ($p in $kv) { [void]$sb.Append('<dt>' + (ConvertTo-BEnc $p[0]) + '</dt><dd>' + (ConvertTo-BEnc $p[1]) + '</dd>') }
+        [void]$sb.Append('</dl>')
+    }
+    if ($conf) { [void]$sb.Append('<span class="conf-big">' + (ConvertTo-BEnc $conf) + '</span>') }
+    [void]$sb.Append('</div><div class="grid" style="grid-template-rows:repeat(3,1fr)">')
+    foreach ($s in @($s1, $s2, $s3)) { [void]$sb.Append((ConvertTo-BTileHtml $s)) }
+    [void]$sb.Append('</div></div>')
+    return $sb.ToString()
+}
+
+function Build-BExec {
+    param($Page, $Used)
+    $tx = Get-BTexts $Page
+    $tiles = Get-BTiles $Page $tx
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append((ConvertTo-BGrid $tiles))
+    $mon = Get-BChartItem $Page 'Monthly'; $stat = Get-BChartItem $Page 'Status'
+    $wsr = Get-BChartItem $Page 'Weekly Service'; $winc = Get-BChartItem $Page 'Weekly Incident'
+    foreach ($c in @($mon, $stat, $wsr, $winc)) { Add-BUsedChart $Used $c }
+    [void]$sb.Append('<div class="grid g12" style="margin-top:16px">')
+    [void]$sb.Append((ConvertTo-BChartCard ([string]$mon.Spec.title) 'Incidents and service requests, stacked = total' (Get-BChartHtml $mon 'columns' @{ Stack = $true; Months = $true; H = 340 })))
+    [void]$sb.Append((ConvertTo-BChartCard ([string]$stat.Spec.title) 'Share of all incidents' (Get-BChartHtml $stat 'donut' @{ Strip = $true })))
+    [void]$sb.Append('</div><div class="grid g2" style="margin-top:16px">')
+    [void]$sb.Append((ConvertTo-BChartCard ((([string]$wsr.Spec.title) -replace "[`r`n]+", ' ')) 'Created vs resolved / closed · open shown as label' (Get-BChartHtml $wsr 'columns' @{ Weeks = $true })))
+    [void]$sb.Append((ConvertTo-BChartCard ([string]$winc.Spec.title) 'Created vs closed · open shown as label' (Get-BChartHtml $winc 'columns' @{ Weeks = $true })))
+    [void]$sb.Append('</div>')
+    $ach = @($tx | Where-Object { $_.Text -match '^ACHIEVEMENTS' } | Select-Object -First 1)
+    if ($ach.Count) {
+        $notes = New-Object System.Collections.Generic.List[object]
+        foreach ($c in (Get-BCardTexts $Page $tx $ach[0].T ($ach[0].T + 140) 150)) { $notes.Add([pscustomobject]@{ Head = (@($c.Texts | ForEach-Object { $_.Text }) -join ' '); Body = '' }) }
+        if ($notes.Count) { [void]$sb.Append('<div class="card notes" style="margin-top:16px"><h3>Achievements</h3><div class="grid g4" style="gap:0 24px">' + (ConvertTo-BNotes $notes) + '</div></div>') }
+    }
+    return $sb.ToString()
+}
+
+function Build-BIncident {
+    param($Page, $Used)
+    $tx = Get-BTexts $Page
+    $tiles = Get-BTiles $Page $tx
+    $total = Find-BTile $tiles '^Total Incidents'
+    $pri = Get-BChartItem $Page 'Priority'; $cls = Get-BChartItem $Page 'Classification'
+    Add-BUsedChart $Used $pri; Add-BUsedChart $Used $cls
+    $center = $null; if ($total) { $center = $total.Value }
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append((ConvertTo-BGrid $tiles))
+    [void]$sb.Append('<div class="grid g21" style="margin-top:16px">')
+    [void]$sb.Append((ConvertTo-BChartCard ([string]$pri.Spec.title) 'Incidents' (Get-BChartHtml $pri 'donut' @{ Center = $center; Sub = 'incidents' })))
+    [void]$sb.Append((ConvertTo-BChartCard ([string]$cls.Spec.title) 'Incidents, share of total' (Get-BChartHtml $cls 'hbars' @{})))
+    [void]$sb.Append('</div>')
+    return $sb.ToString()
+}
+
+function Build-BServiceRequests {
+    param($Page, $Used)
+    $tx = Get-BTexts $Page
+    $tiles = Get-BTiles $Page $tx
+    $mon = Get-BChartItem $Page 'Monthly'; $cat = Get-BChartItem $Page 'category'
+    Add-BUsedChart $Used $mon; Add-BUsedChart $Used $cat
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append((ConvertTo-BGrid $tiles))
+    [void]$sb.Append('<div class="grid g2" style="margin-top:16px">')
+    [void]$sb.Append((ConvertTo-BChartCard ([string]$mon.Spec.title) 'Service requests per month' (Get-BChartHtml $mon 'line' @{ Color = '--s3' })))
+    [void]$sb.Append((ConvertTo-BChartCard ([string]$cat.Spec.title) 'Service requests, share of total' (Get-BChartHtml $cat 'hbars' @{ Color = '--s3' })))
+    [void]$sb.Append('</div>')
+    return $sb.ToString()
+}
+
+function Build-BSla {
+    param($Page, $Used)
+    $tx = Get-BTexts $Page
+    $tiles = Get-BTiles $Page $tx -Bottom ($Page.StartY + 150)
+    $res = Get-BChartItem $Page 'Resolution SLA'; $rsp = Get-BChartItem $Page 'Response SLA'
+    Add-BUsedChart $Used $res; Add-BUsedChart $Used $rsp
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append((ConvertTo-BGrid $tiles))
+    [void]$sb.Append('<div class="grid g3" style="margin-top:16px">')
+    [void]$sb.Append((ConvertTo-BChartCard ([string]$res.Spec.title) 'Incidents within SLA' (Get-BChartHtml $res 'donut' @{ Sub = 'within SLA' })))
+    [void]$sb.Append((ConvertTo-BChartCard ([string]$rsp.Spec.title) 'Incidents within SLA' (Get-BChartHtml $rsp 'donut' @{ Sub = 'within SLA' })))
+    # MTTR panel: response / resolution use of the SLA budget, as written in the workbook
+    $mt = @($tx | Where-Object { $_.Text -eq 'MTTR' } | Select-Object -First 1)
+    $body = ''
+    if ($mt.Count) {
+        $zone = @($tx | Where-Object { $_.L -ge $mt[0].L - 20 -and $_.T -ge $mt[0].T -and $_.T -le $mt[0].T + 300 } | Sort-Object T, L)
+        foreach ($part in @('RESPONSE', 'RESOLUTION')) {
+            $lab = @($zone | Where-Object { $_.Text -eq $part } | Select-Object -First 1)
+            if (-not $lab.Count) { continue }
+            $line = @($zone | Where-Object { $_.T -gt $lab[0].T -and $_.T -lt $lab[0].T + 100 -and $_.Text -match 'min SLA' } | Select-Object -First 1)
+            $big = @($zone | Where-Object { $_.T -gt $lab[0].T -and $_.T -lt $lab[0].T + 40 -and (Test-BValue $_.Text) } | Sort-Object @{ Expression = { $_.Size }; Descending = $true } | Select-Object -First 1)
+            $pct = ''; $txt = ''
+            if ($line.Count) { $txt = $line[0].Text; if ($txt -match '\(\s*([\d.]+%)\s*\)') { $pct = $Matches[1] } }
+            $name = (Get-Culture).TextInfo.ToTitleCase($part.ToLowerInvariant())
+            $lt = $name
+            $lineTxt = ($txt -replace '\s*\(\s*[\d.]+%\s*\)', '').Trim()
+            if ($big.Count -and -not $lineTxt.StartsWith($big[0].Text)) { $lt += ' · ' + $big[0].Text }
+            if ($lineTxt) { $lt += ' · ' + $lineTxt }
+            $col = '--s3'; if ($part -eq 'RESOLUTION') { $col = '--s1' }
+            $w = 0; if ($pct -match '^([\d.]+)%$') { $w = [double]::Parse($Matches[1], $Inv) }
+            $body += ('<div class="stat" style="margin-top:12px"><div class="lab">{0}</div><div class="val" style="font-size:29px">{1}</div><div class="bar"><i style="width:{2}%;background:var({3})"></i></div></div>' -f (ConvertTo-BEnc $lt), (ConvertTo-BEnc $pct), (Format-Num ([math]::Min(100, $w))), $col)
+        }
+        $sr = @($zone | Where-Object { $_.Text -match 'SR SLA' } | Select-Object -First 1)
+        if ($sr.Count) {
+            $after = @($tx | Where-Object { $_.T -gt $sr[0].T - 1 -and $_.T -lt $sr[0].T + 40 -and $_.L -ge $sr[0].L - 30 -and -not [object]::ReferenceEquals($_, $sr[0]) } | Sort-Object @{ Expression = { [math]::Round($_.CY / 6) } }, L | ForEach-Object { $_.Text })
+            $body += ('<div class="meta" style="margin-top:16px;font-size:16px;color:var(--ink-3)">{0} {1}</div>' -f (ConvertTo-BEnc ($sr[0].Text -replace '^[^\p{L}]+', '')), (ConvertTo-BEnc (($after -join ' ') -replace '\s*/\s*', ' / ')))
+        }
+    }
+    [void]$sb.Append((ConvertTo-BChartCard 'MTTR vs SLA budget' 'How much of each SLA is used' $body))
+    [void]$sb.Append('</div>')
+    $ins = @($tx | Where-Object { $_.Text -match 'INSIGHTS' } | Select-Object -First 1)
+    if ($ins.Count) {
+        $notes = New-Object System.Collections.Generic.List[object]
+        foreach ($c in (Get-BCardTexts $Page $tx $ins[0].T ($ins[0].T + 60) 150)) {
+            $parts = @($c.Texts | Sort-Object T, L)
+            $notes.Add([pscustomobject]@{ Head = $parts[0].Text; Body = (@($parts | Select-Object -Skip 1 | ForEach-Object { $_.Text }) -join ' ') })
+        }
+        $head = ($ins[0].Text -replace '^.*?[—–-]\s*', '')
+        if ($notes.Count) { [void]$sb.Append(('<div class="card notes" style="margin-top:16px"><h3>{0}</h3><div class="grid g4" style="gap:0 24px">{1}</div></div>' -f (ConvertTo-BEnc $head), (ConvertTo-BNotes $notes))) }
+    }
+    return $sb.ToString()
+}
+
+function Build-BPriority {
+    param($Page, $Used)
+    $pd = Get-BChartItem $Page 'Priority'; $top = Get-BChartItem $Page 'Incident.*Categor'
+    Add-BUsedChart $Used $pd; Add-BUsedChart $Used $top
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('<div class="grid g2">')
+    [void]$sb.Append((ConvertTo-BChartCard ([string]$pd.Spec.title) 'Incidents vs service requests' (Get-BChartHtml $pd 'columns' @{ H = 340 })))
+    [void]$sb.Append((ConvertTo-BChartCard ([string]$top.Spec.title) 'Count and share' (Get-BChartHtml $top 'hbars' @{})))
+    [void]$sb.Append('</div>')
+    return $sb.ToString()
+}
+
+function Build-BAgents {
+    param($Page, $Used)
+    $tx = Get-BTexts $Page
+    $ag = Get-BChartItem $Page 'Agent'
+    Add-BUsedChart $Used $ag
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('<div class="grid g2">')
+    [void]$sb.Append((ConvertTo-BChartCard ([string]$ag.Spec.title) 'Tickets handled' (Get-BChartHtml $ag 'hbars' @{})))
+    $pic = Get-BPicture $Page
+    $picHtml = ''
+    if ($pic) { $picHtml = ('<div class="bimg"><img src="{0}" alt="Assignment groups"></div><div class="note">This table is a linked picture in Wkly_Report, so it is shown as Excel''s picture of it.</div>' -f $pic.Src) }
+    [void]$sb.Append((ConvertTo-BChartCard 'Assignment groups' 'Incidents and average MTTR' $picHtml))
+    [void]$sb.Append('</div>')
+    $enh = @($tx | Where-Object { $_.Text -match '^ENHANCEMENTS' } | Select-Object -First 1)
+    if ($enh.Count) {
+        $sub = @($tx | Where-Object { $_.T -gt $enh[0].T -and $_.T -lt $enh[0].T + 30 -and $_.Text -ne $enh[0].Text } | Select-Object -First 1 | ForEach-Object { $_.Text })
+        $cards = New-Object System.Text.StringBuilder
+        foreach ($c in ((Get-BCards $Page 8000 80000) | Where-Object { $_.T -gt $enh[0].T -and $_.T -lt $enh[0].T + 120 } | Sort-Object L)) {
+            $in = @($tx | Where-Object { Test-BInside $_ $c } | Sort-Object T, L)
+            $id = @($in | Where-Object { $_.Text -match '^[A-Z]\d{1,2}$' } | Select-Object -First 1 | ForEach-Object { $_.Text })
+            $st = @($in | Where-Object { $_.Size -le 7.5 -and $_.Text.Length -le 16 } | Select-Object -First 1 | ForEach-Object { $_.Text })
+            $rest = @($in | Where-Object { $_.Text -notmatch '^[A-Z]\d{1,2}$' -and -not ($_.Size -le 7.5 -and $_.Text.Length -le 16) })
+            $ttl = @($rest | Sort-Object @{ Expression = { $_.Size }; Descending = $true }, T | Select-Object -First 1)
+            $body = @($rest | Where-Object { $ttl.Count -eq 0 -or -not [object]::ReferenceEquals($_, $ttl[0]) } | ForEach-Object { $_.Text }) -join ' '
+            $cls = 'nt'; $s0 = [string]($st -join ''); if ($s0 -match 'progress') { $cls = 'wn' } elseif ($s0 -match 'complete|done') { $cls = 'ok' }
+            $tt = ''; if ($ttl.Count) { $tt = $ttl[0].Text }
+            [void]$cards.Append(('<div class="card"><div style="display:flex;justify-content:space-between"><span class="id">{0}</span><span class="pill {1}">{2}</span></div><h4>{3}</h4><p>{4}</p></div>' -f (ConvertTo-BEnc ($id -join '')), $cls, (ConvertTo-BEnc $s0), (ConvertTo-BEnc $tt), (ConvertTo-BEnc $body)))
+        }
+        $title = (Get-Culture).TextInfo.ToTitleCase($enh[0].Text.ToLowerInvariant())
+        [void]$sb.Append(('<div class="card" style="margin-top:16px"><h3>{0}</h3><div class="sub">{1}</div><div class="enh">{2}</div></div>' -f (ConvertTo-BEnc $title), (ConvertTo-BEnc ($sub -join '')), $cards.ToString()))
+    }
+    return $sb.ToString()
+}
+
+function Build-BResolution {
+    param($Page, $Used)
+    $tx = Get-BTexts $Page
+    $ia = Get-BChartItem $Page 'Incident.*Aging'; $sa = Get-BChartItem $Page 'Service Request Aging'
+    Add-BUsedChart $Used $ia; Add-BUsedChart $Used $sa
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('<div class="grid g2">')
+    [void]$sb.Append((ConvertTo-BChartCard ([string]$ia.Spec.title) 'Incidents by resolution time · share as label' (Get-BChartHtml $ia 'columns' @{})))
+    [void]$sb.Append((ConvertTo-BChartCard ([string]$sa.Spec.title) 'SRs by resolution time · share as label' (Get-BChartHtml $sa 'columns' @{})))
+    [void]$sb.Append('</div>')
+    $ki = @($tx | Where-Object { $_.Text -match '^Key Insights' } | Select-Object -First 1)
+    if ($ki.Count) {
+        $tiles = New-Object System.Collections.Generic.List[object]
+        foreach ($c in ((Get-BCards $Page 8000 80000) | Where-Object { $_.T -gt $ki[0].T -and $_.T -lt $ki[0].T + 60 } | Sort-Object L)) {
+            $in = @($tx | Where-Object { Test-BInside $_ $c } | Sort-Object T, L)
+            $v = @($in | Where-Object { Test-BValue $_.Text } | Select-Object -First 1)
+            if (-not $v.Count) { continue }
+            $others = @($in | Where-Object { -not [object]::ReferenceEquals($_, $v[0]) } | Sort-Object @{ Expression = { $_.Size } }, T)
+            $desc = ''; $unit = ''
+            if ($others.Count) { $desc = $others[0].Text; $unit = (@($others | Select-Object -Skip 1 | ForEach-Object { $_.Text }) -join ' ') }
+            $tiles.Add([pscustomobject]@{ Label = $desc; Value = $v[0].Text; Meta = $unit })
+        }
+        if ($tiles.Count) { [void]$sb.Append('<h3 style="margin:22px 0 10px">' + (ConvertTo-BEnc $ki[0].Text) + '</h3>' + (ConvertTo-BGrid $tiles)) }
+    }
+    return $sb.ToString()
+}
+
+function Build-BRisks {
+    param($Page, $Used)
+    $tx = Get-BTexts $Page
+    $tb = Get-BShapeTable $Page $tx '^Risk$'
+    if ($null -eq $tb -or $tb.Rows.Count -eq 0) { return '' }
+    $heads = @($tb.Heads | ForEach-Object { $_.Text })
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('<div class="card"><table><thead><tr><th>ID</th>')
+    $hdr = @($heads[0])
+    for ($k = 2; $k -lt $heads.Count; $k++) { $hdr += $heads[$k] }
+    foreach ($h in $hdr) { [void]$sb.Append('<th>' + (ConvertTo-BEnc $h) + '</th>') }
+    [void]$sb.Append('</tr></thead><tbody>')
+    foreach ($r in $tb.Rows) {
+        $first = New-Object System.Collections.Generic.List[object]
+        foreach ($k in 0, 1) { if ($r.Cols.ContainsKey($k)) { foreach ($t in $r.Cols[$k]) { $first.Add($t) } } }
+        $id = @($first | Where-Object { $_.Text -match '^[A-Z]\d{1,2}$' } | Select-Object -First 1 | ForEach-Object { $_.Text })
+        $txts = @($first | Where-Object { $_.Text -notmatch '^[A-Z]\d{1,2}$' } | Sort-Object T, L)
+        $ttl = ''; $desc = ''
+        if ($txts.Count) { $ttl = $txts[0].Text; $desc = (@($txts | Select-Object -Skip 1 | ForEach-Object { $_.Raw -replace "^\s*-\s*", '' -replace "[`r`n`v]+\s*-?\s*", '; ' }) -join ' ').Trim() }
+        [void]$sb.Append('<tr><td><b>' + (ConvertTo-BEnc ($id -join '')) + '</b></td><td><b>' + (ConvertTo-BEnc $ttl) + '</b><br><span style="color:var(--ink-2)">' + (ConvertTo-BEnc $desc) + '</span></td>')
+        for ($k = 2; $k -lt $heads.Count; $k++) {
+            $cell = ''
+            if ($r.Cols.ContainsKey($k)) { $cell = (@($r.Cols[$k] | ForEach-Object { $_.Text }) -join ' ') }
+            if ($k -lt $heads.Count - 1) { [void]$sb.Append('<td>' + (ConvertTo-BText $cell) + '</td>') }
+            else { [void]$sb.Append('<td style="color:var(--ink-2)">' + (ConvertTo-BEnc $cell) + '</td>') }
         }
         [void]$sb.Append('</tr>')
     }
-    [void]$sb.Append('</table></div>')
+    [void]$sb.Append('</tbody></table></div>')
     return $sb.ToString()
 }
 
-function ConvertTo-BlockHtml {
-    param($B)
-    $head = ''
-    if ($B.Title) { $head += '<h3>' + (ConvertTo-HtmlText $B.Title) + '</h3>' }
-    if ($B.Sub) { $head += '<div class="sub">' + (ConvertTo-HtmlText $B.Sub) + '</div>' }
-    switch ($B.Type) {
-        'kpi' {
-            $meta = ''
-            foreach ($m in $B.Meta) { $meta += '<span>' + (ConvertTo-BText $m) + '</span>' }
-            return ('<div class="card stat"><div class="lab">{0}</div><div class="val">{1}</div><div class="meta">{2}</div></div>' -f (ConvertTo-HtmlText $B.Label), (ConvertTo-HtmlText $B.Value), $meta)
-        }
-        'chart' {
-            $spec = $B.Spec
-            if ($spec -and $spec.kind) {
-                if (-not $B.Title -and $spec.title) { $head = '<h3>' + (ConvertTo-HtmlText ([string]$spec.title)) + '</h3>' + $head }
-                elseif ($B.Title -and $spec.title -and ([string]$spec.title).Trim() -ne ([string]$B.Title).Trim()) { $head += '<div class="sub">' + (ConvertTo-HtmlText ([string]$spec.title)) + '</div>' }
-                $json = $spec | ConvertTo-Json -Depth 8 -Compress
-                $fallback = ''
-                if ($B.Src) { $fallback = '<img class="fb" src="{0}" alt="{1}">' -f $B.Src, (ConvertTo-Attr $B.Alt) }
-                return ('<div class="card cc">{0}<div class="bchart" data-chart="{1}">{2}</div></div>' -f $head, [System.Net.WebUtility]::HtmlEncode($json), $fallback)
-            }
-            if (-not $B.Title -and $B.Alt) { $head = '<h3>' + (ConvertTo-HtmlText $B.Alt) + '</h3>' + $head }
-            if ($B.Src) { return ('<div class="card cc">{0}<div class="bimg"><img src="{1}" alt="{2}"></div><div class="note">Chart type not redrawn; Excel''s own picture of this chart is shown.</div></div>' -f $head, $B.Src, (ConvertTo-Attr $B.Alt)) }
-            return ('<div class="card cc">{0}<div class="miss">&#9888; This chart could not be read from Wkly_Report.</div></div>' -f $head)
-        }
-        'image' {
-            if (-not $B.Src) { return '' }
-            return ('<div class="card cc">{0}<div class="bimg"><img src="{1}" alt="{2}"></div></div>' -f $head, $B.Src, (ConvertTo-Attr $B.Alt))
-        }
-        'missing' { return ('<div class="card cc">{0}<div class="miss">&#9888; {1}</div></div>' -f $head, (ConvertTo-HtmlText $B.Alt)) }
-        'table' { return ('<div class="card tc">{0}{1}</div>' -f $head, (ConvertTo-TableHtml $B.Cells)) }
-        'text' {
-            $ps = $B.Pieces
-            $sb = New-Object System.Text.StringBuilder
-            $start = 0
-            $maxOther = 0.0
-            for ($i = 1; $i -lt $ps.Count; $i++) { if ($ps[$i].Size -gt $maxOther) { $maxOther = $ps[$i].Size } }
-            if ($ps.Count -ge 2 -and ($ps[0].Bold -or $ps[0].Size -gt $maxOther + 0.5) -and $ps[0].Text.Length -le 90) {
-                [void]$sb.Append('<h3>' + (ConvertTo-HtmlText $ps[0].Text) + '</h3>'); $start = 1
-            }
-            [void]$sb.Append('<div class="lines">')
-            for ($i = $start; $i -lt $ps.Count; $i++) {
-                $p = $ps[$i]
-                $cls = 'ln'; if ($p.Bold) { $cls = 'ln b' }
-                [void]$sb.Append('<p class="' + $cls + '">' + (ConvertTo-BText $p.Text) + '</p>')
-            }
-            [void]$sb.Append('</div>')
-            return ('<div class="card txt">{0}</div>' -f $sb.ToString())
-        }
+function Build-BSummary {
+    param($Page, $Used)
+    $tx = Get-BTexts $Page
+    $rec = @($tx | Where-Object { $_.Text -match '^Recommendations' } | Select-Object -First 1)
+    $split = 470.0; if ($rec.Count) { $split = $rec[0].L - 5 }
+    $log = @($tx | Where-Object { $_.Text -match 'UPDATE LOG' } | Select-Object -First 1)
+    $bottom = 1e9; if ($log.Count) { $bottom = $log[0].T - 2 }
+    $top = $Page.StartY + 60
+    if ($rec.Count) { $top = $rec[0].T - 5 }
+    # summary (left): bigger heading followed by its sentence
+    $left = @($tx | Where-Object { $_.L -lt $split -and $_.T -gt $top - 10 -and $_.T -lt $bottom } | Sort-Object T, L)
+    $notes = New-Object System.Collections.Generic.List[object]
+    $cur = $null
+    foreach ($t in $left) {
+        if ($t.Size -ge 10) { $cur = [pscustomobject]@{ Head = $t.Text; Body = '' }; $notes.Add($cur); continue }
+        if ($cur) { $cur.Body = ($cur.Body + ' ' + $t.Text).Trim() }
     }
-    return ''
-}
-
-function ConvertTo-BlockLayout {
-    # Cards keep Excel's arrangement: rows of cards side by side (widths in Excel's proportions),
-    # cards that sit under each other in Excel stay stacked in the same column.
-    param($Blocks)
+    # recommendations (right): number, title, sentence
+    $right = @($tx | Where-Object { $_.L -ge $split -and $_.T -gt $top + 5 -and $_.T -lt $bottom } | Sort-Object T, L)
+    $recs = New-Object System.Collections.Generic.List[object]
+    $cur = $null
+    foreach ($t in $right) {
+        if ($t.Text -match '^\d{2}$') { continue }
+        if ($t.Size -ge 10) { $cur = [pscustomobject]@{ Head = $t.Text; Body = '' }; $recs.Add($cur); continue }
+        if ($cur) { $cur.Body = ($cur.Body + ' ' + $t.Text).Trim() }
+    }
     $sb = New-Object System.Text.StringBuilder
-    $sorted = @($Blocks | Sort-Object T, L)
-    $bands = New-Object System.Collections.Generic.List[object]
-    $cur = $null; $curBottom = -1e9
-    foreach ($b in $sorted) {
-        if ($null -ne $cur -and $b.T -lt $curBottom - 8) { $cur.Add($b); $curBottom = [math]::Max($curBottom, $b.T + $b.H); continue }
-        $cur = New-Object System.Collections.Generic.List[object]; $cur.Add($b); $bands.Add($cur); $curBottom = $b.T + $b.H
-    }
-    foreach ($band in $bands) {
-        # columns: cards whose horizontal ranges overlap are stacked
-        $cols = New-Object System.Collections.Generic.List[object]
-        foreach ($b in ($band | Sort-Object L, T)) {
-            $placed = $false
-            foreach ($c in $cols) {
-                $ox = [math]::Min($c.R, $b.L + $b.W) - [math]::Max($c.L, $b.L)
-                if ($ox -gt 0.3 * [math]::Min($c.R - $c.L, $b.W)) { $c.Items.Add($b); $c.L = [math]::Min($c.L, $b.L); $c.R = [math]::Max($c.R, $b.L + $b.W); $placed = $true; break }
-            }
-            if (-not $placed) {
-                $nc = [pscustomobject]@{ L = $b.L; R = $b.L + $b.W; Items = (New-Object System.Collections.Generic.List[object]) }
-                $nc.Items.Add($b); $cols.Add($nc)
-            }
+    [void]$sb.Append('<div class="grid g2"><div class="card notes"><h3>Summary</h3>' + (ConvertTo-BNotes $notes) + '</div>')
+    $rt = 'Recommendations'; if ($rec.Count) { $rt = $rec[0].Text }
+    [void]$sb.Append('<div class="card"><h3>' + (ConvertTo-BEnc $rt) + '</h3><ol class="reco">')
+    foreach ($r in $recs) { [void]$sb.Append('<li><div><b>' + (ConvertTo-BEnc $r.Head) + '</b><br><span style="color:var(--ink-2);font-size:17px">' + (ConvertTo-BEnc $r.Body) + '</span></div></li>') }
+    [void]$sb.Append('</ol></div></div>')
+    $tb = Get-BShapeTable $Page $tx '^Week$'
+    if ($tb -and $tb.Rows.Count) {
+        $title = 'Weekly update log'; if ($log.Count) { $title = (Get-Culture).TextInfo.ToTitleCase((($log[0].Text -replace '^[^\p{L}]+', '')).ToLowerInvariant()) }
+        [void]$sb.Append('<div class="card" style="margin-top:16px"><h3>' + (ConvertTo-BEnc $title) + '</h3><table><thead><tr>')
+        foreach ($h in $tb.Heads) { [void]$sb.Append('<th>' + (ConvertTo-BEnc $h.Text) + '</th>') }
+        [void]$sb.Append('</tr></thead><tbody>')
+        $skipped = 0
+        foreach ($r in $tb.Rows) {
+            $vals = New-Object System.Collections.Generic.List[string]
+            for ($k = 0; $k -lt $tb.Heads.Count; $k++) { $v = ''; if ($r.Cols.ContainsKey($k)) { $v = (@($r.Cols[$k] | ForEach-Object { $_.Text }) -join ' ') }; $vals.Add($v) }
+            $empty = $true
+            for ($k = 1; $k -lt $vals.Count; $k++) { if ($vals[$k] -and $vals[$k] -ne '[]') { $empty = $false } }
+            if ($empty) { $skipped++; continue }
+            [void]$sb.Append('<tr>')
+            foreach ($v in $vals) { [void]$sb.Append('<td>' + (ConvertTo-BEnc $v) + '</td>') }
+            [void]$sb.Append('</tr>')
         }
-        $allKpi = $true
-        foreach ($b in $band) { if ($b.Type -ne 'kpi') { $allKpi = $false } }
-        if ($allKpi -and $cols.Count -ge 2) {
-            $n = $cols.Count
-            $tpl = 'repeat({0},minmax(0,1fr))' -f $n
-            if ($n -gt 6) { $tpl = 'repeat(auto-fit,minmax(240px,1fr))' }
-            [void]$sb.Append('<div class="row kpis" style="grid-template-columns:' + $tpl + '">')
-            foreach ($c in $cols) { foreach ($b in ($c.Items | Sort-Object T)) { [void]$sb.Append((ConvertTo-BlockHtml $b)) } }
-            [void]$sb.Append('</div>')
-            continue
-        }
-        $parts = New-Object System.Collections.Generic.List[string]
-        foreach ($c in $cols) { $parts.Add(('minmax(0,{0}fr)' -f (Format-Num ([math]::Max(1.0, [math]::Round(($c.R - $c.L) / 10.0, 1)))))) }
-        [void]$sb.Append('<div class="row" style="grid-template-columns:' + ($parts -join ' ') + '">')
-        foreach ($c in $cols) {
-            [void]$sb.Append('<div class="col">')
-            foreach ($b in ($c.Items | Sort-Object T, L)) {
-                $html = ''
-                try { $html = ConvertTo-BlockHtml $b }
-                catch { Add-Issue -Severity Warning -Location ('Card "{0}"' -f $b.Title) -Message ('Could not be drawn: {0}' -f $_.Exception.Message) }
-                [void]$sb.Append($html)
-            }
-            [void]$sb.Append('</div>')
-        }
-        [void]$sb.Append('</div>')
+        [void]$sb.Append('</tbody></table></div>')
+        if ($skipped) { Write-Log ("Design B: {0} empty row(s) of the weekly update log (only '[]' placeholders) are not shown." -f $skipped) }
     }
     return $sb.ToString()
 }
 
-function ConvertTo-CoverHtml {
-    # Page 1 as the full-screen cover: title, the text around it and its label/value details on the
-    # left; KPI tiles found on the page on the right.
-    param($Page, $Blocks, $Meta)
-    $kpis = New-Object System.Collections.Generic.List[object]
-    $pieces = New-Object System.Collections.Generic.List[object]
-    $rest = New-Object System.Collections.Generic.List[object]
-    foreach ($b in $Blocks) {
-        if ($b.Type -eq 'kpi') { $kpis.Add($b) }
-        elseif ($b.Type -eq 'text') { foreach ($p in $b.Pieces) { $pieces.Add($p) } }
-        else { $rest.Add($b) }
-    }
-    $title = ([string]$Page.Title).Trim()
-    $eyebrow = New-Object System.Collections.Generic.List[string]
-    $tag = New-Object System.Collections.Generic.List[string]
-    $kv = New-Object System.Collections.Generic.List[object]
-    $seenTitle = $false
-    $ordered = @($pieces | Sort-Object T, L)
-    for ($i = 0; $i -lt $ordered.Count; $i++) {
-        $t = $ordered[$i].Text
-        if (-not $seenTitle -and $t -eq $title) { $seenTitle = $true; continue }
-        if ($t -match '^\s*([^:]{2,40}?)\s*:\s*(.+)$') { $kv.Add(@($Matches[1].Trim(), $Matches[2].Trim())); continue }
-        if ($t -match '^\s*([^:]{2,40}?)\s*:\s*$' -and $i + 1 -lt $ordered.Count) { $kv.Add(@($Matches[1].Trim(), $ordered[$i + 1].Text)); $i++; continue }
-        if ($seenTitle) { $tag.Add($t) } else { $eyebrow.Add($t) }
-    }
-    $labels = @{}
-    foreach ($pair in $kv) { $labels[$pair[0].ToLowerInvariant()] = $true }
-    foreach ($known in @(@('Reporting Period', $Meta.ReportingPeriod), @('Report Date', $Meta.ReportDate), @('Prepared By', $Meta.PreparedBy))) {
-        if ($known[1] -and -not $labels.ContainsKey($known[0].ToLowerInvariant())) { $kv.Add(@($known[0], $known[1])) }
-    }
+function Build-BGeneric {
+    # A page added to the workbook later: its KPI cards, charts and remaining text, in the same style.
+    param($Page, $Used)
+    $tx = Get-BTexts $Page
+    $tiles = Get-BTiles $Page $tx
     $sb = New-Object System.Text.StringBuilder
-    $cls = 'cover'; if ($kpis.Count -eq 0) { $cls = 'cover solo' }
-    [void]$sb.Append('<div class="' + $cls + '"><div class="card hero">')
-    if ($eyebrow.Count) { [void]$sb.Append('<div class="eyebrow">' + (ConvertTo-HtmlText ($eyebrow -join ' · ')) + '</div>') }
-    [void]$sb.Append('<h1>' + (ConvertTo-HtmlText $title) + '</h1>')
-    foreach ($t in $tag) { [void]$sb.Append('<div class="tg">' + (ConvertTo-HtmlText $t) + '</div>') }
-    if ($kv.Count) {
-        [void]$sb.Append('<dl class="kv">')
-        foreach ($pair in $kv) { [void]$sb.Append('<dt>' + (ConvertTo-HtmlText $pair[0]) + '</dt><dd>' + (ConvertTo-HtmlText $pair[1]) + '</dd>') }
-        [void]$sb.Append('</dl>')
+    [void]$sb.Append((ConvertTo-BGrid $tiles))
+    $inTiles = @{}
+    foreach ($t in $tiles) { if ($t.PSObject.Properties['Texts']) { foreach ($x in $t.Texts) { $inTiles[(Get-ItemId $x.Item)] = $true } } }
+    $restList = New-Object System.Collections.Generic.List[object]
+    foreach ($x in ($tx | Sort-Object T, L)) { if (-not $inTiles.ContainsKey((Get-ItemId $x.Item)) -and $x.Size -lt 17) { $restList.Add($x) } }
+    $rest = @($restList | ForEach-Object { $_ })
+    if ($rest.Count) {
+        $notes = New-Object System.Collections.Generic.List[object]
+        foreach ($t in $rest) { $notes.Add([pscustomobject]@{ Head = $t.Text; Body = '' }) }
+        [void]$sb.Append('<div class="card notes" style="margin-top:16px">' + (ConvertTo-BNotes $notes) + '</div>')
     }
-    if ($Classification) { [void]$sb.Append('<span class="conf-big">' + (ConvertTo-HtmlText $Classification) + '</span>') }
-    [void]$sb.Append('</div>')
-    if ($kpis.Count) {
-        [void]$sb.Append('<div class="cstats">')
-        foreach ($b in ($kpis | Sort-Object T, L)) { [void]$sb.Append((ConvertTo-BlockHtml $b)) }
-        [void]$sb.Append('</div>')
-    }
-    [void]$sb.Append('</div>')
-    if ($rest.Count) { [void]$sb.Append('<div class="cover-more">' + (ConvertTo-BlockLayout $rest) + '</div>') }
     return $sb.ToString()
 }
 
 function New-DesignBSite {
     # Writes ONE self-contained .html to $OutDir; pictures are read from $WorkDir\assets and embedded.
     param($Pages, [string]$OutDir, $Meta, [string]$WorkDir)
-    $sb = New-Object System.Text.StringBuilder
-    $n = $Pages.Count
-    $enc = { param($t) ConvertTo-HtmlText $t }
-    [void]$sb.Append("<!doctype html>`n<html lang=`"en`">`n<head>`n<meta charset=`"utf-8`">`n<meta name=`"viewport`" content=`"width=device-width,initial-scale=1`">`n")
-    [void]$sb.Append('<title>' + (& $enc $DashboardTitle) + '</title>' + "`n<style>`n" + $DesignBCss + "`n</style>`n</head>`n<body>`n")
-
-    # ---- page menu (hidden until opened)
-    [void]$sb.Append('<div class="scrim" id="scrim"></div><aside class="rail" id="rail"><button class="x" id="mClose" title="Close (Esc)">&times;</button>')
-    [void]$sb.Append('<div class="brand"><div class="logo"><span class="dot">IT</span>' + (& $enc $DashboardTitle) + '</div><small>' + (& $enc $Meta.FileName) + ' &middot; Wkly_Report</small></div><nav id="nav">')
-    foreach ($p in $Pages) { [void]$sb.Append(('<a href="#s{0}"><span class="ix">{0:D2}</span>{1}</a>' -f $p.Index, (& $enc $p.Title))) }
-    [void]$sb.Append('</nav><div class="foot">')
-    if ($Meta.ReportingPeriod) { [void]$sb.Append((& $enc $Meta.ReportingPeriod) + '<br>') }
-    [void]$sb.Append('Source: Wkly_Report &middot; read-only<br>Snapshot ' + (& $enc $Meta.Snapshot) + ' &middot; build ' + $ScriptBuild + '</div></aside>')
-
-    # ---- top bar
-    [void]$sb.Append("`n<main>`n<div class=`"top`">")
-    [void]$sb.Append(('<button class="menu-btn" id="mOpen" title="Pages"><span class="bars">&#9776;</span>Pages <small id="mPos">1 / {0}</small></button>' -f $n))
-    [void]$sb.Append('<h1>' + (& $enc $DashboardTitle) + '</h1>')
-    if ($Meta.ReportingPeriod) { [void]$sb.Append('<span class="chip">Period <b>' + (& $enc $Meta.ReportingPeriod) + '</b></span>') }
-    if ($Meta.ReportDate) { [void]$sb.Append('<span class="chip">Report date <b>' + (& $enc $Meta.ReportDate) + '</b></span>') }
-    [void]$sb.Append('<div class="zoom" title="Zoom (keys + and -)"><button class="btn" id="zOut">&minus;</button><span id="zVal">100%</span><button class="btn" id="zIn">+</button><button class="btn" id="zFit">Fit</button></div>')
-    [void]$sb.Append('<button class="btn" id="theme" title="Switch light / dark">Light / Dark</button><button class="btn" id="present" title="Presentation mode (P)">Present</button><button class="btn" onclick="window.print()">Print</button>')
-    if ($Classification) { [void]$sb.Append('<span class="tag-conf">' + (& $enc $Classification) + '</span>') }
-    [void]$sb.Append("</div>`n<div id=`"content`">`n")
-
-    # ---- pages
-    $colorIx = 0
+    $sections = New-Object System.Text.StringBuilder
+    $n = 0
     foreach ($p in $Pages) {
-        $hdr = $null; $blocks = $null
+        $n++
+        $used = New-Object System.Collections.Generic.List[object]
+        $tx = Get-BTexts $p
+        $body = ''
+        $kind = 'generic'
+        $t = [string]$p.Title
+        if ($p.Index -eq 1 -and -not ($p.Items | Where-Object { $_.Kind -eq 'image' -and $_.IsChart })) { $kind = 'cover' }
+        elseif ($t -match 'Executive') { $kind = 'exec' }
+        elseif ($t -match 'Incident Summary') { $kind = 'incident' }
+        elseif ($t -match 'Service Request') { $kind = 'sr' }
+        elseif ($t -match 'SLA') { $kind = 'sla' }
+        elseif ($t -match 'Priority') { $kind = 'priority' }
+        elseif ($t -match 'Agent') { $kind = 'agents' }
+        elseif ($t -match 'Resolution Time') { $kind = 'resolution' }
+        elseif ($t -match 'Risk') { $kind = 'risks' }
+        elseif ($t -match 'Summary') { $kind = 'summary' }
         try {
-            $hdr = Get-PageHeader $p
-            $hb = $hdr.Bottom
-            if ($p.Index -eq 1) { $hb = [double]$p.StartY - 1 }
-            $blocks = Get-PageBlocks -Page $p -HeaderBottom $hb
+            switch ($kind) {
+                'cover' { $body = Build-BCover $p $Pages $Meta }
+                'exec' { $body = Build-BExec $p $used }
+                'incident' { $body = Build-BIncident $p $used }
+                'sr' { $body = Build-BServiceRequests $p $used }
+                'sla' { $body = Build-BSla $p $used }
+                'priority' { $body = Build-BPriority $p $used }
+                'agents' { $body = Build-BAgents $p $used }
+                'resolution' { $body = Build-BResolution $p $used }
+                'risks' { $body = Build-BRisks $p $used }
+                'summary' { $body = Build-BSummary $p $used }
+                default { $body = Build-BGeneric $p $used }
+            }
+            if ($kind -ne 'cover') { $body += Get-BLeftoverCharts $p $used }
         }
-        catch { Add-Issue -Severity Warning -Location ('Page {0}' -f $p.Index) -Message ('Page content could not be arranged: {0}' -f (Format-ErrorDetail $_)) }
-        if ($null -eq $blocks) { $blocks = New-Object System.Collections.Generic.List[object] }
-        $isCover = $false
-        if ($p.Index -eq 1) {
-            $isCover = $true
-            foreach ($b in $blocks) { if ($b.Type -in 'chart', 'table') { $isCover = $false } }
+        catch {
+            Add-Issue -Severity Warning -Location ('Page {0}' -f $p.Index) -Message ('Design B page could not be built: {0}' -f (Format-ErrorDetail $_))
+            $body = '<div class="card"><div class="miss">This page could not be built - see the log.</div></div>'
         }
-        $counts = @{}
-        foreach ($b in $blocks) { if ($counts.ContainsKey($b.Type)) { $counts[$b.Type]++ } else { $counts[$b.Type] = 1 } }
-        $summary = (@($counts.Keys | Sort-Object | ForEach-Object { '{0} {1}' -f $counts[$_], $_ }) -join ', ')
-        $coverNote = ''
-        if ($isCover) { $coverNote = ' (cover)' }
-        Write-Log ("  page {0} '{1}': {2}{3}" -f $p.Index, $p.Title, $summary, $coverNote)
-        if ($isCover) {
-            [void]$sb.Append(('<section class="cvr" id="s{0}" data-t="{1}">' -f $p.Index, (ConvertTo-Attr $p.Title)))
-            $html = ''
-            try { $html = ConvertTo-CoverHtml -Page $p -Blocks $blocks -Meta $Meta }
-            catch { Add-Issue -Severity Warning -Location 'Cover' -Message ('Cover could not be drawn: {0}' -f (Format-ErrorDetail $_)) }
-            [void]$sb.Append($html + "</section>`n")
+        Write-Log ("  page {0} '{1}': Design B {2} page" -f $p.Index, $t, $kind)
+        if ($kind -eq 'cover') {
+            [void]$sections.Append(('<section id="s{0}" data-t="{1}">{2}</section>' -f $n, (ConvertTo-Attr 'Cover'), $body))
             continue
         }
-        $c = @('c0', 'c1', 'c2')[$colorIx % 3]; $colorIx++
-        [void]$sb.Append(('<section class="page {2}" id="s{0}" data-t="{1}">' -f $p.Index, (ConvertTo-Attr $p.Title), $c))
-        $sub = ''
-        if ($hdr -and $hdr.Sub) { $sub = '<p>' + (& $enc $hdr.Sub) + '</p>' }
-        [void]$sb.Append(('<div class="ph"><span class="no">{0:D2}</span><h2>{1}</h2>{2}</div><div class="pbd">' -f $p.Index, (& $enc $p.Title), $sub))
-        $layout = ''
-        try { $layout = ConvertTo-BlockLayout $blocks }
-        catch { Add-Issue -Severity Warning -Location ('Page {0}' -f $p.Index) -Message ('Page could not be drawn: {0}' -f (Format-ErrorDetail $_)) }
-        if (-not $layout) { $layout = '<div class="card txt"><div class="lines"><p class="ln">No content was found on this page of Wkly_Report.</p></div></div>' }
-        [void]$sb.Append($layout)
-        [void]$sb.Append(('</div><div class="pfoot"><span>{0} &middot; Wkly_Report rows {1}&ndash;{2}</span><span>Page <b>{3}</b> of {4}</span></div></section>' -f (& $enc $Classification), $p.StartRow, $p.EndRow, $p.Index, $n))
-        [void]$sb.Append("`n")
+        $sub = Get-BSubtitle $p $tx
+        [void]$sections.Append(('<section id="s{0}" data-t="{1}"><div class="sh"><span class="no">{0:D2}</span><h2>{2}</h2><p>{3}</p></div>{4}</section>' -f $n, (ConvertTo-Attr $t), (ConvertTo-BEnc $t), (ConvertTo-BEnc $sub), $body))
+        [void]$sections.Append("`n")
     }
-    [void]$sb.Append("</div>`n</main>`n")
-    [void]$sb.Append('<div class="hud"><span id="hpos"></span><button class="btn" id="hp">&#9664;</button><button class="btn" id="hn">&#9654;</button><button class="btn" id="hx">Exit (Esc)</button></div>')
-    [void]$sb.Append("`n<script>`n" + $DesignBJs + "`n</script>`n</body>`n</html>`n")
-
-    $html = $sb.ToString()
+    $html = $DesignBShell
+    $html = $html.Replace('{{TITLE}}', (ConvertTo-BEnc $DashboardTitle))
+    $html = $html.Replace('{{CSS}}', $DesignBCss)
+    $chips = ''
+    if ($Meta.ReportingPeriod) { $chips += '<span class="chip">Period <b>' + (ConvertTo-BEnc $Meta.ReportingPeriod) + '</b></span>' }
+    if ($Meta.ReportDate) { $chips += '<span class="chip">Report date <b>' + (ConvertTo-BEnc $Meta.ReportDate) + '</b></span>' }
+    $html = $html.Replace('{{CHIPS}}', $chips)
+    $html = $html.Replace('{{CONF}}', (ConvertTo-BEnc $Classification))
+    $html = $html.Replace('{{FILE}}', (ConvertTo-BEnc $Meta.FileName))
+    $foot = ''
+    if ($Meta.ReportingPeriod) { $foot = (ConvertTo-BEnc $Meta.ReportingPeriod) + '<br>' }
+    $foot += 'Source: Wkly_Report &middot; read-only<br>Build ' + $ScriptBuild
+    $html = $html.Replace('{{RAILFOOT}}', $foot)
+    $html = $html.Replace('{{SECTIONS}}', $sections.ToString())
+    $html = $html.Replace('{{JS}}', $DesignBJs)
     # every picture is embedded so the single .html works when sent by email or Teams
     $embedded = @{}
     foreach ($m in [regex]::Matches($html, 'src="(assets/[^"]+)"')) {
@@ -2784,13 +3559,10 @@ function New-DesignBSite {
         if (-not (Test-Path -LiteralPath $file)) { Write-Log ("Picture {0} is missing and could not be embedded." -f $rel) 'WARN'; continue }
         $ext = [System.IO.Path]::GetExtension($file).ToLowerInvariant().TrimStart('.')
         $mime = 'image/png'
-        if ($ext -eq 'jpg' -or $ext -eq 'jpeg') { $mime = 'image/jpeg' } elseif ($ext -eq 'gif') { $mime = 'image/gif' } elseif ($ext -eq 'svg') { $mime = 'image/svg+xml' } elseif ($ext -eq 'bmp') { $mime = 'image/bmp' } elseif ($ext -eq 'webp') { $mime = 'image/webp' }
+        if ($ext -eq 'jpg' -or $ext -eq 'jpeg') { $mime = 'image/jpeg' } elseif ($ext -eq 'gif') { $mime = 'image/gif' } elseif ($ext -eq 'emf') { $mime = 'image/emf' }
         $embedded[$rel] = 'data:' + $mime + ';base64,' + [System.Convert]::ToBase64String([System.IO.File]::ReadAllBytes($file))
     }
     foreach ($rel in $embedded.Keys) { $html = $html.Replace('src="' + $rel + '"', 'src="' + $embedded[$rel] + '"') }
-    $external = [regex]::Matches($html, '(?:src|href)="assets/[^"]*"').Count
-    if ($external -gt 0) { Add-Issue -Severity Error -Location 'Dashboard file' -Message ("{0} reference(s) to pictures could not be embedded." -f $external) }
-
     $index = Join-Path $OutDir ($Meta.BaseName + '.html')
     [System.IO.File]::WriteAllText($index, $html, (New-Object System.Text.UTF8Encoding($false)))
     $mb = [math]::Round((Get-Item -LiteralPath $index).Length / 1MB, 1)
@@ -2799,485 +3571,341 @@ function New-DesignBSite {
 }
 
 # ======================================================================================
-#  Design B stylesheet and script (embedded in the single .html)
+#  Design B page shell, stylesheet and script (the approved sample, embedded in the single .html)
 # ======================================================================================
 
+$DesignBShell = @'
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{TITLE}}</title>
+<style>{{CSS}}</style>
+</head>
+<body data-conf="{{CONF}}">
+
+<div class="scrim" id="scrim"></div>
+<aside class="rail" id="rail">
+  <button class="x" id="mClose" title="Close (Esc)">&times;</button>
+  <div class="brand"><div class="logo"><span class="dot">IT</span>{{TITLE}}</div><small>{{FILE}} · Wkly_Report</small></div>
+  <nav id="nav"></nav>
+  <div class="foot">{{RAILFOOT}}</div>
+</aside>
+
+<main>
+<div class="top">
+  <button class="menu-btn" id="mOpen" title="Pages"><span class="bars">&#9776;</span>Pages <small id="mPos">1 / 10</small></button>
+  <h1>{{TITLE}}</h1>
+  {{CHIPS}}
+  <div class="zoom" title="Zoom (keys + and -)"><button class="btn" id="zOut">&minus;</button><span id="zVal">100%</span><button class="btn" id="zIn">+</button><button class="btn" id="zFit">Fit</button></div>
+  <button class="btn" id="theme" title="Switch light / dark">Light / Dark</button>
+  <button class="btn" id="present">Present</button>
+  <button class="btn" onclick="window.print()">Print</button>
+  <span class="tag-conf">{{CONF}}</span>
+</div>
+<div id="content">
+
+{{SECTIONS}}
+</div></main>
+<div class="hud"><span id="hpos"></span><button class="btn" id="hp">&#9664;</button><button class="btn" id="hn">&#9654;</button><button class="btn" id="hx">Exit</button></div>
+<script>{{JS}}</script>
+</body>
+</html>
+
+'@
+
 $DesignBCss = @'
+
 :root{
   color-scheme:light;
   --bg:#eeebe3;--surface:#ffffff;--surface-2:#f7f5ef;--line:#e1dccf;--ink:#0b0b0b;--ink-2:#52514e;--ink-3:#7c7b76;
-  --s1:#1e7d5a;--s3:#d39b1a;--s4:#8a8f98;--s8:#e34948;--c4:#4a4f58;--c5:#a86b0c;--c6:#6fbf9a;
+  --s1:#1e7d5a;--s2:#d39b1a;--s3:#d39b1a;--s4:#8a8f98;--c4:#4a4f58;--c5:#a86b0c;--c6:#6fbf9a;--s5:#e87ba4;--s6:#008300;--s7:#6250d6;--s8:#e34948;
   --good:#1a7f4b;--good-bg:#e3f4ea;--warn:#a66300;--warn-bg:#fbf0db;--bad:#c23b3a;--bad-bg:#fbe5e4;--info-bg:#ece9e0;
   --accent:#1e7d5a;--grid:#ebe7de;--shadow:0 1px 2px rgba(40,32,20,.08),0 6px 18px rgba(40,32,20,.07);
-  --rail:#262a31;--rail-ink:#ecebe7;--rail-ink-2:#b0ada5;--rail-on:rgba(255,255,255,.16);--page-bg:#fdfcf9;
-  --top-bg:#262a31;--top-ink:#ffffff;--top-ink-2:#c9c5bc;--top-btn:#3b414b;--top-btn-h:#4a515c;--top-btn-ink:#ffffff;--top-chip:#343943;
-  --menu-bg:#f2b33d;--menu-ink:#262a31;--conf-bg:#c8333a;--conf-ink:#ffffff;--top-line:transparent;
-  --h0:#262a31;--h1:#13805a;--h2:#a86b0c;--cover:#262a31;
+  --rail:#262a31;--rail-ink:#ecebe7;--rail-ink-2:#b0ada5;--rail-on:rgba(255,255,255,.16);--page-bg:#fdfcf9;--top-bg:#262a31;--top-ink:#ffffff;--top-ink-2:#c9c5bc;--top-btn:#3b414b;--top-btn-h:#4a515c;--top-btn-ink:#ffffff;--top-chip:#343943;--menu-bg:#f2b33d;--menu-ink:#262a31;--conf-bg:#c8333a;--conf-ink:#ffffff;--top-line:transparent;
 }
 @media (prefers-color-scheme:dark){:root:where(:not([data-theme="light"])){
   color-scheme:dark;--bg:#121211;--surface:#1a1a19;--surface-2:#222220;--line:#2e2e2b;--ink:#f0efec;--ink-2:#c3c2b7;--ink-3:#8f8e86;
-  --s1:#2f9d72;--s3:#b08018;--s4:#80868f;--s8:#e66767;--c4:#a3a8b1;--c5:#c98a2e;--c6:#7fcfa9;
-  --good:#4cc38a;--good-bg:#173226;--warn:#e0a640;--warn-bg:#33270f;--bad:#f07777;--bad-bg:#3a1b1b;--info-bg:#22242c;--accent:#2f9d72;--grid:#272725;--shadow:none;
-  --rail:#1b1d22;--rail-ink:#d7dbe4;--rail-ink-2:#8f96a3;--rail-on:rgba(255,255,255,.12);--page-bg:var(--surface);
-  --top-bg:color-mix(in srgb,var(--bg) 88%,transparent);--top-ink:var(--ink);--top-ink-2:var(--ink-3);--top-btn:var(--surface);--top-btn-h:var(--surface-2);--top-btn-ink:var(--ink);--top-chip:var(--surface);
-  --menu-bg:var(--rail);--menu-ink:#fff;--conf-bg:var(--bad-bg);--conf-ink:var(--bad);--top-line:var(--line);--h0:#30343c;--cover:#1f2228}}
+  --s1:#2f9d72;--s2:#b08018;--s3:#b08018;--s4:#80868f;--c4:#a3a8b1;--c5:#c98a2e;--c6:#7fcfa9;--s5:#d55181;--s6:#008300;--s7:#9085e9;--s8:#e66767;
+  --good:#4cc38a;--good-bg:#173226;--warn:#e0a640;--warn-bg:#33270f;--bad:#f07777;--bad-bg:#3a1b1b;--info-bg:#22242c;--accent:#2f9d72;--grid:#272725;--shadow:none;--rail:#1b1d22;--top-bg:color-mix(in srgb,var(--bg) 88%,transparent);--top-ink:var(--ink);--top-ink-2:var(--ink-3);--top-btn:var(--surface);--top-btn-h:var(--surface-2);--top-btn-ink:var(--ink);--top-chip:var(--surface);--menu-bg:var(--rail);--menu-ink:#fff;--conf-bg:var(--bad-bg);--conf-ink:var(--bad);--top-line:var(--line);--rail-ink:#d7e0f2;--rail-ink-2:#8c9cbd;--rail-on:rgba(255,255,255,.12);--page-bg:var(--surface)}}
 :root[data-theme="dark"]{
   color-scheme:dark;--bg:#121211;--surface:#1a1a19;--surface-2:#222220;--line:#2e2e2b;--ink:#f0efec;--ink-2:#c3c2b7;--ink-3:#8f8e86;
-  --s1:#2f9d72;--s3:#b08018;--s4:#80868f;--s8:#e66767;--c4:#a3a8b1;--c5:#c98a2e;--c6:#7fcfa9;
-  --good:#4cc38a;--good-bg:#173226;--warn:#e0a640;--warn-bg:#33270f;--bad:#f07777;--bad-bg:#3a1b1b;--info-bg:#22242c;--accent:#2f9d72;--grid:#272725;--shadow:none;
-  --rail:#1b1d22;--rail-ink:#d7dbe4;--rail-ink-2:#8f96a3;--rail-on:rgba(255,255,255,.12);--page-bg:var(--surface);
-  --top-bg:color-mix(in srgb,var(--bg) 88%,transparent);--top-ink:var(--ink);--top-ink-2:var(--ink-3);--top-btn:var(--surface);--top-btn-h:var(--surface-2);--top-btn-ink:var(--ink);--top-chip:var(--surface);
-  --menu-bg:var(--rail);--menu-ink:#fff;--conf-bg:var(--bad-bg);--conf-ink:var(--bad);--top-line:var(--line);--h0:#30343c;--cover:#1f2228}
+  --s1:#2f9d72;--s2:#b08018;--s3:#b08018;--s4:#80868f;--c4:#a3a8b1;--c5:#c98a2e;--c6:#7fcfa9;--s5:#d55181;--s6:#008300;--s7:#9085e9;--s8:#e66767;
+  --good:#4cc38a;--good-bg:#173226;--warn:#e0a640;--warn-bg:#33270f;--bad:#f07777;--bad-bg:#3a1b1b;--info-bg:#22242c;--accent:#2f9d72;--grid:#272725;--shadow:none;--rail:#1b1d22;--top-bg:color-mix(in srgb,var(--bg) 88%,transparent);--top-ink:var(--ink);--top-ink-2:var(--ink-3);--top-btn:var(--surface);--top-btn-h:var(--surface-2);--top-btn-ink:var(--ink);--top-chip:var(--surface);--menu-bg:var(--rail);--menu-ink:#fff;--conf-bg:var(--bad-bg);--conf-ink:var(--bad);--top-line:var(--line);--rail-ink:#d7e0f2;--rail-ink-2:#8c9cbd;--rail-on:rgba(255,255,255,.12);--page-bg:var(--surface)}
 *{box-sizing:border-box}
 html{scroll-behavior:smooth}
 body{margin:0;background:var(--bg);color:var(--ink);font:18px/1.45 "Segoe UI",system-ui,-apple-system,Arial,sans-serif;-webkit-print-color-adjust:exact;print-color-adjust:exact}
-/* page menu */
-.rail{position:fixed;inset:0 auto 0 0;width:300px;background:var(--rail);color:var(--rail-ink);display:flex;flex-direction:column;z-index:40;transform:translateX(-100%);transition:transform .22s ease}
+.sample{background:var(--warn-bg);color:var(--warn);text-align:center;font-size:12.5px;padding:7px 16px;border-bottom:1px solid var(--line)}
+/* rail */
+.rail{position:fixed;inset:0 auto 0 0;width:280px;background:var(--rail);color:var(--rail-ink);display:flex;flex-direction:column;z-index:40;transform:translateX(-100%);transition:transform .22s ease;box-shadow:none}
 body.menu .rail{transform:none;box-shadow:8px 0 32px rgba(20,18,15,.35)}
 .scrim{position:fixed;inset:0;background:rgba(20,18,15,.35);z-index:35;opacity:0;pointer-events:none;transition:opacity .2s}
 body.menu .scrim{opacity:1;pointer-events:auto}
 .rail .x{position:absolute;top:16px;right:14px;background:rgba(255,255,255,.12);border:0;color:#fff;width:30px;height:30px;border-radius:8px;font-size:16px;cursor:pointer}
-.brand{padding:22px 50px 18px 22px;border-bottom:1px solid rgba(255,255,255,.12)}
-.brand .logo{display:flex;align-items:center;gap:10px;font-weight:700;font-size:15px}
-.brand .dot{width:28px;height:28px;flex:none;border-radius:8px;background:#f2b33d;color:#262a31;display:grid;place-items:center;font-size:13px;font-weight:800}
-.brand small{display:block;color:var(--rail-ink-2);font-size:12px;margin-top:6px;overflow-wrap:anywhere}
-.rail nav{padding:12px 10px;overflow:auto;flex:1}
-.rail a{display:flex;align-items:center;gap:11px;padding:9px 12px;border-radius:9px;color:var(--rail-ink);text-decoration:none;font-size:14px}
-.rail a:hover{background:var(--rail-on);color:#fff}
-.rail a.on{background:var(--rail-on);color:#fff;font-weight:600;box-shadow:inset 3px 0 0 #f2b33d}
-.rail a .ix{font-variant-numeric:tabular-nums;color:var(--rail-ink-2);width:20px;flex:none;font-size:12px}
-.rail a.on .ix{color:#f2b33d}
-.rail .foot{padding:14px 22px;border-top:1px solid rgba(255,255,255,.12);font-size:11.5px;color:var(--rail-ink-2)}
-/* top bar */
-main{padding:0 32px 40px}
-.top{position:sticky;top:0;z-index:10;background:var(--top-bg);backdrop-filter:blur(8px);display:flex;align-items:center;gap:12px;padding:14px 32px;margin:0 -32px 8px;border-bottom:1px solid var(--top-line);color:var(--top-ink)}
-.top h1{font-size:23px;margin:0;flex:1;letter-spacing:-.2px;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.menu-btn{display:flex;align-items:center;gap:8px;padding:8px 13px;font-size:15px;font-weight:700;background:var(--menu-bg);color:var(--menu-ink);border:0;border-radius:10px;cursor:pointer;flex:none}
+.menu-btn{display:flex;align-items:center;gap:8px;padding:8px 13px;font-size:15px;font-weight:700;background:var(--menu-bg);color:var(--menu-ink);border:0;border-radius:10px;cursor:pointer}
 .menu-btn .bars{font-size:18px;line-height:1}
 .menu-btn small{font-weight:500;opacity:.85;font-size:12.5px}
-.chip{border:1px solid var(--top-line);background:var(--top-chip);border-radius:999px;padding:5px 12px;font-size:16px;color:var(--top-ink-2);white-space:nowrap;max-width:420px;overflow:hidden;text-overflow:ellipsis}
+.brand{padding:22px 22px 18px;border-bottom:1px solid rgba(255,255,255,.12)}
+.brand .logo{display:flex;align-items:center;gap:10px;font-weight:700;font-size:15px}
+.brand .dot{width:28px;height:28px;border-radius:8px;background:#f2b33d;color:#262a31!important;display:grid;place-items:center;color:#fff;font-size:13px;font-weight:800}
+.brand small{display:block;color:var(--rail-ink-2);font-size:12px;margin-top:6px}
+.rail nav{padding:12px 10px;overflow:auto;flex:1}
+.rail a{display:flex;align-items:center;gap:11px;padding:9px 12px;border-radius:9px;color:var(--rail-ink);text-decoration:none;font-size:13.5px}
+.rail a:hover{background:var(--rail-on);color:#fff}
+.rail a.on{background:var(--rail-on);color:#fff;font-weight:600;box-shadow:inset 3px 0 0 #f2b33d}
+.rail a .ix{font-variant-numeric:tabular-nums;color:var(--rail-ink-2);width:18px;font-size:12px}
+.rail a.on .ix{color:#f2b33d}
+.rail .foot{padding:14px 22px;border-top:1px solid rgba(255,255,255,.12);font-size:11.5px;color:var(--rail-ink-2)}
+/* main */
+main{margin-left:0;padding:0 32px 40px}
+.top{position:sticky;top:0;z-index:10;background:var(--top-bg);backdrop-filter:blur(8px);display:flex;align-items:center;gap:12px;padding:14px 32px;margin:0 -32px 8px;border-bottom:1px solid var(--top-line);color:var(--top-ink)}
+.top h1{font-size:23px;margin:0;flex:1;letter-spacing:-.2px}
+.top h1 span{color:var(--top-ink-2);font-weight:400}
+.chip{border:1px solid var(--top-line);background:var(--top-chip);border-radius:999px;padding:5px 12px;font-size:16px;color:var(--top-ink-2);white-space:nowrap}
 .chip b{color:var(--top-ink)}
-.btn{border:1px solid var(--line);background:var(--surface);color:var(--ink);border-radius:8px;padding:7px 12px;font:inherit;font-size:17px;cursor:pointer;white-space:nowrap}
+.btn{border:1px solid var(--line);background:var(--surface);color:var(--ink);border-radius:8px;padding:7px 12px;font:inherit;font-size:17px;cursor:pointer}
 .btn:hover{background:var(--surface-2)}
-.top .btn{background:var(--top-btn);color:var(--top-btn-ink);border-color:var(--top-line)}.top .btn:hover{background:var(--top-btn-h)}
-.tag-conf{font-size:14px;letter-spacing:1.2px;font-weight:700;padding:5px 9px;border-radius:6px;background:var(--conf-bg);color:var(--conf-ink);white-space:nowrap}
-.zoom{display:flex;align-items:center;gap:4px}
-.zoom .btn{padding:6px 10px;min-width:34px}
-.zoom span{font-size:16px;color:var(--top-ink-2);min-width:46px;text-align:center;font-variant-numeric:tabular-nums}
-/* pages */
-section{scroll-margin-top:80px}
-.page{--sec:var(--h0);background:var(--page-bg);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-top:26px}
-.page.c1{--sec:var(--h1)}.page.c2{--sec:var(--h2)}
-.ph{display:flex;align-items:center;gap:14px;padding:16px 24px;color:#fff;background:var(--sec)}
-.ph .no{background:rgba(255,255,255,.2);border-radius:8px;padding:4px 10px;font-weight:700;font-size:17px;font-variant-numeric:tabular-nums}
-.ph h2{margin:0;font-size:27px;letter-spacing:-.3px}
-.ph p{margin:0 0 0 auto;font-size:17px;opacity:.88;text-align:right}
-.pbd{padding:20px 24px 22px;display:flex;flex-direction:column;gap:16px}
-.pfoot{display:flex;justify-content:space-between;padding:10px 24px;border-top:1px solid var(--line);font-size:15px;color:var(--ink-3);background:var(--surface-2)}
-.pfoot b{color:var(--ink)}
-.row{display:grid;gap:16px;align-items:stretch}
-.col{display:flex;flex-direction:column;gap:16px;min-width:0}
-.col>.card{flex:1 1 auto}
+.tag-conf{font-size:14px;letter-spacing:1.2px;font-weight:700;color:var(--bad);background:var(--bad-bg);padding:5px 9px;border-radius:6px}
+section{scroll-margin-top:76px;padding-top:28px}
+.sh{display:flex;align-items:baseline;gap:12px;margin-bottom:14px}
+.sh .no{font-size:16px;font-weight:700;color:var(--accent);background:var(--info-bg);border-radius:6px;padding:2px 8px;font-variant-numeric:tabular-nums}
+.sh h2{margin:0;font-size:26px;letter-spacing:-.3px}
+.sh p{margin:0;color:var(--ink-3);font-size:17px}
+.grid{display:grid;gap:16px}
+.g6{grid-template-columns:repeat(6,1fr)}.g5{grid-template-columns:repeat(5,1fr)}.g4{grid-template-columns:repeat(4,1fr)}.g3{grid-template-columns:repeat(3,1fr)}.g2{grid-template-columns:1fr 1fr}.g12{grid-template-columns:1.6fr 1fr}.g21{grid-template-columns:1fr 1.6fr}
 .card{background:var(--surface);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);padding:16px 18px;min-width:0}
-.card h3{margin:0 0 2px;font-size:19px;color:color-mix(in srgb,var(--sec,var(--ink)) 70%,var(--ink))}
-:root[data-theme="dark"] .card h3{color:var(--ink)}
-@media (prefers-color-scheme:dark){:root:not([data-theme="light"]) .card h3{color:var(--ink)}}
+.card h3{margin:0 0 2px;font-size:18px}
 .card .sub{color:var(--ink-3);font-size:16px;margin-bottom:10px}
-/* KPI tiles */
-.stat{border-top:3px solid var(--sec,var(--accent));background:linear-gradient(180deg,color-mix(in srgb,var(--sec,var(--accent)) 7%,var(--surface)),var(--surface) 70%)}
-.stat .lab{color:var(--ink-2);font-size:17px}
-.stat .val{font-size:38px;font-weight:650;letter-spacing:-.6px;font-variant-numeric:tabular-nums;margin:4px 0 2px;overflow-wrap:anywhere}
-.stat .meta{font-size:16px;color:var(--ink-3);display:flex;gap:4px 10px;align-items:center;flex-wrap:wrap}
-.pill{display:inline-flex;align-items:center;border-radius:999px;padding:1px 9px;font-size:15px;font-weight:600}
+/* stat tiles */
+.stat .lab{color:var(--ink-2);font-size:16px}
+.stat .val{font-size:36px;font-weight:650;letter-spacing:-.6px;font-variant-numeric:tabular-nums;margin:4px 0 2px}
+.stat .meta{font-size:16px;color:var(--ink-3);display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.pill{display:inline-flex;align-items:center;gap:4px;border-radius:999px;padding:1px 8px;font-size:15px;font-weight:600}
 .ok{color:var(--good);background:var(--good-bg)}.wn{color:var(--warn);background:var(--warn-bg)}.bd{color:var(--bad);background:var(--bad-bg)}.nt{color:var(--ink-2);background:var(--surface-2)}
-/* text cards */
-.txt .lines{display:flex;flex-direction:column;gap:6px;margin-top:6px}
-.txt .ln{margin:0;color:var(--ink-2);font-size:17px;white-space:pre-wrap}
-.txt .ln.b{color:var(--ink);font-weight:600}
+.bar{height:6px;border-radius:3px;background:var(--surface-2);overflow:hidden;margin-top:8px}.bar i{display:block;height:100%;border-radius:3px;background:var(--accent)}
+/* charts */
+.chart{position:relative}
+.chart svg{display:block;max-width:100%;overflow:visible}
+.chart .ax{fill:var(--ink-3);font-size:14px}
+.chart .gl{stroke:var(--grid)}
+.chart .base{stroke:var(--line)}
+.chart .lbl{fill:var(--ink-2);font-size:14px;font-variant-numeric:tabular-nums}
+.chart .hit{fill:transparent}
+.legend{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:16px;color:var(--ink-2);margin-top:6px}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px;vertical-align:-1px}
+.tip{position:absolute;pointer-events:none;background:var(--ink);color:var(--surface);font-size:16px;padding:6px 9px;border-radius:7px;white-space:nowrap;display:none;z-index:5;box-shadow:0 4px 14px rgba(0,0,0,.2)}
+.tip b{font-variant-numeric:tabular-nums}
 /* tables */
-.tblwrap{overflow-x:auto}
 table{border-collapse:collapse;width:100%;font-size:17px}
 th{text-align:left;font-weight:600;color:var(--ink-3);font-size:15px;letter-spacing:.3px;text-transform:uppercase;padding:8px 10px;border-bottom:1px solid var(--line)}
 td{padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:top}
-td.n,th.n{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
 tr.total td{font-weight:650;border-bottom:0}
-/* charts */
-.bchart{position:relative;margin-top:6px}
-.bchart svg{display:block;width:100%;overflow:visible}
-.bchart .fb{display:none}
-.bchart.err .fb{display:block;width:100%}
-.bchart .ax{fill:var(--ink-3);font-size:14px}
-.bchart .gl{stroke:var(--grid)}
-.bchart .base{stroke:var(--line)}
-.bchart .lbl{fill:var(--ink-2);font-size:14px;font-variant-numeric:tabular-nums;paint-order:stroke;stroke:var(--surface);stroke-width:4px;stroke-linejoin:round}
-.bchart .hit{fill:transparent}
-.legend{display:flex;flex-wrap:wrap;gap:4px 16px;font-size:16px;color:var(--ink-2);margin-top:8px}
-.legend i{display:inline-block;width:11px;height:11px;border-radius:3px;margin-right:6px;vertical-align:-1px}
-.legend i.ln{height:3px;width:16px;vertical-align:4px}
-.tip{position:absolute;pointer-events:none;background:var(--ink);color:var(--surface);font-size:16px;padding:6px 9px;border-radius:7px;white-space:nowrap;display:none;z-index:5;box-shadow:0 4px 14px rgba(0,0,0,.2)}
-.bimg img{display:block;max-width:100%;height:auto;margin:6px auto 0}
-.note{font-size:14px;color:var(--ink-3);margin-top:6px}
-.miss{border:1.5px dashed var(--bad);background:var(--bad-bg);color:var(--bad);border-radius:10px;padding:14px;font-weight:600}
-.xerr{outline:2px dashed var(--bad);outline-offset:1px;border-radius:2px;cursor:help}
+.inbar{position:relative}
+.inbar span{position:absolute;inset:6px auto 6px 0;background:var(--info-bg);border-radius:4px;z-index:0}
+.inbar b{position:relative;font-weight:500}
 /* cover */
-.cvr{height:var(--coverH,calc(100vh - 110px));min-height:520px;display:flex;flex-direction:column;margin-top:10px}
-.cover{flex:1;min-height:0;display:grid;grid-template-columns:1.55fr 1fr;gap:20px}
-.cover.solo{grid-template-columns:1fr}
-.hero{display:flex;flex-direction:column;justify-content:center;padding:4vh 4.5vw;overflow:hidden;background:var(--cover);color:#fff;border:0;border-radius:22px}
-.hero .eyebrow{color:#f2b33d;font-size:clamp(13px,min(1.2vw,2vh),20px);letter-spacing:3px;text-transform:uppercase;font-weight:700}
-.hero h1{font-size:clamp(38px,min(5.2vw,9vh),96px);line-height:1.02;margin:2.2vh 0 1.4vh;letter-spacing:-1.5px}
-.hero .tg{color:#ecebe7;font-size:clamp(15px,min(1.5vw,2.5vh),26px);margin-bottom:1vh}
-.hero .kv{display:grid;grid-template-columns:max-content 1fr;font-size:clamp(15px,min(1.4vw,2.4vh),26px);gap:1.4vh 28px;margin-top:3vh}
-.hero .kv dt{color:#b8b4aa}.hero .kv dd{color:#fff;margin:0;font-weight:600}
-.hero .conf-big{margin-top:4vh;display:inline-block;align-self:flex-start;border:2px solid #f2b33d;color:#f2b33d;border-radius:8px;padding:6px 14px;letter-spacing:4px;font-weight:700;font-size:clamp(12px,1vw,16px)}
-.cstats{display:flex;flex-direction:column;gap:20px;min-height:0}
-.cstats .stat{flex:1;display:flex;flex-direction:column;justify-content:center;padding:2vh 2vw;border-radius:22px;border-top:0;border-left:6px solid var(--s3);background:var(--surface)}
-.cstats .stat:nth-child(3n+1){border-left-color:var(--h0)}.cstats .stat:nth-child(3n+2){border-left-color:var(--s1)}
-.cstats .stat .lab{font-size:clamp(14px,min(1.25vw,2.1vh),22px)}
-.cstats .stat .val{font-size:clamp(32px,min(4.2vw,7vh),76px);letter-spacing:-1.5px}
-.cstats .stat .meta{font-size:clamp(12px,min(1vw,1.8vh),18px)}
-.cover-more{margin-top:20px;display:flex;flex-direction:column;gap:16px}
+.cover{display:grid;grid-template-columns:1.4fr 1fr;gap:16px}
+.cover .hero{padding:34px 34px 30px;background:linear-gradient(135deg,var(--info-bg),var(--surface) 70%)}
+.cover .eyebrow{font-size:15px;letter-spacing:1.6px;text-transform:uppercase;color:var(--accent);font-weight:700}
+.cover h1{font-size:44px;letter-spacing:-.8px;margin:12px 0 6px}
+.cover .tg{color:var(--ink-2);margin-bottom:26px}
+.kv{display:grid;grid-template-columns:max-content 1fr;gap:8px 18px;font-size:18px}
+.kv dt{color:var(--ink-3)}.kv dd{margin:0;font-weight:600}
+.notes .n{display:flex;gap:12px;padding:12px 0;border-bottom:1px solid var(--line)}
+.notes .n:last-child{border-bottom:0}
+.notes .ic{flex:none;width:28px;height:28px;border-radius:8px;display:grid;place-items:center;font-size:18px}
+.notes b{display:block;font-size:18px}
+.notes span{color:var(--ink-2);font-size:17px}
+.reco{counter-reset:r}
+.reco li{list-style:none;display:flex;gap:12px;padding:11px 0;border-bottom:1px solid var(--line)}
+.reco li::before{counter-increment:r;content:counter(r,decimal-leading-zero);flex:none;width:30px;height:30px;border-radius:8px;background:var(--info-bg);color:var(--accent);font-weight:700;display:grid;place-items:center;font-size:16px}
+.reco{padding:0;margin:0}
+.enh{display:grid;grid-template-columns:repeat(5,1fr);gap:12px}
+.enh .card{padding:14px}
+.enh .id{font-size:15px;font-weight:700;color:var(--ink-3)}
+.enh h4{margin:6px 0 6px;font-size:18px}
+.enh p{margin:8px 0 0;color:var(--ink-2);font-size:16px}
+.foot{margin-top:36px;color:var(--ink-3);font-size:16px;display:flex;justify-content:space-between;border-top:1px solid var(--line);padding-top:14px}
+/* pages */
+section{--sec:var(--s1)}
+section:nth-of-type(3n+2){--sec:#262a31}section:nth-of-type(3n+3){--sec:#13805a}section:nth-of-type(3n+4){--sec:#a86b0c}
+.page{background:var(--page-bg);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-top:26px}
+.ph{display:flex;align-items:center;gap:14px;padding:16px 24px;color:#fff;background:var(--sec)}
+.ph .no{background:rgba(255,255,255,.2);border-radius:8px;padding:4px 10px;font-weight:700;font-size:17px;font-variant-numeric:tabular-nums}
+.ph h2{margin:0;font-size:27px;letter-spacing:-.3px}
+.ph p{margin:0 0 0 auto;font-size:17px;opacity:.85}
+.pbd{padding:20px 24px 22px}
+.pfoot{display:flex;justify-content:space-between;padding:10px 24px;border-top:1px solid var(--line);font-size:15px;color:var(--ink-3);background:var(--surface-2)}
+.pfoot b{color:var(--sec)}
+section{padding-top:0}
+.pbd .card.stat{border-top:3px solid var(--sec);background:linear-gradient(180deg,color-mix(in srgb,var(--sec) 7%,var(--surface)),var(--surface) 70%)}
+.pbd .card h3{color:color-mix(in srgb,var(--sec) 70%,var(--ink))}
+:root[data-theme="dark"] .pbd .card h3{color:var(--ink)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]) .pbd .card h3{color:var(--ink)}}
+/* top bar buttons */
+.top .btn{background:var(--top-btn);color:var(--top-btn-ink);border-color:var(--top-line)}.top .btn:hover{background:var(--top-btn-h)}
+.top .tag-conf{background:var(--conf-bg);color:var(--conf-ink)}
+/* zoom */
+.zoom{display:flex;align-items:center;gap:4px}
+.zoom .btn{padding:6px 10px;min-width:34px}
+.zoom span{font-size:16px;color:var(--top-ink-2);min-width:46px;text-align:center;font-variant-numeric:tabular-nums}
+/* big cover */
+#s1{height:var(--coverH,calc(100vh - 120px));min-height:520px;display:flex;flex-direction:column}
+#s1 .cover{flex:1;min-height:0;grid-template-columns:1.55fr 1fr;gap:20px}
+#s1 .hero{display:flex;flex-direction:column;justify-content:center;padding:4vh 4.5vw;overflow:hidden;background:#262a31;color:#fff;border:0;border-radius:22px}
+#s1 .eyebrow{color:#f2b33d;font-size:clamp(13px,min(1.2vw,2vh),20px);letter-spacing:3px}
+#s1 h1{font-size:clamp(38px,min(5.2vw,9vh),96px);line-height:1.02;margin:2.2vh 0 1.4vh;letter-spacing:-1.5px}
+#s1 .tg{color:#ecebe7;font-size:clamp(15px,min(1.5vw,2.5vh),26px);margin-bottom:4vh}
+#s1 .kv{font-size:clamp(15px,min(1.4vw,2.4vh),26px);gap:1.4vh 28px}
+#s1 .kv dt{color:#b8b4aa}#s1 .kv dd{color:#fff}
+#s1 .stat{display:flex;flex-direction:column;justify-content:center;padding:2vh 2vw;min-height:0;border-radius:22px;border-top:0;border-left:6px solid var(--s3)}
+#s1 .stat:nth-child(1){border-left-color:#262a31}#s1 .stat:nth-child(2){border-left-color:var(--s1)}#s1 .stat:nth-child(3){border-left-color:var(--s3)}
+#s1 .stat .lab{font-size:clamp(14px,min(1.25vw,2.1vh),22px)}
+#s1 .stat .val{font-size:clamp(32px,min(4.2vw,7vh),76px);letter-spacing:-1.5px}
+#s1 .stat .meta{font-size:clamp(12px,min(1vw,1.8vh),18px)}
+#s1 .conf-big{margin-top:4vh;display:inline-block;align-self:flex-start;border:2px solid #f2b33d;color:#f2b33d;border-radius:8px;padding:6px 14px;letter-spacing:4px;font-weight:700;font-size:clamp(12px,1vw,16px)}
 /* presentation */
-.hud{display:none}
-body.present .rail,body.present .scrim,body.present .top{display:none}
-body.present main{padding:20px 32px}
-body.present section{display:none;margin-top:0}
+body.present .rail,body.present .scrim,body.present .top,body.present .sample{display:none}
+body.present main{margin:0;padding:24px 40px}
+body.present section{display:none;min-height:calc(100vh - 48px)}
 body.present section.cur{display:block}
-body.present .hud{display:flex;position:fixed;right:18px;bottom:18px;gap:6px;align-items:center;background:var(--surface);border:1px solid var(--line);border-radius:999px;padding:5px 6px 5px 14px;font-size:14px;box-shadow:var(--shadow);z-index:30}
+.hud{display:none}
+body.present .hud{display:flex;position:fixed;right:18px;bottom:18px;gap:6px;align-items:center;background:var(--surface);border:1px solid var(--line);border-radius:999px;padding:5px 6px 5px 14px;font-size:12px;box-shadow:var(--shadow);z-index:30}
+@media (max-width:1280px){.g6{grid-template-columns:repeat(3,1fr)}.g5{grid-template-columns:repeat(3,1fr)}.enh{grid-template-columns:repeat(3,1fr)}}
 @media (max-width:1600px){.top .chip{display:none}}
-@media (max-width:980px){main{padding:0 16px 30px}.top{margin:0 -16px 8px;padding:12px 16px}.row{grid-template-columns:1fr!important}.cover{grid-template-columns:1fr}.cvr{height:auto}}
-@media print{@page{size:A4 landscape;margin:8mm}body{background:#fff}.rail,.scrim,.top,.hud{display:none!important}main{padding:0}section{break-after:page}.page{margin:0;box-shadow:none}.card{box-shadow:none}.cvr{height:180mm}#content{zoom:1!important}}
+@media (max-width:980px){.rail{display:none}main{margin:0;padding:0 16px 30px}.g4,.g3,.g2,.g12,.g21,.cover{grid-template-columns:1fr}.g6,.g5,.enh{grid-template-columns:1fr 1fr}.top .chip{display:none}}
+@media print{@page{size:A4 landscape;margin:10mm}.rail,.top,.sample,.hud{display:none!important}main{margin:0;padding:0}section{break-after:page;padding-top:0}.card{box-shadow:none}}
+.g1{grid-template-columns:1fr}
+.miss{border:1.5px dashed var(--bad);background:var(--bad-bg);color:var(--bad);border-radius:10px;padding:14px;font-weight:600;margin-top:8px}
+.val.miss-v{color:var(--ink-3)}
+.bimg img{display:block;max-width:100%;height:auto;margin:8px auto 0;border-radius:8px}
+.note{font-size:14px;color:var(--ink-3);margin-top:8px}
+.xerr{outline:2px dashed var(--bad);outline-offset:1px;border-radius:2px;cursor:help}
+td .pill{white-space:nowrap}
+
 '@
 
 $DesignBJs = @'
-(function () {
-  'use strict';
-  var body = document.body, root = document.documentElement;
-  var secs = [].slice.call(document.querySelectorAll('#content > section'));
-  var ERR = /#(DIV\/0!|N\/A|VALUE!|REF!|NAME\?|NUM!|NULL!|SPILL!|CALC!|FIELD!|BLOCKED!|CONNECT!|BUSY!|UNKNOWN!|GETTING_DATA)/g;
-  // Excel error values are shown exactly as displayed, with an outline so they are noticed.
-  (function () {
-    var w = document.createTreeWalker(document.getElementById('content'), NodeFilter.SHOW_TEXT, null), hits = [];
-    while (w.nextNode()) { ERR.lastIndex = 0; if (ERR.test(w.currentNode.nodeValue)) hits.push(w.currentNode); }
-    hits.forEach(function (t) {
-      var s = t.nodeValue, frag = document.createDocumentFragment(), last = 0, m;
-      ERR.lastIndex = 0;
-      while ((m = ERR.exec(s))) {
-        if (m.index > last) frag.appendChild(document.createTextNode(s.slice(last, m.index)));
-        var sp = document.createElement('span'); sp.className = 'xerr'; sp.title = 'Excel error value - shown exactly as in Wkly_Report';
-        sp.textContent = m[0]; frag.appendChild(sp); last = m.index + m[0].length;
-      }
-      if (last < s.length) frag.appendChild(document.createTextNode(s.slice(last)));
-      t.parentNode.replaceChild(frag, t);
-    });
-  })();
 
-  // ---------- number formats (Excel's format codes, so labels read as in Excel)
-  function decimalsOf(nf) { var m = /0\.(0+)/.exec(nf || ''); return m ? m[1].length : 0; }
-  function fmt(v, nf) {
-    if (v === null || v === undefined || isNaN(v)) return '';
-    nf = nf || 'General';
-    var sec = nf.split(';');
-    if (v === 0 && sec.length > 2) { var z = sec[2].replace(/_.|\*.|["\\\s]/g, ''); if (/^[-–]$/.test(z)) return '-'; }
-    if (v < 0 && sec.length > 1) nf = sec[1]; else nf = sec[0];
-    if (/general/i.test(nf)) { var r = Math.round(v * 100) / 100; return Math.abs(r) >= 1000 ? r.toLocaleString('en-US') : String(r); }
-    if (/\[?h\]?:mm/i.test(nf)) {
-      var t = Math.round(Math.abs(v) * 86400), h = Math.floor(t / 3600), mi = Math.floor(t % 3600 / 60), s2 = t % 60;
-      return h + ':' + (mi < 10 ? '0' : '') + mi + (/ss/i.test(nf) ? ':' + (s2 < 10 ? '0' : '') + s2 : '');
-    }
-    var d = decimalsOf(nf), pct = nf.indexOf('%') >= 0, x = Math.abs(pct ? v * 100 : v);
-    var str = x.toFixed(d);
-    if (nf.indexOf(',') >= 0) { var parts = str.split('.'); parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ','); str = parts.join('.'); }
-    if (v < 0 && sec.length < 2) str = '-' + str;
-    return str + (pct ? '%' : '');
-  }
-  function esc(t) { return String(t === null || t === undefined ? '' : t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
-  function niceAxis(min, max) {
-    if (min > 0) min = 0;
-    if (max <= min) max = min + 1;
-    var span = max - min, step = Math.pow(10, Math.floor(Math.log10(span / 4))), f = span / 4 / step;
-    step *= f <= 1 ? 1 : f <= 2 ? 2 : f <= 2.5 ? 2.5 : f <= 5 ? 5 : 10;
-    return { min: Math.floor(min / step) * step, max: Math.ceil(max * 1.04 / step) * step, major: step };
-  }
-  function axisOf(ax, vals) {
-    if (ax && ax.max !== null && ax.max !== undefined && ax.major > 0 && ax.max > ax.min && (ax.max - ax.min) / ax.major <= 12) return { min: ax.min, max: ax.max, major: ax.major };
-    var lo = Math.min.apply(null, vals.concat([0])), hi = Math.max.apply(null, vals.concat([0]));
-    return niceAxis(lo, hi);
-  }
+(function(){
+'use strict';
+var css=function(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim();};
+var nf=function(v,d){return v===null||v===undefined?'—':Number(v).toLocaleString('en-US',{minimumFractionDigits:d||0,maximumFractionDigits:d||0});};
+function esc(t){return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;');}
+function nice(max){var p=Math.pow(10,Math.floor(Math.log10(max||1))),f=max/p;return (f<=1?1:f<=2?2:f<=2.5?2.5:f<=5?5:10)*p;}
+function legend(items){return '<div class="legend">'+items.map(function(i){return '<span><i style="background:var('+i[1]+')"></i>'+esc(i[0])+'</span>';}).join('')+'</div>';}
+function tipOn(box){var t=document.createElement('div');t.className='tip';box.appendChild(t);if(box._tipBound){return;}box._tipBound=1;
+  box.addEventListener('mousemove',function(e){var t=box.querySelector('.tip');var el=e.target.closest('[data-tip]');if(!el){t.style.display='none';return;}
+    var r=box.getBoundingClientRect();t.innerHTML=el.getAttribute('data-tip');t.style.display='block';
+    var x=e.clientX-r.left+12,y=e.clientY-r.top+12;if(x+t.offsetWidth>r.width)x=e.clientX-r.left-t.offsetWidth-12;t.style.left=x+'px';t.style.top=y+'px';});
+  box.addEventListener('mouseleave',function(){var t=box.querySelector('.tip');if(t)t.style.display='none';});}
+// vertical bars (optionally stacked), single axis
+function columns(el,cats,series,o){o=o||{};var W=Math.max(300,el.clientWidth),H=o.h||320,m={l:62,r:10,t:20,b:o.rot?86:38};
+  var n=cats.length,cw=(W-m.l-m.r)/n,stack=o.stack;
+  var tot=cats.map(function(_,i){return stack?series.reduce(function(a,s){return a+(s.v[i]||0);},0):Math.max.apply(null,series.map(function(s){return s.v[i]||0;}));});
+  var max=nice(Math.max.apply(null,tot)*1.08),Y=function(v){return m.t+(H-m.t-m.b)*(1-v/max);},g='';
+  for(var k=0;k<=4;k++){var v=max*k/4,y=Y(v);g+='<line class="gl" x1="'+m.l+'" x2="'+(W-m.r)+'" y1="'+y+'" y2="'+y+'"/><text class="ax" x="'+(m.l-8)+'" y="'+(y+5)+'" text-anchor="end">'+(o.pct?nf(v,0)+'%':nf(v))+'</text>';}
+  var bw=stack?cw*0.56:cw*0.72/series.length;
+  cats.forEach(function(c,i){var base=0,x0=m.l+cw*i+(cw-(stack?bw:bw*series.length))/2;
+    series.forEach(function(s,j){var v=s.v[i];if(v===null||v===undefined)return;var x=stack?x0:x0+j*bw,y1=Y(base+v),y0=Y(base);
+      var h=Math.max(0,y0-y1-(stack&&j>0?2:0)),col=s.colors?s.colors[i]:s.c;
+      g+='<rect x="'+(x+(stack?0:1))+'" y="'+y1+'" width="'+(bw-(stack?0:2))+'" height="'+h+'" rx="'+(j===series.length-1||!stack?3:0)+'" fill="var('+col+')"/>';
+      if(stack)base+=v;});
+    var lab=o.labels?o.labels[i]:null;if(lab)g+='<text class="lbl" x="'+(x0+(stack?bw:bw*series.length)/2)+'" y="'+(Y(tot[i])-6)+'" text-anchor="middle">'+lab+'</text>';
+    var tip='<b>'+esc(c)+'</b><br>'+series.map(function(s){return esc(s.n)+': <b>'+(s.v[i]===null?'—':(o.pct?nf(s.v[i],2)+'%':nf(s.v[i])))+'</b>';}).join('<br>')+(o.tipx?'<br>'+o.tipx[i]:'');
+    g+='<rect class="hit" x="'+(m.l+cw*i)+'" y="'+m.t+'" width="'+cw+'" height="'+(H-m.t-m.b)+'" data-tip="'+esc(tip).replace(/"/g,'&quot;')+'"/>';
+    g+=o.rot?'<text class="ax" transform="translate('+(m.l+cw*i+cw/2+4)+','+(H-m.b+12)+') rotate(-35)" text-anchor="end">'+esc(c)+'</text>':'<text class="ax" x="'+(m.l+cw*i+cw/2)+'" y="'+(H-m.b+22)+'" text-anchor="middle">'+esc(c)+'</text>';});
+  g+='<line class="base" x1="'+m.l+'" x2="'+(W-m.r)+'" y1="'+Y(0)+'" y2="'+Y(0)+'"/>';
+  el.innerHTML='<svg width="'+W+'" height="'+H+'" viewBox="0 0 '+W+' '+H+'">'+g+'</svg>'+(series.length>1?legend(series.map(function(s){return [s.n,s.c];})):'');tipOn(el);}
+// horizontal bars with value + share labels
+function hbars(el,cats,vals,o){o=o||{};var W=Math.max(300,el.clientWidth),rh=o.rh||36,lw=Math.min(o.lw||270,Math.round(W*0.42)),H=cats.length*rh+8,max=Math.max.apply(null,vals)*(o.share?1.4:1.18),g='';
+  var maxCh=Math.max(6,Math.floor((lw-16)/8.3)),short=function(c){c=String(c);return c.length>maxCh?c.slice(0,maxCh-1)+'…':c;};
+  cats.forEach(function(c,i){var y=4+i*rh,w=(W-lw-10)*vals[i]/max,share=o.share?o.share[i]:null;
+    g+='<text class="ax" x="'+(lw-10)+'" y="'+(y+rh/2+4)+'" text-anchor="end" style="font-size:16px;fill:var(--ink-2)">'+esc(short(c))+'</text>';
+    g+='<rect x="'+lw+'" y="'+(y+7)+'" width="'+Math.max(2,w)+'" height="'+(rh-14)+'" rx="3" fill="var('+(o.c||'--s1')+')"/>';
+    g+='<text class="lbl" x="'+(lw+w+6)+'" y="'+(y+rh/2+4)+'">'+nf(vals[i])+(share?' · '+share:'')+'</text>';
+    g+='<rect class="hit" x="0" y="'+y+'" width="'+W+'" height="'+rh+'" data-tip="<b>'+esc(c)+'</b><br>'+nf(vals[i])+(share?' ('+share+')':'')+'"/>';});
+  el.innerHTML='<svg width="'+W+'" height="'+H+'" viewBox="0 0 '+W+' '+H+'">'+g+'</svg>';tipOn(el);}
+// donut with centre figure
+function donut(el,parts,o){o=o||{};var S=220,c=S/2,R=92,r=64,tot=parts.reduce(function(a,p){return a+p[1];},0),a=-Math.PI/2,g='';
+  parts.forEach(function(p){var f=p[1]/tot,a2=a+f*2*Math.PI-(f<1?0.012:0),big=a2-a>Math.PI?1:0,P=function(rr,an){return (c+rr*Math.cos(an)).toFixed(2)+','+(c+rr*Math.sin(an)).toFixed(2);};
+    var d=f>=0.9999?'M'+P(R,0)+'A'+R+','+R+' 0 1 1 '+P(R,Math.PI)+'A'+R+','+R+' 0 1 1 '+P(R,0)+'M'+P(r,0)+'A'+r+','+r+' 0 1 0 '+P(r,Math.PI)+'A'+r+','+r+' 0 1 0 '+P(r,0)+'Z':
+      'M'+P(R,a)+'A'+R+','+R+' 0 '+big+' 1 '+P(R,a2)+'L'+P(r,a2)+'A'+r+','+r+' 0 '+big+' 0 '+P(r,a)+'Z';
+    g+='<path d="'+d+'" fill="var('+p[2]+')" fill-rule="evenodd" data-tip="<b>'+esc(p[0])+'</b><br>'+(o.pct?'':nf(p[1])+' · ')+(f*100).toFixed(2)+'%"/>';a=a2+(f<1?0.012:0);});
+  g+='<text x="'+c+'" y="'+(c-2)+'" text-anchor="middle" style="font-size:26px;font-weight:650;fill:var(--ink)">'+(o.center||'')+'</text><text x="'+c+'" y="'+(c+18)+'" text-anchor="middle" class="ax">'+(o.sub||'')+'</text>';
+  el.innerHTML='<svg viewBox="0 0 '+S+' '+S+'" style="max-width:320px;margin:0 auto">'+g+'</svg>'+legend(parts.map(function(p){return [p[0]+' · '+(o.pct?(p[1]*100).toFixed(2)+'%':nf(p[1])),p[2]];}));tipOn(el);}
+// single line with markers
+function line(el,cats,vals,o){o=o||{};var W=Math.max(300,el.clientWidth),H=300,m={l:62,r:12,t:20,b:38},max=nice(Math.max.apply(null,vals)*1.1),n=cats.length,g='';
+  var X=function(i){return m.l+(W-m.l-m.r)*(i+.5)/n;},Y=function(v){return m.t+(H-m.t-m.b)*(1-v/max);};
+  for(var k=0;k<=4;k++){var v=max*k/4;g+='<line class="gl" x1="'+m.l+'" x2="'+(W-m.r)+'" y1="'+Y(v)+'" y2="'+Y(v)+'"/><text class="ax" x="'+(m.l-8)+'" y="'+(Y(v)+4)+'" text-anchor="end">'+nf(v)+'</text>';}
+  g+='<path d="M'+vals.map(function(v,i){return X(i)+','+Y(v);}).join('L')+'" fill="none" stroke="var('+(o.c||'--s1')+')" stroke-width="2" stroke-linejoin="round"/>';
+  vals.forEach(function(v,i){g+='<circle cx="'+X(i)+'" cy="'+Y(v)+'" r="4" fill="var(--surface)" stroke="var('+(o.c||'--s1')+')" stroke-width="2"/><rect class="hit" x="'+(X(i)-(W-m.l-m.r)/n/2)+'" y="'+m.t+'" width="'+((W-m.l-m.r)/n)+'" height="'+(H-m.t-m.b)+'" data-tip="<b>'+esc(cats[i])+'</b><br>'+nf(v)+'"/><text class="ax" x="'+X(i)+'" y="'+(H-m.b+22)+'" text-anchor="middle">'+esc(cats[i])+'</text>';});
+  el.innerHTML='<svg width="'+W+'" height="'+H+'" viewBox="0 0 '+W+' '+H+'">'+g+'</svg>';tipOn(el);}
 
-  // ---------- colours: Excel's colours are mapped onto the dashboard palette by hue
-  function hue(hex) {
-    var m = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})/i.exec(hex || ''); if (!m) return null;
-    var r = parseInt(m[1], 16) / 255, g = parseInt(m[2], 16) / 255, b = parseInt(m[3], 16) / 255;
-    var mx = Math.max(r, g, b), mn = Math.min(r, g, b), l = (mx + mn) / 2, d = mx - mn, h = 0, s = 0;
-    if (d > 0) { s = d / (1 - Math.abs(2 * l - 1)); h = mx === r ? ((g - b) / d) % 6 : mx === g ? (b - r) / d + 2 : (r - g) / d + 4; h *= 60; if (h < 0) h += 360; }
-    return { h: h, s: s, l: l };
-  }
-  var ORDER = ['--s1', '--s3', '--s4', '--c4', '--c5', '--c6'];
-  function palette() {
-    var used = {}, cache = {};
-    return function (excel, key) {
-      var k = excel ? excel.toLowerCase() : '#' + key;
-      if (cache[k]) return cache[k];
-      var pref = null, c = hue(excel);
-      if (c) {
-        if (c.s < 0.15 || c.l > 0.93) pref = '--s4';
-        else if ((c.h < 14 || c.h >= 340) && c.s >= 0.35) pref = '--s8';
-        else if (c.h >= 14 && c.h < 70) pref = '--s3';
-        else if (c.h >= 70 && c.h < 170) pref = '--s1';
-      }
-      var pick = null;
-      if (pref === '--s8') pick = pref;                       // red stays red: it marks problems
-      else if (pref && !used[pref]) pick = pref;
-      else for (var i = 0; i < ORDER.length; i++) if (!used[ORDER[i]]) { pick = ORDER[i]; break; }
-      if (!pick) pick = '--s4';
-      used[pick] = true; cache[k] = 'var(' + pick + ')';
-      return cache[k];
-    };
-  }
-  function excelColor(s) { return (s.kind === 'line' || s.kind === 'area') ? (s.lineOn !== false && s.line ? s.line : s.fill) : (s.fillOn !== false && s.fill ? s.fill : s.line); }
-  function distinct(arr) { var o = {}, n = 0; (arr || []).forEach(function (c) { if (c && !o[c]) { o[c] = 1; n++; } }); return n; }
+function drawAll(){
+[].slice.call(document.querySelectorAll('.chart[data-c]')).forEach(function(el){
+  try{var d=JSON.parse(el.getAttribute('data-c'));
+    if(d.type==='columns')columns(el,d.cats,d.series,d.o);
+    else if(d.type==='hbars')hbars(el,d.cats,d.vals,d.o);
+    else if(d.type==='donut')donut(el,d.parts,d.o);
+    else if(d.type==='line')line(el,d.cats,d.vals,d.o);
+  }catch(e){el.innerHTML='<div class="miss">Chart could not be drawn: '+esc(String(e))+'</div>';}
+});
+}
+drawAll();var rz;window.addEventListener('resize',function(){clearTimeout(rz);rz=setTimeout(drawAll,150);});
 
-  function tipOn(el, tips) {
-    var tip = el.querySelector('.tip');
-    el.onmousemove = function (e) {
-      var t = e.target.getAttribute && e.target.getAttribute('data-tip');
-      if (t === null || t === undefined) { tip.style.display = 'none'; return; }
-      var r = el.getBoundingClientRect(), z = parseFloat(getComputedStyle(document.getElementById('content')).zoom) || 1;
-      tip.innerHTML = tips[+t]; tip.style.display = 'block';
-      var x = (e.clientX - r.left) / z + 14, y = (e.clientY - r.top) / z + 14;
-      if (x + tip.offsetWidth > el.clientWidth) x = Math.max(0, x - tip.offsetWidth - 28);
-      tip.style.left = x + 'px'; tip.style.top = y + 'px';
-    };
-    el.onmouseleave = function () { tip.style.display = 'none'; };
-  }
-  function legendHtml(items) {
-    return '<div class="legend">' + items.map(function (i) { return '<span><i class="' + (i.line ? 'ln' : '') + '" style="background:' + i.c + '"></i>' + esc(i.n) + '</span>'; }).join('') + '</div>';
-  }
-
-  // ---------- chart drawing (Excel's data, scale and number formats; dashboard look)
-  function draw(el) {
-    var sp = el._spec || (el._spec = JSON.parse(el.getAttribute('data-chart')));
-    var fb = el.querySelector('.fb'); var fbHtml = fb ? fb.outerHTML : '';
-    var W = Math.max(280, el.clientWidth), o = [], tips = [], col = palette();
-    var series = sp.series || [], cats = [];
-    series.forEach(function (s) { if (s.cats && s.cats.length > cats.length) cats = s.cats; });
-    var pie = sp.kind === 'pie' || sp.kind === 'doughnut';
-    if (pie) {
-      var s0 = series[0], vals = (s0.values || []).map(function (v) { return v > 0 ? v : 0; }), tot = vals.reduce(function (a, b) { return a + b; }, 0);
-      var S = Math.min(W, 340), c = S / 2, R = c - 6, r0 = R * 0.62, a = (sp.firstAngle || 0) * Math.PI / 180 - Math.PI / 2, leg = [];
-      var many = distinct(s0.points) >= 2;
-      vals.forEach(function (v, i) {
-        var cc = col(many ? s0.points[i] : null, i), cat = (s0.cats || [])[i] || ('#' + (i + 1));
-        var lf = s0.labels && s0.labels.format && s0.labels.format.indexOf('%') < 0 ? s0.labels.format : '#,##0';
-        var pctTxt = s0.labels && s0.labels.percent && tot ? ' (' + fmt(v / tot, s0.labels.format && s0.labels.format.indexOf('%') >= 0 ? s0.labels.format : '0%') + ')' : '';
-        leg.push({ n: cat + ' · ' + fmt(s0.values[i], lf) + pctTxt, c: cc });
-        if (!tot || v <= 0) return;
-        var f = v / tot, a2 = a + f * 2 * Math.PI - (f < 1 ? 0.012 : 0), big = a2 - a > Math.PI ? 1 : 0;
-        var P = function (rr, an) { return (c + rr * Math.cos(an)).toFixed(2) + ',' + (c + rr * Math.sin(an)).toFixed(2); };
-        var d = f >= 0.9999 ? 'M' + P(R, 0) + 'A' + R + ',' + R + ' 0 1 1 ' + P(R, Math.PI) + 'A' + R + ',' + R + ' 0 1 1 ' + P(R, 0) + 'M' + P(r0, 0) + 'A' + r0 + ',' + r0 + ' 0 1 0 ' + P(r0, Math.PI) + 'A' + r0 + ',' + r0 + ' 0 1 0 ' + P(r0, 0) + 'Z'
-          : 'M' + P(R, a) + 'A' + R + ',' + R + ' 0 ' + big + ' 1 ' + P(R, a2) + 'L' + P(r0, a2) + 'A' + r0 + ',' + r0 + ' 0 ' + big + ' 0 ' + P(r0, a) + 'Z';
-        tips.push('<b>' + esc(cat) + '</b><br>' + esc(fmt(s0.values[i], lf)) + ' · ' + (f * 100).toFixed(2) + '%');
-        o.push('<path d="' + d + '" fill="' + cc + '" fill-rule="evenodd" data-tip="' + (tips.length - 1) + '"/>');
-        a = a2 + (f < 1 ? 0.012 : 0);
-      });
-      el.innerHTML = '<svg viewBox="0 0 ' + S + ' ' + S + '" style="max-width:' + S + 'px;margin:0 auto">' + o.join('') + '</svg>' + legendHtml(leg) + '<div class="tip"></div>' + fbHtml;
-      tipOn(el, tips); return;
-    }
-    var horiz = series.some(function (s) { return s.kind === 'bar'; });
-    var stacked = series.some(function (s) { return s.stacked; });
-    var n = Math.max(1, cats.length || (series[0] && series[0].values ? series[0].values.length : 1));
-    var prim = [], sec = [];
-    series.forEach(function (s) { (s.axis === 2 ? sec : prim).push.apply(s.axis === 2 ? sec : prim, (s.values || []).filter(function (v) { return v !== null; })); });
-    if (stacked) prim = cats.map(function (c, i) { return series.filter(function (s) { return s.axis !== 2; }).reduce(function (a, s) { return a + Math.max(0, (s.values || [])[i] || 0); }, 0); });
-    var A1 = axisOf(sp.y, prim.length ? prim : [0]), A2 = sec.length ? axisOf(sp.y2, sec) : null;
-    var yf = (sp.y || {}).format, y2f = (sp.y2 || {}).format;
-    var perPoint = series.map(function (s) { return (s.kind === 'column' || s.kind === 'bar') && distinct(s.points) >= 2; });
-    // bars coloured point by point (e.g. green / amber / red by age) claim their colours first
-    series.forEach(function (s, i) { if (perPoint[i]) s.points.forEach(function (c, j) { if (c) col(c, 'p' + j); }); });
-    var colors = series.map(function (s, i) {
-      if (perPoint[i]) { for (var j = 0; j < s.points.length; j++) if (s.points[j]) return col(s.points[j], 'p' + j); }
-      return col(excelColor(s), i);
-    });
-    var anyLabels = series.some(function (s) { return s.labels; });
-    var H, m;
-    if (horiz) {
-      var maxCat = Math.max.apply(null, cats.map(function (c) { return String(c).length; }).concat([2]));
-      m = { l: Math.min(W * 0.42, maxCat * 8.6 + 14), r: 120, t: 6, b: 6 };
-      H = n * 38 * Math.max(1, stacked ? 1 : Math.min(2, series.length)) + m.t + m.b;
-    } else {
-      var tickW = Math.max.apply(null, [fmt(A1.max, yf), fmt(A1.min, yf)].map(function (t) { return t.length; })) * 8.6 + 14;
-      var band0 = (W - tickW - 10) / n, longest = Math.max.apply(null, cats.map(function (c) { return String(c).length; }).concat([1]));
-      var rot = longest * 8 > band0 * 0.95;
-      m = { l: tickW, r: A2 ? Math.max.apply(null, [fmt(A2.max, y2f)].map(function (t) { return t.length; })) * 8.6 + 14 : 10, t: anyLabels ? 26 : 14, b: rot ? Math.min(140, longest * 6.2 + 20) : 34 };
-      H = 300 + m.b - 34;
-    }
-    var pl = m.l, pr = W - m.r, pt = m.t, pb = H - m.b;
-    var V = function (v, ax) { ax = ax || A1; var f = (v - ax.min) / (ax.max - ax.min); return horiz ? pl + f * (pr - pl) : pb - f * (pb - pt); };
-    if (!horiz) for (var g = A1.min; g <= A1.max + A1.major / 1000; g += A1.major) {
-      var gy = V(g);
-      o.push('<line class="gl" x1="' + pl + '" x2="' + pr + '" y1="' + gy + '" y2="' + gy + '"/><text class="ax" x="' + (pl - 8) + '" y="' + (gy + 5) + '" text-anchor="end">' + esc(fmt(g, yf)) + '</text>');
-    }
-    if (A2 && !horiz) for (var g2 = A2.min; g2 <= A2.max + A2.major / 1000; g2 += A2.major) o.push('<text class="ax" x="' + (pr + 8) + '" y="' + (V(g2, A2) + 5) + '">' + esc(fmt(g2, y2f)) + '</text>');
-    var band = (horiz ? pb - pt : pr - pl) / n;
-    var xr = (sp.x || {}).reverse;
-    var order = function (i) { return horiz ? (xr ? i : n - 1 - i) : (xr ? n - 1 - i : i); };   // Excel draws bar categories bottom-up unless reversed
-    var C = function (i) { return (horiz ? pt : pl) + band * (order(i) + 0.5); };
-    cats.forEach(function (c, i) {
-      if (horiz) o.push('<text class="ax" x="' + (pl - 10) + '" y="' + (C(i) + 5) + '" text-anchor="end" style="font-size:16px;fill:var(--ink-2)">' + esc(c) + '</text>');
-      else if (rot) o.push('<text class="ax" transform="translate(' + (C(i) + 5) + ',' + (pb + 14) + ') rotate(-35)" text-anchor="end">' + esc(c) + '</text>');
-      else o.push('<text class="ax" x="' + C(i) + '" y="' + (pb + 22) + '" text-anchor="middle">' + esc(c) + '</text>');
-    });
-    var bars = series.filter(function (s) { return s.kind === 'column' || s.kind === 'bar'; });
-    var nb = stacked ? 1 : Math.max(1, bars.length), groupW = band * (stacked ? 0.56 : Math.min(0.78, 0.36 * nb + 0.2)), bw = groupW / nb;
-    var stackBase = cats.map(function () { return 0; }), labels = [], hits = [];
-    // when a line also carries value labels, bar labels go inside the foot of the bar so the two never collide
-    var boxes = [];   // [centre x, baseline y, width] of bar labels drawn above bars
-    var lineLabels = series.some(function (s) { return (s.kind === 'line' || s.kind === 'area') && s.labels && s.labels.value; });
-    bars.forEach(function (s, bi) {
-      var si = series.indexOf(s);
-      (s.values || []).forEach(function (v, i) {
-        if (v === null || v === undefined) return;
-        var cc = perPoint[si] ? col(s.points[i], 'p' + i) : colors[si];
-        var base = stacked ? stackBase[i] : 0, end = base + v;
-        if (stacked) stackBase[i] = end;
-        var c0 = C(i) - groupW / 2 + (stacked ? 0 : bi * bw);
-        var p0 = V(Math.max(A1.min, Math.min(A1.max, base))), p1 = V(Math.max(A1.min, Math.min(A1.max, end)));
-        var gapPx = stacked && bi > 0 ? 2 : 0;
-        if (horiz) o.push('<rect x="' + (Math.min(p0, p1) + gapPx) + '" y="' + (c0 + 1) + '" width="' + Math.max(0, Math.abs(p1 - p0) - gapPx) + '" height="' + Math.max(1, bw - 2) + '" rx="3" fill="' + cc + '"/>');
-        else o.push('<rect x="' + (c0 + 1) + '" y="' + Math.min(p0, p1) + '" width="' + Math.max(1, bw - 2) + '" height="' + Math.max(0, Math.abs(p1 - p0) - gapPx) + '" rx="3" fill="' + cc + '"/>');
-        if (s.labels) {
-          var t = [];
-          if (s.labels.value) t.push(fmt(v, s.labels.format && !/general/i.test(s.labels.format) ? s.labels.format : yf));
-          if (s.labels.category) t.push(cats[i] || '');
-          if (s.labels.series) t.push(s.name || '');
-          if (t.length) labels.push(horiz ? '<text class="lbl" x="' + (Math.max(p0, p1) + 8) + '" y="' + (c0 + bw / 2 + 5) + '">' + esc(t.join(' · ')) + '</text>'
-            : (lineLabels && Math.abs(p1 - p0) > 26 ? '<text class="lbl" x="' + (c0 + bw / 2) + '" y="' + (Math.max(p0, p1) - 10) + '" text-anchor="middle" style="fill:#fff;font-weight:600;stroke:none">' + esc(t.join(' · ')) + '</text>'
-              : (boxes.push([c0 + bw / 2, Math.min(p0, p1) - 7, t.join(' · ').length * 8.2]), '<text class="lbl" x="' + (c0 + bw / 2) + '" y="' + (Math.min(p0, p1) - 7) + '" text-anchor="middle">' + esc(t.join(' · ')) + '</text>')));
-        }
-      });
-    });
-    series.forEach(function (s, si) {
-      if (s.kind !== 'line' && s.kind !== 'area') return;
-      var ax = s.axis === 2 && A2 ? A2 : A1, cc = colors[si], pts = [];
-      (s.values || []).forEach(function (v, i) { if (v !== null && v !== undefined) pts.push([C(i), V(Math.max(ax.min, Math.min(ax.max, v)), ax), v, i]); });
-      if (!pts.length) return;
-      var d = 'M' + pts.map(function (q) { return q[0].toFixed(1) + ',' + q[1].toFixed(1); }).join('L');
-      if (s.kind === 'area') o.push('<path d="' + d + 'L' + pts[pts.length - 1][0] + ',' + V(Math.max(ax.min, 0), ax) + 'L' + pts[0][0] + ',' + V(Math.max(ax.min, 0), ax) + 'Z" fill="' + cc + '" opacity=".25"/>');
-      o.push('<path d="' + d + '" fill="none" stroke="' + cc + '" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>');
-      pts.forEach(function (q) {
-        o.push('<circle cx="' + q[0] + '" cy="' + q[1] + '" r="4.5" fill="var(--surface)" stroke="' + cc + '" stroke-width="2"/>');
-        if (s.labels && s.labels.value) {
-          var lt = fmt(q[2], s.labels.format && !/general/i.test(s.labels.format) ? s.labels.format : (s.axis === 2 ? y2f : yf)), ly = q[1] - 10, lw = lt.length * 8.2;
-          // lift the line's label clear of a bar label at the same spot
-          for (var k = 0; k < 4; k++) {
-            var hit = boxes.some(function (bx) { return Math.abs(bx[0] - q[0]) < (bx[2] + lw) / 2 + 2 && Math.abs(bx[1] - ly) < 17; });
-            if (!hit) break; ly -= 18;
-          }
-          labels.push('<text class="lbl" x="' + q[0] + '" y="' + ly + '" text-anchor="middle">' + esc(lt) + '</text>');
-        }
-      });
-    });
-    o.push(horiz ? '<line class="base" x1="' + V(Math.max(A1.min, 0)) + '" x2="' + V(Math.max(A1.min, 0)) + '" y1="' + pt + '" y2="' + pb + '"/>' : '<line class="base" x1="' + pl + '" x2="' + pr + '" y1="' + V(Math.max(A1.min, 0)) + '" y2="' + V(Math.max(A1.min, 0)) + '"/>');
-    // one hover target per category: every series' value for it
-    cats.forEach(function (c, i) {
-      var lines = series.map(function (s) { var v = (s.values || [])[i]; var f = (s.labels && s.labels.format && !/general/i.test(s.labels.format)) ? s.labels.format : (s.axis === 2 ? y2f : yf); return (series.length > 1 ? esc(s.name || '') + ': ' : '') + '<b>' + (v === null || v === undefined ? '—' : esc(fmt(v, f))) + '</b>'; });
-      tips.push('<b>' + esc(c) + '</b><br>' + lines.join('<br>'));
-      if (horiz) hits.push('<rect class="hit" x="0" y="' + (C(i) - band / 2) + '" width="' + W + '" height="' + band + '" data-tip="' + (tips.length - 1) + '"/>');
-      else hits.push('<rect class="hit" x="' + (C(i) - band / 2) + '" y="' + pt + '" width="' + band + '" height="' + (pb - pt) + '" data-tip="' + (tips.length - 1) + '"/>');
-    });
-    var leg = series.length > 1 ? legendHtml(series.map(function (s, i) { return { n: s.name || ('Series ' + (i + 1)), c: colors[i], line: s.kind === 'line' }; })) : '';
-    el.innerHTML = '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '">' + o.concat(labels).concat(hits).join('') + '</svg>' + leg + '<div class="tip"></div>' + fbHtml;
-    tipOn(el, tips);
-  }
-  var charts = [].slice.call(document.querySelectorAll('.bchart[data-chart]'));
-  function drawAll() { charts.forEach(function (el) { try { draw(el); el.classList.remove('err'); } catch (e) { el.classList.add('err'); el.setAttribute('data-error', String(e)); } }); }
-  var rz; window.addEventListener('resize', function () { clearTimeout(rz); rz = setTimeout(function () { fitCover(); drawAll(); }, 150); });
-
-  // ---------- cover fills the window under the top bar
-  var zoom = 1;
-  function fitCover() {
-    var t = document.querySelector('.top'); if (!t) return;
-    var avail = body.classList.contains('present') ? window.innerHeight - 40 : window.innerHeight - t.getBoundingClientRect().height - 26;
-    root.style.setProperty('--coverH', Math.max(520, avail / zoom) + 'px');
-  }
-  // ---------- zoom
-  try { zoom = parseFloat(localStorage.getItem('itsmB.zoom')) || 1; } catch (e) { }
-  function setZoom(z) {
-    zoom = Math.max(0.6, Math.min(2, Math.round(z * 100) / 100));
-    document.getElementById('content').style.zoom = zoom;
-    document.getElementById('zVal').textContent = Math.round(zoom * 100) + '%';
-    try { localStorage.setItem('itsmB.zoom', String(zoom)); } catch (e) { }
-    fitCover(); clearTimeout(rz); rz = setTimeout(drawAll, 60);
-  }
-  document.getElementById('zIn').onclick = function () { setZoom(zoom + 0.1); };
-  document.getElementById('zOut').onclick = function () { setZoom(zoom - 0.1); };
-  document.getElementById('zFit').onclick = function () { setZoom(1); };
-  // ---------- page menu
-  var nav = document.getElementById('nav'), links = [].slice.call(nav.querySelectorAll('a'));
-  function menu(o) { body.classList.toggle('menu', o); }
-  document.getElementById('mOpen').onclick = function () { menu(true); };
-  document.getElementById('mClose').onclick = function () { menu(false); };
-  document.getElementById('scrim').onclick = function () { menu(false); };
-  links.forEach(function (l) { l.addEventListener('click', function () { menu(false); }); });
-  function track() {
-    var k = 0, y = window.innerHeight * 0.4;
-    secs.forEach(function (s, i) { if (s.getBoundingClientRect().top <= y) k = i; });
-    links.forEach(function (l, i) { l.classList.toggle('on', i === k); });
-    document.getElementById('mPos').textContent = (k + 1) + ' / ' + secs.length;
-    return k;
-  }
-  window.addEventListener('scroll', track, { passive: true });
-  // ---------- theme
-  try { var th = localStorage.getItem('itsmB.theme'); if (th) root.dataset.theme = th; } catch (e) { }
-  document.getElementById('theme').onclick = function () {
-    var d = root.dataset.theme === 'dark' || (!root.dataset.theme && matchMedia('(prefers-color-scheme:dark)').matches);
-    root.dataset.theme = d ? 'light' : 'dark';
-    try { localStorage.setItem('itsmB.theme', root.dataset.theme); } catch (e) { }
-    drawAll();
-  };
-  // ---------- presentation: one page at a time
-  var cur = 0;
-  function show(i) {
-    cur = Math.max(0, Math.min(secs.length - 1, i));
-    secs.forEach(function (s, k) { s.classList.toggle('cur', k === cur); });
-    document.getElementById('hpos').textContent = (cur + 1) + ' / ' + secs.length;
-    fitCover(); drawAll();
-  }
-  function start() {
-    body.classList.add('present'); show(track());
-    if (root.requestFullscreen) root.requestFullscreen().catch(function () { });
-  }
-  function stop() {
-    body.classList.remove('present'); secs.forEach(function (s) { s.classList.remove('cur'); });
-    if (document.fullscreenElement) document.exitFullscreen();
-    fitCover(); drawAll(); secs[cur].scrollIntoView();
-  }
-  document.getElementById('present').onclick = start;
-  document.getElementById('hp').onclick = function () { show(cur - 1); };
-  document.getElementById('hn').onclick = function () { show(cur + 1); };
-  document.getElementById('hx').onclick = stop;
-  document.addEventListener('fullscreenchange', function () { if (!document.fullscreenElement && body.classList.contains('present')) stop(); });
-  document.addEventListener('keydown', function (e) {
-    if (e.key === 'Escape') menu(false);
-    if (body.classList.contains('present')) {
-      if (['ArrowRight', 'PageDown', ' '].indexOf(e.key) >= 0) { e.preventDefault(); show(cur + 1); }
-      if (['ArrowLeft', 'PageUp'].indexOf(e.key) >= 0) { e.preventDefault(); show(cur - 1); }
-      if (e.key === 'Home') show(0);
-      if (e.key === 'End') show(secs.length - 1);
-      if (e.key === 'Escape') stop();
-      return;
-    }
-    if (e.ctrlKey || e.metaKey || e.altKey) return;
-    if (e.key === '+' || e.key === '=') setZoom(zoom + 0.1);
-    if (e.key === '-') setZoom(zoom - 0.1);
-    if (e.key === 'p' || e.key === 'P') { e.preventDefault(); start(); }
-  });
-  window.addEventListener('beforeprint', function () { document.getElementById('content').style.zoom = 1; });
-  window.addEventListener('afterprint', function () { document.getElementById('content').style.zoom = zoom; });
-  setZoom(zoom); track(); drawAll();
-  if (document.fonts && document.fonts.ready) document.fonts.ready.then(drawAll);
+(function(){var ERR=/#(DIV\/0!|N\/A|VALUE!|REF!|NAME\?|NUM!|NULL!|SPILL!|CALC!|FIELD!|BLOCKED!|CONNECT!|BUSY!|UNKNOWN!|GETTING_DATA)/g;
+  var w=document.createTreeWalker(document.getElementById('content'),NodeFilter.SHOW_TEXT,null),hits=[];
+  while(w.nextNode()){ERR.lastIndex=0;if(ERR.test(w.currentNode.nodeValue))hits.push(w.currentNode);}
+  hits.forEach(function(t){var s=t.nodeValue,f=document.createDocumentFragment(),last=0,m;ERR.lastIndex=0;
+    while((m=ERR.exec(s))){if(m.index>last)f.appendChild(document.createTextNode(s.slice(last,m.index)));var sp=document.createElement('span');sp.className='xerr';sp.title='Excel error value - shown exactly as in Wkly_Report';sp.textContent=m[0];f.appendChild(sp);last=m.index+m[0].length;}
+    if(last<s.length)f.appendChild(document.createTextNode(s.slice(last)));t.parentNode.replaceChild(f,t);});})();
+// pages: coloured header bar, body, footer
+var all=[].slice.call(document.querySelectorAll('section')),N=all.length;
+all.forEach(function(sec,i){
+  var sh=sec.querySelector('.sh'),body=document.createElement('div');body.className='pbd';
+  if(sh){var no=sh.querySelector('.no'),h=sh.querySelector('h2'),pp=sh.querySelector('p');var head=document.createElement('div');head.className='ph';
+    head.innerHTML='<span class="no">'+no.textContent+'</span><h2>'+h.innerHTML+'</h2>'+(pp?'<p>'+pp.innerHTML+'</p>':'');sh.remove();
+    while(sec.firstChild)body.appendChild(sec.firstChild);sec.classList.add('page');sec.appendChild(head);sec.appendChild(body);
+    var f=document.createElement('div');f.className='pfoot';f.innerHTML='<span>'+document.title+' · '+(document.body.getAttribute('data-conf')||'')+'</span><span>Page <b>'+(i+1)+'</b> of '+N+'</span>';sec.appendChild(f);}
+});
+// cover fills the window below the top bar
+function fitCover(){var t=document.querySelector('.top'),c=document.getElementById('s1');if(!t||!c)return;
+  document.documentElement.style.setProperty('--coverH',Math.max(520,(window.innerHeight-t.getBoundingClientRect().bottom-18)/zoom)+'px');}
+window.addEventListener('resize',fitCover);
+// zoom
+var zoom=1;try{zoom=parseFloat(localStorage.getItem('itsmB.zoom'))||1;}catch(e){}
+function setZoom(z){zoom=Math.max(0.6,Math.min(2,Math.round(z*100)/100));document.getElementById('content').style.zoom=zoom;
+  document.getElementById('zVal').textContent=Math.round(zoom*100)+'%';try{localStorage.setItem('itsmB.zoom',String(zoom));}catch(e){}
+  fitCover();clearTimeout(rz);rz=setTimeout(drawAll,60);}
+document.getElementById('zIn').onclick=function(){setZoom(zoom+0.1);};document.getElementById('zOut').onclick=function(){setZoom(zoom-0.1);};document.getElementById('zFit').onclick=function(){setZoom(1);};
+document.addEventListener('keydown',function(e){if(document.body.classList.contains('present')||e.ctrlKey||e.metaKey)return;if(e.key==='+'||e.key==='=')setZoom(zoom+0.1);if(e.key==='-')setZoom(zoom-0.1);});
+setZoom(zoom);
+// navigation
+var secs=[].slice.call(document.querySelectorAll('section')),nav=document.getElementById('nav');
+nav.innerHTML=secs.map(function(s,i){return '<a href="#'+s.id+'"><span class="ix">'+String(i+1).padStart(2,'0')+'</span>'+s.dataset.t+'</a>';}).join('');
+var links=[].slice.call(nav.querySelectorAll('a'));
+// pages menu (hidden until opened)
+function menu(o){document.body.classList.toggle('menu',o);}
+document.getElementById('mOpen').onclick=function(){menu(true);};document.getElementById('mClose').onclick=function(){menu(false);};document.getElementById('scrim').onclick=function(){menu(false);};
+links.forEach(function(l){l.addEventListener('click',function(){menu(false);});});
+document.addEventListener('keydown',function(e){if(e.key==='Escape')menu(false);});
+function track(){var k=0,y=window.innerHeight*0.4;secs.forEach(function(s,i){if(s.getBoundingClientRect().top<=y)k=i;});
+  links.forEach(function(l,i){l.classList.toggle('on',i===k);});document.getElementById('mPos').textContent=(k+1)+' / '+secs.length;}
+window.addEventListener('scroll',track,{passive:true});window.addEventListener('resize',track);track();
+// theme
+document.getElementById('theme').onclick=function(){var r=document.documentElement,d=r.dataset.theme==='dark'||(!r.dataset.theme&&matchMedia('(prefers-color-scheme:dark)').matches);r.dataset.theme=d?'light':'dark';};
+// present
+var cur=0;function show(i){cur=Math.max(0,Math.min(secs.length-1,i));secs.forEach(function(s,k){s.classList.toggle('cur',k===cur);});document.getElementById('hpos').textContent=(cur+1)+' / '+secs.length;}
+function start(){document.body.classList.add('present');show(Math.max(0,links.findIndex(function(l){return l.classList.contains('on');})));if(document.documentElement.requestFullscreen)document.documentElement.requestFullscreen().catch(function(){});}
+function stop(){document.body.classList.remove('present');if(document.fullscreenElement)document.exitFullscreen();secs[cur].scrollIntoView();}
+document.getElementById('present').onclick=start;document.getElementById('hp').onclick=function(){show(cur-1);};document.getElementById('hn').onclick=function(){show(cur+1);};document.getElementById('hx').onclick=stop;
+document.addEventListener('keydown',function(e){if(!document.body.classList.contains('present'))return;if(['ArrowRight','PageDown',' '].indexOf(e.key)>=0){e.preventDefault();show(cur+1);}if(['ArrowLeft','PageUp'].indexOf(e.key)>=0)show(cur-1);if(e.key==='Escape')stop();});
+document.addEventListener('fullscreenchange',function(){if(!document.fullscreenElement&&document.body.classList.contains('present'))stop();});
 })();
+
 '@
 
 # ======================================================================================
@@ -3433,6 +4061,7 @@ function Invoke-Main {
         try { Find-OverlappingText -Items $items } catch { }
         $result = Find-ReportPages -Items $items -Geo $geo -ContentWidth $contentWidth -ContentBottom $contentBottom `
             -Mode $PageMode -StartRows $PageStartRows -BreakRows $breakRows -MinFont $TitleMinFontSize -MinHeight $MinPageHeightPt
+        Optimize-ReportPages -Pages $result.Pages
 
     }
     finally {
@@ -3484,10 +4113,10 @@ function Invoke-Main {
     # validation of the single output file
     $validLevel = 'OK'
     $written = Get-Content -LiteralPath $index -Raw -Encoding UTF8
-    $sections = [regex]::Matches($written, '<section class="(?:page|cvr)').Count
+    $sections = [regex]::Matches($written, '<section id="s\d+"').Count
     $externalRefs = [regex]::Matches($written, '(?:src|href)="(?!data:|#)[^"]+"').Count
     if ($sections -ne $result.Pages.Count -or $externalRefs -ne 0) { $validLevel = 'WARN' }
-    $nativeCharts = [regex]::Matches($written, 'class="bchart"').Count
+    $nativeCharts = [regex]::Matches($written, 'class="chart" data-c=').Count
     Write-Log ("Validation: {0} page(s) in the file (expected {1}), {2} chart(s) redrawn from data, {3} external reference(s) (expected 0)." -f $sections, $result.Pages.Count, $nativeCharts, $externalRefs) $validLevel
     Write-Log "Dashboard written: $index" 'OK'
 

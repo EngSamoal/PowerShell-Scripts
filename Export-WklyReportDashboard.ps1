@@ -100,7 +100,7 @@ param(
     [ValidateSet('Rebuilt', 'Picture')]
     [string]$RenderMode = 'Rebuilt',
     [int[]]$PageStartRows,
-    [double]$TitleMinFontSize = 20,
+    [double]$TitleMinFontSize = 17,
     [double]$MinPageHeightPt = 250,
     [string]$DashboardTitle = 'ITSM Executive Dashboard',
     [string]$Classification = 'CONFIDENTIAL',
@@ -110,7 +110,7 @@ param(
     [switch]$OpenWhenDone
 )
 
-$ScriptBuild = '2026.10.21-r28'
+$ScriptBuild = '2026.10.22-r29'
 $SheetName = 'Wkly_Report'          # fixed by design - no other worksheet is ever read
 $Inv = [System.Globalization.CultureInfo]::InvariantCulture
 $ErrRegex = '#(DIV/0!|N/A|VALUE!|REF!|NAME\?|NUM!|NULL!|SPILL!|CALC!|FIELD!|BLOCKED!|CONNECT!|BUSY!|UNKNOWN!|GETTING_DATA)'
@@ -136,6 +136,7 @@ $script:PdfScale = 2
 $script:PdfReady = $null
 $script:PictureMethods = @{}
 $script:BitmapScales = New-Object System.Collections.Generic.List[double]
+$script:ItemSeq = 0
 
 # ======================================================================================
 #  Small helpers
@@ -562,7 +563,7 @@ function Get-ChartKind {
     param([int]$Type)
     if ($Type -in 51, 52, 53, 54, 55, 56, -4100, 92, 93, 94, 99, 100, 101, 106, 107, 108) { return 'column' }
     if ($Type -in 57, 58, 59, 60, 61, 62, 95, 96, 97, 102, 103, 104, 109, 110, 111) { return 'bar' }
-    if ($Type -in 4, 63, 64, 65, 66, 67, -4101) { return 'line' }
+    if ($Type -in 4, 63, 64, 65, 66, 67, -4101, 72, 73, 74, 75) { return 'line' }
     if ($Type -in 1, 76, 77, -4098) { return 'area' }
     if ($Type -in 5, 69, -4102, 70) { return 'pie' }
     if ($Type -in -4120, 80) { return 'doughnut' }
@@ -708,7 +709,25 @@ function Get-ChartSpec {
         $spec.series.Add($sr)
     }
     if ($spec.series.Count -eq 0) { $spec.kind = $null }
+    Repair-ChartSpec $spec
     return $spec
+}
+
+function Repair-ChartSpec {
+    # A combination chart (bars + line) has no single Excel chart type; it is drawn natively when
+    # every series is a kind the dashboard can draw.
+    param($Spec)
+    if ($null -eq $Spec -or $Spec.kind) { return }
+    $kinds = New-Object System.Collections.Generic.List[string]
+    foreach ($sr in $Spec.series) {
+        $k = $sr.kind
+        if (-not $k -and [int]$Spec.excelType -in 72, 73, 74, 75) { $k = 'line'; $sr.kind = 'line' }
+        if (-not $k) { return }
+        $kinds.Add([string]$k)
+    }
+    if ($kinds.Count -eq 0) { return }
+    if ($kinds.Contains('pie') -or $kinds.Contains('doughnut')) { return }
+    if ($kinds.Contains('bar')) { $Spec.kind = 'bar' } elseif ($kinds.Contains('column')) { $Spec.kind = 'column' } elseif ($kinds.Contains('area')) { $Spec.kind = 'area' } else { $Spec.kind = 'line' }
 }
 
 function Get-RunInfo {
@@ -1726,12 +1745,6 @@ function Find-ReportPages {
                 Items    = $pageItems; ExcelView = $null; IssueCount = 0; Picture = $null
             })
     }
-    # All pages share one horizontal crop so they have the same scale and line up with each other.
-    if ($pages.Count) {
-        $gL = ($pages | Measure-Object -Property OffsetX -Minimum).Minimum
-        $gR = ($pages | ForEach-Object { $_.OffsetX + $_.Width } | Measure-Object -Maximum).Maximum
-        foreach ($p in $pages) { $p.OffsetX = $gL; $p.Width = $gR - $gL }
-    }
     Write-Log ("Page detection - {0}. Pages: {1}" -f $method, $pages.Count) 'OK'
     foreach ($p in $pages) { Write-Log ("  page {0}: rows {1}-{2}, {3} x {4} pt, '{5}'" -f $p.Index, $p.StartRow, $p.EndRow, [int]$p.Width, [int]($p.EndY - $p.StartY), $p.Title) }
     return [pscustomobject]@{ Pages = $pages; Method = $method }
@@ -1757,6 +1770,461 @@ function Find-LabelValue {
         }
     }
     return $null
+}
+
+# ======================================================================================
+#  Page clean-up before drawing (pure logic - no Excel calls)
+#  - every object belongs to exactly one page (the one it mostly sits on)
+#  - helper cells outside the page panels are left out
+#  - values placed over gaps in a sentence (separate small text boxes) are merged into
+#    that sentence, so text can never overlap when the browser's line breaks differ
+#  - each page gets its own width (no blank strip because another page is wider)
+# ======================================================================================
+
+function Test-OpaqueBg {
+    param([string]$Bg)
+    if (-not $Bg) { return $false }
+    if ($Bg -match '^rgba\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*0(?:\.0+)?\s*\)$') { return $false }
+    return $true
+}
+
+function Get-TextWidthPt {
+    # Calibri advance widths (em) - only used to find which gap a value box fills.
+    param([string]$Text, [double]$Size)
+    if ($null -eq $script:CalibriEm) {
+        $t = @{}
+        $pairs = ' .226 a .479 b .525 c .423 d .525 e .498 f .305 g .471 h .525 i .229 j .239 k .455 l .229 m .799 n .525 o .527 p .525 q .525 r .349 s .391 t .335 u .525 v .452 w .715 x .433 y .453 z .395 ' +
+            'A .579 B .544 C .533 D .615 E .488 F .459 G .631 H .623 I .252 J .319 K .520 L .420 M .855 N .646 O .662 P .517 Q .673 R .543 S .459 T .487 U .642 V .567 W .890 X .519 Y .487 Z .468 ' +
+            ', .250 . .252 : .268 ; .268 | .460 / .386 ( .303 ) .303 % .715 & .682 + .498 - .306 _ .498 = .498 # .498 ~ .498 ! .326 ? .463 '' .221 " .401'
+        $tok = $pairs.Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)
+        for ($k = 0; $k + 1 -lt $tok.Count; $k += 2) { $t[[string]$tok[$k]] = [double]::Parse($tok[$k + 1], $Inv) }
+        $script:CalibriEm = $t
+    }
+    $w = 0.0
+    foreach ($ch in $Text.ToCharArray()) {
+        $c = [int]$ch
+        if ($ch -eq ' ') { $f = 0.226 }
+        elseif ($c -ge 48 -and $c -le 57) { $f = 0.507 }
+        elseif ($script:CalibriEm.ContainsKey([string]$ch)) { $f = $script:CalibriEm[[string]$ch] }
+        elseif ($c -eq 0x2013) { $f = 0.5 }
+        elseif ($c -eq 0x2014) { $f = 1.0 }
+        elseif ($c -eq 0xB7) { $f = 0.268 }
+        elseif ($c -ge 0xD800 -and $c -le 0xDFFF) { $f = 0.5 }
+        elseif ($c -gt 0x2000) { $f = 1.0 }
+        else { $f = 0.5 }
+        $w += $f * $Size
+    }
+    return $w
+}
+
+function Remove-ItemRef {
+    # List.Remove by reference (never by value equality)
+    param($List, $Obj)
+    for ($k = 0; $k -lt $List.Count; $k++) { if ([object]::ReferenceEquals($List[$k], $Obj)) { $List.RemoveAt($k); return $true } }
+    return $false
+}
+
+function Get-ItemId {
+    param($It)
+    if ($null -eq $It.PSObject.Properties['_id']) { $script:ItemSeq++; $It | Add-Member -NotePropertyName _id -NotePropertyValue $script:ItemSeq -Force }
+    return [string]$It._id
+}
+
+function Get-RunsText {
+    param($It)
+    if (-not $It.Runs) { return '' }
+    $s = ''
+    foreach ($r in $It.Runs) { $s += [string]$r.Text }
+    return $s
+}
+
+function Get-TextLayout {
+    # Where each gap (3+ spaces) and each paragraph end of a text box falls on the sheet,
+    # by simulating Excel's word wrap with approximate character widths.
+    param($It)
+    $text = Get-RunsText $It
+    $size = 11.0
+    foreach ($r in $It.Runs) { if ([string]$r.Text -match '\S' -and [double]$r.Size -gt 0) { $size = [double]$r.Size; break } }
+    $m = $It.Margins
+    if (-not $m -or $m.Count -lt 4) { $m = @(7.2, 3.6, 7.2, 3.6) }
+    $avail = [math]::Max(10.0, [double]$It.W - [double]$m[0] - [double]$m[2])
+    $lineH = 1.22 * $size
+    $slots = New-Object System.Collections.Generic.List[object]
+    $line = 0; $x = 0.0; $pi = 0
+    $lineStartSlot = 0
+    $lineWidths = New-Object System.Collections.Generic.List[double]
+    $i = 0; $n = $text.Length
+    $paraAlign = 'left'
+    $alignOf = { param($k) if ($It.Aligns -and $k -lt $It.Aligns.Count) { return [string]$It.Aligns[$k] } return 'left' }
+    $paraAlign = & $alignOf 0
+    $lineAlign = New-Object System.Collections.Generic.List[string]
+    $finishLine = { $lineWidths.Add($x); $lineAlign.Add($paraAlign) }
+    $noWrap = ($It.Wrap -eq $false)
+    $paraStart = $true
+    $paraLine = 0
+    while ($i -le $n) {
+        if ($paraStart) {
+            $paraStart = $false
+            $paraLine = $line
+            $lead = ''
+            if ($i -lt $n) { $lead = [string]$text[$i] }
+            if ($lead -eq ' ' -or $lead -eq '/' -or $lead -eq '·') {
+                $slots.Add([pscustomobject]@{ Kind = 'start'; Line = $line; X = 0.0; Start = $i; End = $i; Fill = (New-Object System.Collections.Generic.List[object]) })
+            }
+        }
+        if ($i -eq $n -or $text[$i] -eq "`r") {
+            $slots.Add([pscustomobject]@{ Kind = 'end'; Line = $line; X = $x; Start = $i; End = $i; ParaLine = $paraLine; Fill = (New-Object System.Collections.Generic.List[object]) })
+            & $finishLine
+            if ($i -eq $n) { break }
+            $line++; $x = 0.0; $pi++; $paraAlign = & $alignOf $pi; $i++; $paraStart = $true; continue
+        }
+        if ($text[$i] -eq "`n" -or $text[$i] -eq "`v") { & $finishLine; $line++; $x = 0.0; $i++; continue }
+        if ($text[$i] -eq ' ') {
+            $j = $i; while ($j -lt $n -and $text[$j] -eq ' ') { $j++ }
+            $runW = Get-TextWidthPt (' ' * ($j - $i)) $size
+            if ($j - $i -ge 3) {
+                $slots.Add([pscustomobject]@{ Kind = 'gap'; Line = $line; X = $x + $runW / 2; Start = $i; End = $j; Fill = (New-Object System.Collections.Generic.List[object]) })
+            }
+            $x += $runW; $i = $j; continue
+        }
+        $j = $i; while ($j -lt $n -and $text[$j] -ne ' ' -and $text[$j] -ne "`r" -and $text[$j] -ne "`n" -and $text[$j] -ne "`v") { $j++ }
+        $ww = Get-TextWidthPt $text.Substring($i, $j - $i) $size
+        if (-not $noWrap -and $x -gt 0 -and $x + $ww -gt $avail * 1.04) { & $finishLine; $line++; $x = 0.0 }
+        $x += $ww; $i = $j
+    }
+    # paragraph alignment shifts each line; absolute sheet positions
+    $nLines = [math]::Max(1, $lineWidths.Count)
+    $top = [double]$It.T + [double]$m[1]
+    if ($It.Anchor -eq 'middle') { $top = [double]$It.T + ([double]$It.H - $nLines * $lineH) / 2 }
+    elseif ($It.Anchor -eq 'bottom') { $top = [double]$It.T + [double]$It.H - [double]$m[3] - $nLines * $lineH }
+    foreach ($s in $slots) {
+        $off = 0.0
+        if ($s.Line -lt $lineWidths.Count) {
+            $lw = $lineWidths[$s.Line]
+            if ($lineAlign[$s.Line] -eq 'center') { $off = ($avail - $lw) / 2 } elseif ($lineAlign[$s.Line] -eq 'right') { $off = $avail - $lw }
+        }
+        $s | Add-Member -NotePropertyName AbsX -NotePropertyValue ([double]$It.L + [double]$m[0] + $off + $s.X)
+        $s | Add-Member -NotePropertyName AbsY -NotePropertyValue ($top + ($s.Line + 0.5) * $lineH)
+        if ($s.Kind -eq 'end') { $s | Add-Member -NotePropertyName ParaY -NotePropertyValue ($top + ($s.ParaLine + 0.5) * $lineH) }
+    }
+    return [pscustomobject]@{ Text = $text; Size = $size; LineH = $lineH; Slots = $slots; Lines = $nLines }
+}
+
+function Get-OverlayAnchor {
+    # Sheet position of the visible text of a small value box.
+    param($It)
+    $raw = Get-RunsText $It
+    $t = $raw.Trim()
+    $size = 11.0
+    foreach ($r in $It.Runs) { if ([string]$r.Text -match '\S' -and [double]$r.Size -gt 0) { $size = [double]$r.Size; break } }
+    $m = $It.Margins
+    if (-not $m -or $m.Count -lt 4) { $m = @(7.2, 3.6, 7.2, 3.6) }
+    $tw = Get-TextWidthPt $t $size
+    $lead = Get-TextWidthPt (' ' * ($raw.Length - $raw.TrimStart().Length)) $size
+    $align = 'left'
+    if ($It.Aligns -and $It.Aligns.Count) { $align = [string]$It.Aligns[0] }
+    $x = [double]$It.L + [double]$m[0] + $lead + $tw / 2
+    if ($align -eq 'center') { $x = [double]$It.L + [double]$It.W / 2 }
+    elseif ($align -eq 'right') { $x = [double]$It.L + [double]$It.W - [double]$m[2] - $tw / 2 }
+    $y = [double]$It.T + [double]$It.H / 2
+    return [pscustomobject]@{ X = $x; Y = $y; Text = $t; Size = $size; Width = $tw }
+}
+
+function Get-ContainerOf {
+    # Smallest filled card/panel under a point (so values are only joined within the same card).
+    param($Items, [double]$X, [double]$Y)
+    $best = $null; $bestA = 1e18
+    foreach ($c in $Items) {
+        if ($c.Kind -ne 'fill' -and $c.Kind -ne 'shape') { continue }
+        if (-not (Test-OpaqueBg $c.Bg)) { continue }
+        if ($X -lt $c.L -or $X -gt $c.L + $c.W -or $Y -lt $c.T -or $Y -gt $c.T + $c.H) { continue }
+        $a = [double]$c.W * [double]$c.H
+        if ($a -lt $bestA) { $bestA = $a; $best = $c }
+    }
+    if ($null -eq $best) { return '' }
+    return (Get-ItemId $best)
+}
+
+function Test-SlotHost {
+    # A sentence that has room for values Excel places over it: a run of 3+ spaces, or an ending such
+    # as "Report Date:", "1 January –", "Completion at", "(".
+    param([string]$Text)
+    if ($Text -match '\S {3,}|^ {3,}\S|\( {2,}\)') { return $true }
+    $t = $Text.TrimEnd()
+    if ($t -match '[:–—\-|(/=]$' -or $t -match '\s(at|to|of|by|is|from)$') { return $true }
+    return $false
+}
+
+function Get-SlotCost {
+    # How well a value box (anchor A) fits a slot of a sentence (layout Lay, box H); 1e12 = cannot fit.
+    param($A, $Sl, $Lay, $H)
+    $dx = $A.X - $Sl.AbsX
+    $dl = [math]::Abs(($A.Y - $Sl.AbsY) / $Lay.LineH)
+    if ($Sl.Kind -eq 'end') {
+        $right = [double]$H.L + [double]$H.W
+        if ($A.X -ge $right - 4) {
+            # placed just past the sentence's box: appended to that paragraph, whatever the wrap estimate says
+            $dlp = [math]::Abs(($A.Y - $Sl.ParaY) / $Lay.LineH)
+            $alt = 20 + ($A.X - $right) + 10 * [math]::Min($dl, $dlp)
+            if ($A.X - $right -le 130 -and ($dl -le 1.6 -or $dlp -le 1.6)) { return $alt }
+        }
+        if ($dl -gt 1.6 -or $dx -lt -15 -or $dx -gt 130) { return 1e12 }
+        return 20 + [math]::Max(0, $dx) + 10 * $dl
+    }
+    if ($dl -gt 1.6 -or [math]::Abs($dx) -gt [math]::Max(45.0, 4 * $Lay.Size)) { return 1e12 }
+    $pen = 0
+    # spaces that start a continuation paragraph are indentation rather than a value slot
+    if ($Sl.Kind -eq 'gap' -and $Sl.Start -gt 0 -and "`r`n`v".IndexOf($Lay.Text[$Sl.Start - 1]) -ge 0) { $pen = 30 }
+    return [math]::Abs($dx) + 10 * $dl + $pen
+}
+
+function Merge-OverlayText {
+    # Values that Excel shows inside a sentence by placing a separate small text box over a gap
+    # ("Report Date:  [10/22/2026]", "—  [67.66%]  of total") are written into that sentence.
+    # Values are matched to the sentence's gaps in reading order; positions only confirm the match.
+    param($Items)
+    $plain = New-Object System.Collections.Generic.List[object]
+    foreach ($it in $Items) {
+        if ($it.Kind -ne 'shape' -or -not $it.Runs) { continue }
+        if ((Test-OpaqueBg $it.Bg) -or $it.Border) { continue }
+        $plain.Add($it)
+    }
+    $hosts = New-Object System.Collections.Generic.List[object]
+    $overlays = New-Object System.Collections.Generic.List[object]
+    foreach ($it in $plain) {
+        $t = Get-RunsText $it
+        $trim = $t.Trim()
+        if ($trim.Length -gt 0 -and $trim.Length -le 32 -and $trim -notmatch '   ' -and $trim -notmatch "[`r`n`v]") { $overlays.Add($it) }
+        if ($trim.Length -ge 4 -and (Test-SlotHost $t)) { $hosts.Add($it) }
+    }
+    if ($hosts.Count -eq 0 -or $overlays.Count -eq 0) { return 0 }
+    $layouts = @{}; $boxOf = @{}
+    foreach ($h in $hosts) {
+        $hid = Get-ItemId $h
+        try { $layouts[$hid] = Get-TextLayout $h } catch { continue }
+        $boxOf[$hid] = Get-ContainerOf $Items ([double]$h.L + [math]::Min(12.0, [double]$h.W / 2)) ([double]$h.T + [math]::Min(8.0, [double]$h.H / 2))
+    }
+    # each value box goes to the one sentence it sits in (same card, inside or just right of it)
+    $byHost = @{}
+    foreach ($o in $overlays) {
+        $a = Get-OverlayAnchor $o
+        $obox = Get-ContainerOf $Items $a.X $a.Y
+        $best = $null; $bestScore = 1e9
+        foreach ($h in $hosts) {
+            $hid = Get-ItemId $h
+            if ([object]::ReferenceEquals($h, $o) -or -not $layouts.ContainsKey($hid)) { continue }
+            if ($boxOf[$hid] -ne $obox) { continue }
+            $lay = $layouts[$hid]
+            if ($a.Y -lt $h.T - 4 -or $a.Y -gt $h.T + $h.H + 4) { continue }
+            if ($a.X -lt $h.L - 8 -or $a.X -gt $h.L + $h.W + 70) { continue }
+            $dist = 0.0
+            if ($a.X -gt $h.L + $h.W) { $dist = $a.X - ($h.L + $h.W) }
+            $fit = 1e12
+            foreach ($sl in $lay.Slots) { $c = Get-SlotCost $a $sl $lay $h; if ($c -lt $fit) { $fit = $c } }
+            if ($fit -ge 1e12) { continue }
+            $score = $fit + $dist
+            if ($score -lt $bestScore) { $bestScore = $score; $best = $h }
+        }
+        if ($null -eq $best) { continue }
+        $bid = Get-ItemId $best
+        if (-not $byHost.ContainsKey($bid)) { $byHost[$bid] = New-Object System.Collections.Generic.List[object] }
+        $byHost[$bid].Add([pscustomobject]@{ O = $o; A = $a })
+    }
+    $mergedO = New-Object System.Collections.Generic.List[object]
+    foreach ($h in $hosts) {
+        $hid = Get-ItemId $h
+        if (-not $byHost.ContainsKey($hid)) { continue }
+        $lay = $layouts[$hid]
+        $top = $h.T
+        # values in reading order (same visual line -> left to right)
+        $byY = @($byHost[$hid] | Sort-Object @{ Expression = { $_.A.Y } })
+        $band = 0; $prevY = -1e9
+        foreach ($e in $byY) { if ($e.A.Y - $prevY -gt 0.75 * $lay.LineH) { $band++ }; $prevY = $e.A.Y; $e | Add-Member -NotePropertyName Band -NotePropertyValue $band -Force }
+        $ovs = @($byY | Sort-Object Band, @{ Expression = { $_.A.X } })
+        $slots = @($lay.Slots | Sort-Object Start, @{ Expression = { if ($_.Kind -eq 'start') { 0 } elseif ($_.Kind -eq 'gap') { 1 } else { 2 } } })
+        $nO = $ovs.Count; $nS = $slots.Count
+        if ($nS -eq 0) { continue }
+        # monotonic alignment of values to slots (dynamic programming): minimal total distance
+        $INF = 1e12
+        $dp = New-Object 'double[,]' ($nO + 1), ($nS + 1)
+        $bk = New-Object 'int[,]' ($nO + 1), ($nS + 1)
+        for ($i = 0; $i -le $nO; $i++) { for ($j = 0; $j -le $nS; $j++) { $dp[$i, $j] = $INF } }
+        $dp[0, 0] = 0
+        $costOf = {
+            param($i, $j)
+            $c = Get-SlotCost $ovs[$i].A $slots[$j] $lay $h
+            if ($c -ge 1e12) { return $INF }
+            return $c
+        }
+        for ($i = 0; $i -le $nO; $i++) {
+            for ($j = 0; $j -le $nS; $j++) {
+                $cur = $dp[$i, $j]
+                if ($cur -ge $INF) { continue }
+                if ($j -lt $nS -and $cur -lt $dp[$i, ($j + 1)]) { $dp[$i, ($j + 1)] = $cur; $bk[$i, ($j + 1)] = 1 }            # slot left empty
+                if ($i -lt $nO -and $cur + 200 -lt $dp[($i + 1), $j]) { $dp[($i + 1), $j] = $cur + 200; $bk[($i + 1), $j] = 2 } # value not joined
+                if ($i -lt $nO -and $j -lt $nS) {
+                    $c = & $costOf $i $j
+                    if ($c -lt $INF) {
+                        if ($slots[$j].Kind -eq 'end') {
+                            if ($cur + $c -lt $dp[($i + 1), $j]) { $dp[($i + 1), $j] = $cur + $c; $bk[($i + 1), $j] = 4 }       # several values after the text end
+                        }
+                        elseif ($cur + $c -lt $dp[($i + 1), ($j + 1)]) { $dp[($i + 1), ($j + 1)] = $cur + $c; $bk[($i + 1), ($j + 1)] = 3 }
+                    }
+                }
+            }
+        }
+        $i = $nO; $j = $nS
+        $pairs = New-Object System.Collections.Generic.List[object]
+        while ($i -gt 0 -or $j -gt 0) {
+            $b = $bk[$i, $j]
+            if ($b -eq 1) { $j-- }
+            elseif ($b -eq 2) { $i-- }
+            elseif ($b -eq 3) { $pairs.Add(@(($i - 1), ($j - 1))); $i--; $j-- }
+            elseif ($b -eq 4) { $pairs.Add(@(($i - 1), $j)); $i-- }
+            else { break }
+        }
+        if ($pairs.Count -eq 0) { continue }
+        foreach ($pr in $pairs) { $slots[$pr[1]].Fill.Add($ovs[$pr[0]]); $mergedO.Add($ovs[$pr[0]].O) }
+        # rebuild the runs: host text with the values written into their slots
+        $owner = New-Object System.Collections.Generic.List[object]
+        foreach ($r in $h.Runs) { foreach ($ch in ([string]$r.Text).ToCharArray()) { $owner.Add($r) } }
+        $at = @{}
+        foreach ($sl in $slots) { $k = [string]$sl.Start; if (-not $at.ContainsKey($k)) { $at[$k] = New-Object System.Collections.Generic.List[object] }; $at[$k].Add($sl) }
+        $out = New-Object System.Collections.Generic.List[object]
+        $emit = {
+            param($Run, [string]$Txt)
+            if ($Txt.Length -eq 0) { return }
+            if ($out.Count -gt 0 -and [object]::ReferenceEquals($out[$out.Count - 1].Src, $Run)) { $out[$out.Count - 1].Text += $Txt; return }
+            $out.Add([pscustomobject]@{ Src = $Run; Text = $Txt })
+        }
+        $valueRun = {
+            param($f)
+            $vr = $f.O.Runs[0]
+            foreach ($orr in $f.O.Runs) { if ([string]$orr.Text -match '\S') { $vr = $orr; break } }
+            return $vr
+        }
+        $text = $lay.Text
+        $i = 0
+        $hasFill = $false
+        while ($i -le $text.Length) {
+            $k = [string]$i
+            $skipTo = -1
+            if ($at.ContainsKey($k)) {
+                foreach ($sl in $at[$k]) {
+                    if ($sl.Kind -eq 'start' -and $sl.Fill.Count) {
+                        foreach ($f in $sl.Fill) { & $emit (& $valueRun $f) ((Get-RunsText $f.O).Trim() + ' ') }
+                    }
+                    elseif ($sl.Kind -eq 'end' -and $sl.Fill.Count) {
+                        foreach ($f in $sl.Fill) {
+                            $prev = ''; if ($out.Count) { $prev = $out[$out.Count - 1].Text }
+                            $sep = ' '; if ($prev.EndsWith(' ') -or $prev.Length -eq 0) { $sep = '' }
+                            & $emit (& $valueRun $f) ($sep + (Get-RunsText $f.O).Trim())
+                        }
+                    }
+                    elseif ($sl.Kind -eq 'gap') {
+                        $prevCh = ''; if ($i -gt 0) { $prevCh = [string]$text[$i - 1] }
+                        $lead = ($i -eq 0 -or $prevCh -eq "`r" -or $prevCh -eq "`n" -or $prevCh -eq "`v")
+                        if ($sl.Fill.Count) {
+                            $f = $sl.Fill[0]
+                            $nextCh = ''; if ($sl.End -lt $text.Length) { $nextCh = [string]$text[$sl.End] }
+                            if (-not $lead -and $prevCh -ne '(') { & $emit $owner[$i] ' ' }
+                            & $emit (& $valueRun $f) (Get-RunsText $f.O).Trim()
+                            if (',.;:)%'.IndexOf($nextCh) -lt 0 -or $nextCh -eq '') { & $emit $owner[$sl.End - 1] ' ' }
+                        }
+                        elseif (-not $lead) { & $emit $owner[$i] ' ' }
+                        $skipTo = $sl.End
+                    }
+                }
+            }
+            if ($i -eq $text.Length) { break }
+            if ($skipTo -ge 0) { $i = $skipTo; continue }
+            & $emit $owner[$i] ([string]$text[$i])
+            $i++
+        }
+        $newRuns = New-Object System.Collections.Generic.List[object]
+        foreach ($seg in $out) { $nr = $seg.Src.PSObject.Copy(); $nr.Text = $seg.Text; $newRuns.Add($nr) }
+        $h.Runs = $newRuns
+        # the sentence's box now also covers where the values stood, so it never wraps because of them
+        $l0 = [double]$h.L; $r0 = [double]$h.L + [double]$h.W
+        foreach ($pr in $pairs) { $ob = $ovs[$pr[0]].O; if ($ob.L -lt $l0) { $l0 = [double]$ob.L }; if ($ob.L + $ob.W -gt $r0) { $r0 = [double]$ob.L + [double]$ob.W } }
+        $h.L = $l0; $h.W = $r0 - $l0
+        $h | Add-Member -NotePropertyName MergedValues -NotePropertyValue $true -Force
+    }
+    foreach ($o in $mergedO) { [void](Remove-ItemRef $Items $o) }
+    return $mergedO.Count
+}
+
+function Optimize-ReportPages {
+    # Runs once after page detection, before any drawing. Never changes text or numbers -
+    # it only decides which page an object is shown on and joins split sentences.
+    param($Pages)
+    $all = New-Object System.Collections.Generic.List[object]
+    $seen = @{}
+    foreach ($p in $Pages) { foreach ($it in $p.Items) { $id = Get-ItemId $it; if (-not $seen.ContainsKey($id)) { $seen[$id] = $true; $all.Add($it) } } }
+    $lists = @{}
+    foreach ($p in $Pages) { $lists[$p.Index] = New-Object System.Collections.Generic.List[object] }
+    foreach ($it in $all) {
+        $best = $null; $bestOv = -1.0
+        $t0 = [double]$it.T; $t1 = [double]$it.T + [math]::Max([double]$it.H, 0.5)
+        if ($it.Kind -eq 'shape' -and -not $it.Runs -and -not (Test-OpaqueBg $it.Bg)) { $c = ($t0 + $t1) / 2; $t0 = $c - 0.25; $t1 = $c + 0.25 }
+        foreach ($p in $Pages) {
+            $ov = [math]::Min($t1, [double]$p.EndY) - [math]::Max($t0, [double]$p.StartY)
+            if ($ov -gt $bestOv) { $bestOv = $ov; $best = $p }
+        }
+        if ($best -and $bestOv -gt 0) { $lists[$best.Index].Add($it) }
+    }
+    $dropped = 0; $mergedTotal = 0; $helper = New-Object System.Collections.Generic.List[string]
+    foreach ($p in $Pages) {
+        $items = $lists[$p.Index]
+        # empty text boxes (a single space) carry nothing to show
+        foreach ($it in @($items | Where-Object { $_.Kind -eq 'shape' -and $_.Runs -and -not (Test-OpaqueBg $_.Bg) -and -not $_.Border -and (Get-RunsText $_).Trim().Length -eq 0 })) { [void](Remove-ItemRef $items $it); $dropped++ }
+        # the same value box stacked several times at one spot: keep the top one
+        $keep = @{}
+        foreach ($it in ($items | Where-Object { $_.Kind -eq 'shape' -and $_.Runs } | Sort-Object Z -Descending)) {
+            $key = '{0}|{1}|{2}' -f (Get-RunsText $it).Trim(), [math]::Round([double]$it.L / 3), [math]::Round([double]$it.T / 3)
+            if ($keep.ContainsKey($key)) { [void](Remove-ItemRef $items $it); $dropped++ } else { $keep[$key] = $true }
+        }
+        # helper cells beside the page panels (calculation area) are not part of the page design
+        $panelL = 1e9; $panelR = -1e9
+        $extR = 0.0
+        foreach ($it in $items) { if ($it.L + $it.W -gt $extR) { $extR = $it.L + $it.W } }
+        foreach ($it in $items) {
+            if ($it.Kind -ne 'shape' -or -not (Test-OpaqueBg $it.Bg)) { continue }
+            if ($it.W -lt 0.4 * $extR -or $it.H -lt 100) { continue }
+            if ($it.L -lt $panelL) { $panelL = $it.L }
+            if ($it.L + $it.W -gt $panelR) { $panelR = $it.L + $it.W }
+        }
+        $kept = New-Object System.Collections.Generic.List[object]
+        if ($panelR -gt 0) {
+            foreach ($it in @($items | Where-Object { $_.Kind -in 'cell', 'fill', 'blank' -and ($_.L -ge $panelR + 2 -or $_.L + $_.W -le $panelL - 2) })) {
+                [void](Remove-ItemRef $items $it)
+                if ($it.Kind -eq 'cell') { $helper.Add([string]$it.Address); $kept.Add($it) }
+            }
+        }
+        $p | Add-Member -NotePropertyName HelperCells -NotePropertyValue $kept -Force
+        try { $mergedTotal += Merge-OverlayText -Items $items } catch { Add-Issue -Severity Warning -Location ('Page {0}' -f $p.Index) -Message ('Values inside sentences could not be joined: {0}' -f $_.Exception.Message) }
+        # this page's own width
+        # transparent decorations (no fill, no text) may reach past the panels; they never set the page size
+        $minL = 1e9; $maxR = 0.0
+        foreach ($it in $items) {
+            if ($it.Kind -in 'blank') { continue }
+            if ($it.Kind -eq 'shape' -and -not $it.Runs -and -not (Test-OpaqueBg $it.Bg)) { continue }
+            if ($it.L -lt $minL) { $minL = [double]$it.L }
+            if ($it.L + $it.W -gt $maxR) { $maxR = [double]$it.L + [double]$it.W }
+        }
+        if ($maxR -gt $minL) { $p.OffsetX = [math]::Max(0, $minL - 4); $p.Width = $maxR + 4 - $p.OffsetX }
+        $minT = [double]$p.StartY; $maxB = [double]$p.EndY
+        foreach ($it in $items) {
+            if ($it.Kind -eq 'shape' -and -not $it.Runs -and -not (Test-OpaqueBg $it.Bg)) { continue }
+            if ($it.T -lt $minT) { $minT = [double]$it.T }; if ($it.T + $it.H -gt $maxB) { $maxB = [double]$it.T + [double]$it.H }
+        }
+        $p.StartY = $minT; $p.EndY = $maxB
+        $sorted = New-Object System.Collections.Generic.List[object]
+        foreach ($it in ($items | Sort-Object Z)) { $sorted.Add($it) }
+        $p.Items = $sorted
+    }
+    Write-Log ("Page clean-up: {0} value(s) joined into their sentences, {1} empty/duplicate text box(es) skipped, each object shown on one page only." -f $mergedTotal, $dropped)
+    if ($helper.Count) { Write-Log ("Helper cells beside the page panels are not shown: {0}" -f ($helper -join ', ')) }
 }
 
 # ======================================================================================
@@ -1852,6 +2320,11 @@ function ConvertTo-ItemHtml {
                 $tx = 'padding:{0}pt {1}pt {2}pt {3}pt;justify-content:{4}' -f (Format-Num $m[1]), (Format-Num $m[2]), (Format-Num $m[3]), (Format-Num $m[0]), $jc
                 if ($It.TextOrientation -eq 2 -or $It.TextOrientation -eq 6) { $tx += ';writing-mode:vertical-rl;transform:rotate(180deg)' }
                 elseif ($It.TextOrientation -eq 3 -or $It.TextOrientation -eq 5) { $tx += ';writing-mode:vertical-rl' }
+                # base size = smallest run size, so the browser's default 16px never sets a taller
+                # minimum line height than Excel uses (small-font text otherwise spills out of its box)
+                $minSize = 0
+                foreach ($run in $It.Runs) { if ($run.Size -gt 0 -and ($minSize -eq 0 -or $run.Size -lt $minSize)) { $minSize = [double]$run.Size } }
+                if ($minSize -gt 0) { $tx += ';font-size:{0}pt' -f (Format-Num $minSize) }
                 $sb = New-Object System.Text.StringBuilder
                 $pi = 0
                 $alignOf = {
@@ -1883,6 +2356,7 @@ function ConvertTo-ItemHtml {
                 $inner = '<div class="tx" style="{0}">{1}</div>' -f $tx, $sb.ToString()
             }
             $cls = if ($It.Wrap) { 'it shp' } else { 'it shp nowrap' }
+            if ($It.Runs -and (Get-RunsText $It).Trim() -notmatch '\s') { $cls = 'it shp nowrap' }
             $inspect = ''
             try { $inspect = ([System.Net.WebUtility]::HtmlEncode([string](Get-InspectText $It))).Replace([string][char]10, '&#10;') }
             catch { $inspect = [System.Net.WebUtility]::HtmlEncode([string]$It.Name) + ' (details unavailable: ' + [System.Net.WebUtility]::HtmlEncode($_.Exception.Message) + ')' }
@@ -1897,6 +2371,12 @@ function ConvertTo-ItemHtml {
             return '<svg class="it" style="{0}" viewBox="0 0 {1} {2}" preserveAspectRatio="none"><line x1="{3}" y1="{4}" x2="{5}" y2="{6}" stroke="{7}" stroke-width="{8}"/></svg>' -f $st, (Format-Num $w), (Format-Num $h), (Format-Num $x1), (Format-Num $y1), (Format-Num $x2), (Format-Num $y2), $It.Color, (Format-Num $It.Weight)
         }
         'image' {
+            if ($It.IsChart -and $It.Spec -and $It.Spec.kind) {
+                $json = $It.Spec | ConvertTo-Json -Depth 8 -Compress
+                $fb = ''
+                if ($It.Src) { $fb = '<img src="{0}" alt="{1}" style="width:100%;height:100%">' -f $It.Src, (ConvertTo-Attr $It.Alt) }
+                return ('<div class="it rchart" style="{0}" data-w="{1}" data-h="{2}" data-chart="{3}">{4}</div>' -f $box, (Format-Num ([double]$It.W * 4 / 3)), (Format-Num ([double]$It.H * 4 / 3)), [System.Net.WebUtility]::HtmlEncode($json), $fb)
+            }
             $cls = if ($It.IsChart) { 'it img chart' } else { 'it img' }
             return '<img class="{0}" src="{1}" alt="{2}" title="{2}" style="{3}">' -f $cls, $It.Src, (ConvertTo-Attr $It.Alt), $box
         }
@@ -2131,7 +2611,18 @@ function Save-PageInventory {
                 elseif ($it.Kind -eq 'shape' -and $it.Runs) { $text = (($it.Runs | ForEach-Object { $_.Text }) -join '') }
                 $o = [ordered]@{ kind = $it.Kind; name = [string]$it.Name; address = [string]$it.Address; L = [math]::Round($it.L, 1); T = [math]::Round($it.T, 1); W = [math]::Round($it.W, 1); H = [math]::Round($it.H, 1); Z = $it.Z
                     bg = $it.Bg; text = $text; link = $it.Formula }
-                if ($it.Kind -eq 'shape' -and $it.Runs) { $o['runs'] = @($it.Runs | ForEach-Object { [ordered]@{ text = $_.Text; size = $_.Size; bold = $_.Bold; color = $_.Color; font = $_.Font } }) }
+                if ($it.Kind -eq 'shape' -and $it.Runs) { $o['runs'] = @($it.Runs | ForEach-Object { [ordered]@{ text = $_.Text; size = $_.Size; bold = $_.Bold; italic = $_.Italic; color = $_.Color; font = $_.Font } }) }
+                if ($it.Kind -eq 'shape') {
+                    $o['border'] = $it.Border; $o['radius'] = $it.Radius; $o['shadow'] = $it.Shadow; $o['rot'] = $it.Rot
+                    $o['anchor'] = $it.Anchor; $o['wrap'] = $it.Wrap; $o['orient'] = $it.TextOrientation
+                    if ($it.Margins) { $o['margins'] = @($it.Margins) }
+                    if ($it.Aligns) { $al = New-Object System.Collections.Generic.List[string]; foreach ($x in $it.Aligns) { $al.Add([string]$x) }; $o['aligns'] = $al.ToArray() }
+                }
+                if ($it.Kind -eq 'cell') {
+                    $o['font'] = [ordered]@{ name = $it.FontName; size = $it.FontSize; bold = $it.Bold; italic = $it.Italic; color = $it.Color }
+                    $o['align'] = $it.Align; $o['valign'] = $it.VAlign; $o['wrapText'] = $it.Wrap; $o['borders'] = $it.Borders
+                }
+                if ($it.Kind -eq 'image') { $o['isChart'] = [bool]$it.IsChart; $o['hasPicture'] = [bool]$it.Src }
                 if ($it.Spec) { $o['chart'] = $it.Spec }
                 $objs.Add($o)
             }
@@ -2206,17 +2697,6 @@ function New-DashboardSite {
         & $add ('<div class="pbar"><div class="pt"><span class="pn">{0:D2}</span><h2>{1}</h2><span class="rows">rows {2}&ndash;{3}</span></div><div class="tools">' -f $p.Index, (& $enc $p.Title), $p.StartRow, $p.EndRow)
         & $add ('<span class="pnum">{0} / {1}</span></div></div>' -f $p.Index, $n)
         & $add ('<div class="pbody"><div class="cvwrap" style="--w:{0}pt;--h:{1}pt;--pz:{2}">' -f (Format-Num $wPt), (Format-Num $hPt), (Format-Num $pz))
-        if ($RenderMode -eq 'Rebuilt') {
-            $flow = ''
-            try { $flow = ConvertTo-RebuiltPage $p }
-            catch { Add-Issue -Severity Warning -Location ("Page {0}" -f $p.Index) -Message ("Page could not be rebuilt: {0}" -f (Format-ErrorDetail $_)) }
-            & $add ('<div class="cv rb" data-w="{0}" data-h="auto" style="width:{1}pt">' -f (Format-Num ($wPt * $pt2px)), (Format-Num $wPt))
-            & $add $flow
-            & $add '</div></div></div>'
-            & $add ('<div class="pf"><span>{0}</span><span>Wkly_Report &middot; page {1} of {2}</span><span class="c">{3}</span></div></section>' -f (& $enc $DashboardTitle), $p.Index, $n, (& $enc $Classification))
-            & $add "`n"
-            continue
-        }
         & $add ('<div class="cv" data-w="{0}" data-h="{1}" style="width:{2}pt;height:{3}pt">' -f (Format-Num ($wPt * $pt2px)), (Format-Num ($hPt * $pt2px)), (Format-Num $wPt), (Format-Num $hPt))
         if ($p.Picture) {
             $picHtml = ''
@@ -2402,6 +2882,7 @@ body.inspect .shp:hover{outline:2px solid #e5484d;outline-offset:-1px}
 .rleaf.rtext .cell{display:flex}
 .rimg img{width:100%;height:100%;object-fit:contain;display:block}
 .rchart{position:relative;overflow:hidden}
+.it.rchart{position:absolute}
 .rchart svg{display:block;width:100%;height:100%}
 .rchart text{pointer-events:none}
 .rchart [data-tip]{pointer-events:all;cursor:default}
@@ -2491,6 +2972,7 @@ $DashboardJs = @'
     var sec = nf.split(';');
     if (v === 0 && sec.length > 2) { var z = sec[2].replace(/_.|\*.|["\\\s]/g, ''); if (/^[-–]$/.test(z)) return '-'; }
     if (v < 0 && sec.length > 1) nf = sec[1]; else nf = sec[0];
+    if (!nf.replace(/["\s]/g, '')) return '';   // ;;; = hidden in Excel
     if (/general/i.test(nf)) { var r = Math.round(v * 100) / 100; return String(r); }
     if (/\[?h\]?:mm/i.test(nf)) {
       var t = Math.round(Math.abs(v) * 86400), h = Math.floor(t / 3600), m = Math.floor(t % 3600 / 60), s2 = t % 60;
@@ -2599,7 +3081,7 @@ $DashboardJs = @'
         var vf = lb && lb.format && lb.format.indexOf('%') < 0 && !/general/i.test(lb.format) ? lb.format : '#,##0';
         tips.push(cat + ': ' + fmt(s0.values[i], vf) + ' (' + (v / tot * 100).toFixed(2) + '%)');
         o.push('<path d="' + d + '" fill="' + col + '" stroke="rgba(0,0,0,.25)" stroke-width="1" data-tip="' + (tips.length - 1) + '"/>');
-        if (lb && v > 0) {
+        if (lb && v > 0 && v / tot >= 0.02) {
           var parts = [];
           if (lb.category) parts.push(cat);
           if (lb.value) parts.push(fmt(s0.values[i], lb.format));
@@ -2753,9 +3235,27 @@ $DashboardJs = @'
       wrap.style.height = (H * s) + 'px';
     });
   }
+  // wrapped text that needs a little more room than its Excel box is shrunk slightly (at most 15%)
+  // so it does not run over the next object; the wording is never changed
+  function fitText() {
+    [].slice.call(document.querySelectorAll('.shp > .tx')).forEach(function (tx) {
+      try {
+        if (tx.parentNode.classList.contains('nowrap')) return;
+        var els = [tx].concat([].slice.call(tx.querySelectorAll('span')));
+        els.forEach(function (el) {
+          if (!el.getAttribute('data-fs')) el.setAttribute('data-fs', parseFloat(getComputedStyle(el).fontSize));
+          el.style.fontSize = el.getAttribute('data-fs') + 'px';
+        });
+        for (var f = 0.97; f >= 0.849 && tx.scrollHeight > tx.clientHeight + 1; f -= 0.03) {
+          els.forEach(function (el) { el.style.fontSize = (parseFloat(el.getAttribute('data-fs')) * f) + 'px'; });
+        }
+      } catch (e) { }
+    });
+  }
+  fitText();
   window.addEventListener('resize', fit);
   fit();
-  if (document.fonts && document.fonts.ready) document.fonts.ready.then(fit);
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(function () { fitText(); fit(); });
 
   // page list is a pop-out, so pages always use the whole window width
   document.getElementById('btnMenu').addEventListener('click', function () { body.classList.toggle('sb'); });
@@ -2983,13 +3483,14 @@ function Invoke-Main {
         try { Find-OverlappingText -Items $items } catch { }
         $result = Find-ReportPages -Items $items -Geo $geo -ContentWidth $contentWidth -ContentBottom $contentBottom `
             -Mode $PageMode -StartRows $PageStartRows -BreakRows $breakRows -MinFont $TitleMinFontSize -MinHeight $MinPageHeightPt
+        Optimize-ReportPages -Pages $result.Pages
 
         $lastColLetter = ConvertTo-ColumnLetter ([math]::Max(1, $lastCol))
         $pictureNote = 'not captured'
         try {
             $pc = 0
             if ($RenderMode -eq 'Picture') { $pc = Add-PagePictures -Pages $result.Pages -Ws $ws -Geo $geo -AssetsDir $assets }
-            else { Write-Log 'Render mode Rebuilt: pages are rebuilt from the worksheet content; charts are redrawn from their data.' }
+            else { Write-Log 'Render mode Rebuilt: every object is drawn at its exact Excel position; charts are redrawn from their data.' }
             $pictureNote = '{0} of {1} pages shown as Excel''s own picture' -f $pc, $result.Pages.Count
         }
         catch { Add-Issue -Severity Warning -Location 'Page pictures' -Message ("Page pictures failed; the re-drawn view is shown: {0}" -f (Format-ErrorDetail $_)) }
