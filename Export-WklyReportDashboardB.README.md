@@ -24,7 +24,7 @@ cd C:\Temp
 .\Export-WklyReportDashboardB.ps1 -OpenWhenDone
 ```
 
-The first line printed shows the build, for example `Export-WklyReportDashboardB (Design B) build 2026.10.22-B2`.
+The first line printed shows the build, for example `Export-WklyReportDashboardB (Design B) build 2026.10.22-B3`.
 
 | Parameter | Default |
 |---|---|

@@ -51,7 +51,12 @@ Before pushing any change to `VMware_Weekly_HealthCheck.ps1` (or similar scripts
    also safe for `$null`) and use `$list.Count`; `@(... | Where-Object ...)` pipelines are fine. Test helper
    code with real `List[object]` data, not hand-built arrays, and make optional or diagnostic features
    unable to abort the main output (per-item try/catch).
-5. Don't guess twice at the same class of bug. If a fix doesn't hold up against the next report
+5. **Save scripts as UTF-8 *with* BOM.** Windows PowerShell 5.1 reads a BOM-less file as ANSI (Windows-1252),
+   so any non-ASCII character (`→ ▲ – — ·`, emoji) is misread: string comparisons silently stop matching, and a
+   character such as `→` inside quotes breaks parsing (`Export-WklyReportDashboardB.ps1` build B2 failed this way;
+   pwsh 7 assumes UTF-8 and hid it). Check with `head -c3 file | od -An -tx1` (must be `ef bb bf`), and
+   parse-check the file as 5.1 would by decoding it as code page 1252 when there is no BOM.
+6. Don't guess twice at the same class of bug. If a fix doesn't hold up against the next report
    the user sends, get the actual error/log data before proposing another fix, rather than
    patching blind again.
 

@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Presents the "Wkly_Report" worksheet of the weekly ITSM workbook as an executive HTML dashboard
     in the "Design B" style (charcoal / green / gold) - strictly READ-ONLY.
@@ -79,7 +79,7 @@ param(
     [switch]$OpenWhenDone
 )
 
-$ScriptBuild = '2026.10.22-B2'
+$ScriptBuild = '2026.10.22-B3'
 $SheetName = 'Wkly_Report'          # fixed by design - no other worksheet is ever read
 $Inv = [System.Globalization.CultureInfo]::InvariantCulture
 $ErrRegex = '#(DIV/0!|N/A|VALUE!|REF!|NAME\?|NUM!|NULL!|SPILL!|CALC!|FIELD!|BLOCKED!|CONNECT!|BUSY!|UNKNOWN!|GETTING_DATA)'
@@ -1760,8 +1760,9 @@ function Get-TextWidthPt {
     # Calibri advance widths (em) - only used to find which gap a value box fills.
     param([string]$Text, [double]$Size)
     if ($null -eq $script:CalibriEm) {
-        $t = @{}
-        $pairs = ' .226 a .479 b .525 c .423 d .525 e .498 f .305 g .471 h .525 i .229 j .239 k .455 l .229 m .799 n .525 o .527 p .525 q .525 r .349 s .391 t .335 u .525 v .452 w .715 x .433 y .453 z .395 ' +
+        # ordinal keys: 'a' and 'A' have different widths (a plain @{} would merge them); space is handled below
+        $t = New-Object System.Collections.Hashtable ([System.StringComparer]::Ordinal)
+        $pairs = 'a .479 b .525 c .423 d .525 e .498 f .305 g .471 h .525 i .229 j .239 k .455 l .229 m .799 n .525 o .527 p .525 q .525 r .349 s .391 t .335 u .525 v .452 w .715 x .433 y .453 z .395 ' +
             'A .579 B .544 C .533 D .615 E .488 F .459 G .631 H .623 I .252 J .319 K .520 L .420 M .855 N .646 O .662 P .517 Q .673 R .543 S .459 T .487 U .642 V .567 W .890 X .519 Y .487 Z .468 ' +
             ', .250 . .252 : .268 ; .268 | .460 / .386 ( .303 ) .303 % .715 & .682 + .498 - .306 _ .498 = .498 # .498 ~ .498 ! .326 ? .463 '' .221 " .401'
         $tok = $pairs.Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)

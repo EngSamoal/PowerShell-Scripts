@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Presents the "Wkly_Report" worksheet of the weekly ITSM workbook as an interactive,
     executive HTML dashboard - strictly READ-ONLY.
@@ -110,7 +110,7 @@ param(
     [switch]$OpenWhenDone
 )
 
-$ScriptBuild = '2026.10.22-r29'
+$ScriptBuild = '2026.10.22-r30'
 $SheetName = 'Wkly_Report'          # fixed by design - no other worksheet is ever read
 $Inv = [System.Globalization.CultureInfo]::InvariantCulture
 $ErrRegex = '#(DIV/0!|N/A|VALUE!|REF!|NAME\?|NUM!|NULL!|SPILL!|CALC!|FIELD!|BLOCKED!|CONNECT!|BUSY!|UNKNOWN!|GETTING_DATA)'
@@ -1792,8 +1792,9 @@ function Get-TextWidthPt {
     # Calibri advance widths (em) - only used to find which gap a value box fills.
     param([string]$Text, [double]$Size)
     if ($null -eq $script:CalibriEm) {
-        $t = @{}
-        $pairs = ' .226 a .479 b .525 c .423 d .525 e .498 f .305 g .471 h .525 i .229 j .239 k .455 l .229 m .799 n .525 o .527 p .525 q .525 r .349 s .391 t .335 u .525 v .452 w .715 x .433 y .453 z .395 ' +
+        # ordinal keys: 'a' and 'A' have different widths (a plain @{} would merge them); space is handled below
+        $t = New-Object System.Collections.Hashtable ([System.StringComparer]::Ordinal)
+        $pairs = 'a .479 b .525 c .423 d .525 e .498 f .305 g .471 h .525 i .229 j .239 k .455 l .229 m .799 n .525 o .527 p .525 q .525 r .349 s .391 t .335 u .525 v .452 w .715 x .433 y .453 z .395 ' +
             'A .579 B .544 C .533 D .615 E .488 F .459 G .631 H .623 I .252 J .319 K .520 L .420 M .855 N .646 O .662 P .517 Q .673 R .543 S .459 T .487 U .642 V .567 W .890 X .519 Y .487 Z .468 ' +
             ', .250 . .252 : .268 ; .268 | .460 / .386 ( .303 ) .303 % .715 & .682 + .498 - .306 _ .498 = .498 # .498 ~ .498 ! .326 ? .463 '' .221 " .401'
         $tok = $pairs.Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)
@@ -2209,16 +2210,55 @@ function Optimize-ReportPages {
         foreach ($it in $items) {
             if ($it.Kind -in 'blank') { continue }
             if ($it.Kind -eq 'shape' -and -not $it.Runs -and -not (Test-OpaqueBg $it.Bg)) { continue }
-            if ($it.L -lt $minL) { $minL = [double]$it.L }
-            if ($it.L + $it.W -gt $maxR) { $maxR = [double]$it.L + [double]$it.W }
+            $l = [double]$it.L; $r = [double]$it.L + [double]$it.W
+            # a text box without fill or outline only shows its text: it counts as far as the text reaches
+            if ($it.Kind -eq 'shape' -and $it.Runs -and -not (Test-OpaqueBg $it.Bg) -and -not $it.Border) {
+                try {
+                    $lineW = 0.0; $textW = 0.0
+                    foreach ($run in $it.Runs) {
+                        $parts = ([string]$run.Text) -split "[`r`n`v]"
+                        for ($q = 0; $q -lt $parts.Count; $q++) {
+                            if ($q -gt 0) { $lineW = 0.0 }
+                            $lineW += Get-TextWidthPt $parts[$q] ([double]$run.Size)
+                            if ($lineW -gt $textW) { $textW = $lineW }
+                        }
+                    }
+                    $m = $it.Margins; if (-not $m) { $m = @(7.2, 3.6, 7.2, 3.6) }
+                    $need = [math]::Min([double]$it.W, $textW * 1.05 + [double]$m[0] + [double]$m[2])
+                    $al = 'left'; if ($it.Aligns -and $it.Aligns.Count) { $al = [string]$it.Aligns[0] }
+                    if ($al -eq 'center') { $cx = $l + $it.W / 2; $l = $cx - $need / 2; $r = $cx + $need / 2 }
+                    elseif ($al -eq 'right') { $l = $r - $need }
+                    else { $r = $l + $need }
+                } catch { }
+            }
+            if ($l -lt $minL) { $minL = $l }
+            if ($r -gt $maxR) { $maxR = $r }
         }
         if ($maxR -gt $minL) { $p.OffsetX = [math]::Max(0, $minL - 4); $p.Width = $maxR + 4 - $p.OffsetX }
-        $minT = [double]$p.StartY; $maxB = [double]$p.EndY
+        # full-width bands (header bar, footer bar) reach both page edges, as in Excel's printed page
         foreach ($it in $items) {
+            if (-not (($it.Kind -eq 'shape' -and (Test-OpaqueBg $it.Bg)) -or $it.Kind -eq 'fill')) { continue }
+            if ($it.W -lt 0.85 * $p.Width) { continue }
+            $r = [double]$it.L + [double]$it.W
+            if ($it.L - $p.OffsetX -le 0.1 * $p.Width) { $it.L = [double]$p.OffsetX; $it.W = $r - $it.L }
+            if ($p.OffsetX + $p.Width - $r -le 0.15 * $p.Width) { $it.W = [double]$p.OffsetX + [double]$p.Width - [double]$it.L }
+        }
+        # page height follows the content, so empty rows at the end of the page range add no space;
+        # cell fills count only near the content (a panel's edge), never as a large empty area
+        $minT = [double]$p.StartY; $maxB = 0.0
+        foreach ($it in $items) {
+            if ($it.Kind -in 'blank', 'fill') { continue }
             if ($it.Kind -eq 'shape' -and -not $it.Runs -and -not (Test-OpaqueBg $it.Bg)) { continue }
             if ($it.T -lt $minT) { $minT = [double]$it.T }; if ($it.T + $it.H -gt $maxB) { $maxB = [double]$it.T + [double]$it.H }
         }
-        $p.StartY = $minT; $p.EndY = $maxB
+        if ($maxB -le $minT) { $maxB = [double]$p.EndY }
+        $contentB = $maxB
+        foreach ($it in $items) {
+            if ($it.Kind -ne 'fill') { continue }
+            $b = [double]$it.T + [double]$it.H
+            if ($b -gt $maxB -and $b -le $contentB + 40 -and $it.T -lt $contentB) { $maxB = $b }
+        }
+        $p.StartY = $minT; $p.EndY = $maxB + 4
         $sorted = New-Object System.Collections.Generic.List[object]
         foreach ($it in ($items | Sort-Object Z)) { $sorted.Add($it) }
         $p.Items = $sorted
@@ -3010,6 +3050,49 @@ $DashboardJs = @'
     if (cur) lines.push(cur);
     return lines.slice(0, 3);
   }
+  // text is measured with the real font, so labels are shortened or skipped instead of overlapping
+  var mctx = null;
+  function tw(t, f, defSize) {
+    f = f || {};
+    try {
+      if (!mctx) mctx = document.createElement('canvas').getContext('2d');
+      mctx.font = (f.italic ? 'italic ' : '') + (f.bold ? '700 ' : '') + px(f.size || defSize).toFixed(1) + 'px ' + (f.name ? '"' + f.name + '",' : '') + 'Calibri,Carlito,"Segoe UI",sans-serif';
+      return mctx.measureText(String(t)).width;
+    } catch (e) { return String(t).length * px(f.size || defSize) * 0.55; }
+  }
+  function clip(t, maxW, f, defSize) {
+    t = String(t);
+    if (maxW <= 0) return '';
+    if (tw(t, f, defSize) <= maxW) return t;
+    while (t.length > 1 && tw(t + '\u2026', f, defSize) > maxW) t = t.slice(0, -1);
+    return t.replace(/\s+$/, '') + '\u2026';
+  }
+  function wrapPx(t, maxW, f, defSize, maxLines) {
+    var words = String(t).split(/\s+/), lines = [], cur = '';
+    words.forEach(function (w) {
+      var nx = cur ? cur + ' ' + w : w;
+      if (cur && tw(nx, f, defSize) > maxW) { lines.push(cur); cur = w; } else cur = nx;
+    });
+    if (cur) lines.push(cur);
+    if (lines.length > maxLines) { lines = lines.slice(0, maxLines); lines[maxLines - 1] += '\u2026'; }
+    return lines.map(function (ln) { return clip(ln, maxW, f, defSize); });
+  }
+  function scaled(f, k) { var g = {}; f = f || {}; for (var key in f) g[key] = f[key]; g.size = (f.size || 9) * k; return g; }
+  // places a label only where it does not overlap one already placed
+  function placer(W, H) {
+    var boxes = [];
+    return function (x, y, text, f, anchor, defSize) {
+      if (!text) return '';
+      var w = tw(text, f, defSize), h = px((f && f.size) || defSize);
+      var x0 = anchor === 'middle' ? x - w / 2 : anchor === 'end' ? x - w : x;
+      if (x0 < 1) { x0 = 1; } if (x0 + w > W - 1) { x0 = W - 1 - w; }
+      var b = { l: x0, r: x0 + w, t: y - h * 0.8, b: y + h * 0.2 };
+      for (var i = 0; i < boxes.length; i++) { var q = boxes[i]; if (b.l < q.r + 1 && b.r > q.l - 1 && b.t < q.b && b.b > q.t) return ''; }
+      boxes.push(b);
+      return '<text x="' + x0.toFixed(1) + '" y="' + y.toFixed(1) + '" ' + fontAttr(f, defSize, chartTxt) + '>' + esc(text) + '</text>';
+    };
+  }
+  var chartTxt = '#404040';
   function seriesColor(sr, i) {
     var pal = ['#4472c4', '#ed7d31', '#a5a5a5', '#ffc000', '#5b9bd5', '#70ad47'];
     if (sr.kind === 'line' || sr.kind === 'area') return sr.lineOn !== false && sr.line ? sr.line : (sr.fill || pal[i % 6]);
@@ -3019,6 +3102,8 @@ $DashboardJs = @'
     var sp = JSON.parse(el.getAttribute('data-chart'));
     var W = parseFloat(el.dataset.w), H = parseFloat(el.dataset.h);
     var txt = (sp.font && sp.font.color) || '#404040';
+    chartTxt = txt;
+    var put = placer(W, H);
     var o = [], tips = [];
     var top = 8, bottom = H - 8, left = 10, right = W - 10;
     if (sp.bg) { el.style.background = sp.bg; }
@@ -3044,21 +3129,32 @@ $DashboardJs = @'
     }
     var lf = sp.legendFont || sp.font || {}, lsz = px(lf.size || 9);
     if (legend.length && (sp.legend === 'bottom' || sp.legend === 'top')) {
-      var lx = 0, items = legend.map(function (e) { var w = e.name.length * lsz * 0.55 + lsz * 2.2; lx += w; return w; });
-      var x0 = Math.max(left, (W - lx) / 2), ly = sp.legend === 'bottom' ? bottom - lsz * 0.3 : top + lsz;
-      legend.forEach(function (e, i) {
-        o.push(e.line ? '<line x1="' + x0 + '" y1="' + (ly - lsz * 0.35) + '" x2="' + (x0 + lsz * 1.4) + '" y2="' + (ly - lsz * 0.35) + '" stroke="' + e.color + '" stroke-width="3"/>'
-          : '<rect x="' + x0 + '" y="' + (ly - lsz * 0.8) + '" width="' + lsz * 0.8 + '" height="' + lsz * 0.8 + '" fill="' + e.color + '"/>');
-        o.push('<text x="' + (x0 + lsz * 1.6) + '" y="' + ly + '" ' + fontAttr(lf, 9, txt) + '>' + esc(e.name) + '</text>');
-        x0 += items[i];
+      // legend entries wrap onto more rows when they do not fit on one
+      var avail = W - 20, rows = [[]], rw = [0];
+      legend.forEach(function (e) {
+        var nm = clip(e.name, avail - lsz * 2.2, lf, 9), w = tw(nm, lf, 9) + lsz * 2.2;
+        if (rw[rw.length - 1] + w > avail && rows[rows.length - 1].length) { rows.push([]); rw.push(0); }
+        rows[rows.length - 1].push({ e: e, nm: nm, w: w }); rw[rw.length - 1] += w;
       });
-      if (sp.legend === 'bottom') bottom -= lsz * 1.8; else top += lsz * 1.8;
+      var rowH = lsz * 1.45, ly0 = sp.legend === 'bottom' ? bottom - lsz * 0.3 - rowH * (rows.length - 1) : top + lsz;
+      rows.forEach(function (row, ri) {
+        var x0 = Math.max(10, (W - rw[ri]) / 2), ly = ly0 + ri * rowH;
+        row.forEach(function (it) {
+          var e = it.e;
+          o.push(e.line ? '<line x1="' + x0 + '" y1="' + (ly - lsz * 0.35) + '" x2="' + (x0 + lsz * 1.4) + '" y2="' + (ly - lsz * 0.35) + '" stroke="' + e.color + '" stroke-width="3"/>'
+            : '<rect x="' + x0 + '" y="' + (ly - lsz * 0.8) + '" width="' + lsz * 0.8 + '" height="' + lsz * 0.8 + '" fill="' + e.color + '"/>');
+          o.push('<text x="' + (x0 + lsz * 1.6) + '" y="' + ly + '" ' + fontAttr(lf, 9, txt) + '>' + esc(it.nm) + '</text>');
+          x0 += it.w;
+        });
+      });
+      if (sp.legend === 'bottom') bottom -= rowH * rows.length + lsz * 0.4; else top += rowH * rows.length + lsz * 0.4;
     } else if (legend.length) {
-      var ry = top + 10, lw = Math.min(W * 0.32, Math.max.apply(null, legend.map(function (e) { return e.name.length; })) * lsz * 0.55 + lsz * 2);
+      var ry = top + 10, lw = Math.min(W * 0.32, Math.max.apply(null, legend.map(function (e) { return tw(e.name, lf, 9); })) + lsz * 2);
       var rx = sp.legend === 'left' ? left : right - lw;
       legend.forEach(function (e) {
+        if (ry > bottom) return;
         o.push('<rect x="' + rx + '" y="' + (ry - lsz * 0.8) + '" width="' + lsz * 0.8 + '" height="' + lsz * 0.8 + '" fill="' + e.color + '"/>');
-        o.push('<text x="' + (rx + lsz * 1.4) + '" y="' + ry + '" ' + fontAttr(lf, 9, txt) + '>' + esc(e.name) + '</text>');
+        o.push('<text x="' + (rx + lsz * 1.4) + '" y="' + ry + '" ' + fontAttr(lf, 9, txt) + '>' + esc(clip(e.name, lw - lsz * 1.4, lf, 9)) + '</text>');
         ry += lsz * 1.5;
       });
       if (sp.legend === 'left') left += lw + 6; else right -= lw + 6;
@@ -3069,7 +3165,7 @@ $DashboardJs = @'
       var cx = (left + right) / 2, cy = (top + bottom) / 2, R = Math.max(10, Math.min(right - left, bottom - top) / 2 - 18);
       var r0 = sp.kind === 'doughnut' ? R * (sp.hole || 50) / 100 : 0;
       var a = (sp.firstAngle || 0) * Math.PI / 180 - Math.PI / 2;
-      var lb = s0.labels;
+      var lb = s0.labels, pieLabels = [];
       vals.forEach(function (v, i) {
         if (!tot) return;
         var a2 = a + v / tot * 2 * Math.PI, col = (s0.points && s0.points[i]) || seriesColor(s0, i), big = a2 - a > Math.PI ? 1 : 0;
@@ -3087,10 +3183,11 @@ $DashboardJs = @'
           if (lb.value) parts.push(fmt(s0.values[i], lb.format));
           if (lb.percent) parts.push(fmt(v / tot, lb.format && lb.format.indexOf('%') >= 0 ? lb.format : '0%'));
           var mid = (a + a2) / 2, lr = r0 ? (R + r0) / 2 : (v / tot < 0.08 ? R + 14 : R * 0.65);
-          o.push('<text x="' + (cx + lr * Math.cos(mid)) + '" y="' + (cy + lr * Math.sin(mid) + 4) + '" text-anchor="middle" ' + fontAttr(lb.font, 9, txt) + '>' + esc(parts.join(', ')) + '</text>');
+          pieLabels.push([cx + lr * Math.cos(mid), cy + lr * Math.sin(mid) + 4, parts.join(', ')]);
         }
         a = a2;
       });
+      pieLabels.forEach(function (q) { o.push(put(q[0], q[1], q[2], lb.font, 'middle', 9)); });
       el.innerHTML = '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none">' + o.join('') + '</svg><div class="ctip"></div>';
       bindTips(el, tips);
       return;
@@ -3111,13 +3208,18 @@ $DashboardJs = @'
     var n = Math.max(1, cats.length || (series[0] && series[0].values ? series[0].values.length : 1));
     var catW = 0;
     if (horiz) {
-      catW = Math.min((right - left) * 0.42, Math.max.apply(null, cats.map(function (c) { return String(c).length; }).concat([1])) * csz * 0.55 + 8);
+      catW = Math.min((right - left) * 0.42, Math.max.apply(null, cats.map(function (c) { return tw(c, xf.font, 9); }).concat([1])) + 10);
+      // value labels at the bar ends need room inside the chart
+      var lblW = 0;
+      series.forEach(function (s) { if ((s.kind === 'bar' || s.kind === 'column') && s.labels && s.labels.value) (s.values || []).forEach(function (v) { if (v !== null) lblW = Math.max(lblW, tw(fmt(v, s.labels.format), s.labels.font, 9)); }); });
+      if (lblW) right -= lblW + 6;
       if (xf.show !== false) left += catW;
       if (yf.show !== false) top += tsz + 6;
     } else {
       if (yf.show !== false) left += Math.max.apply(null, [fmt(A1.max, yf.format), fmt(A1.min, yf.format)].map(function (t) { return t.length; })) * tsz * 0.6 + 8;
       if (A2 && y2f.show !== false) right -= Math.max.apply(null, [fmt(A2.max, y2f.format)].map(function (t) { return t.length; })) * tsz * 0.6 + 8;
-      var maxLines = Math.max.apply(null, cats.map(function (c) { return wrapText(c, Math.max(4, Math.floor((right - left) / n / (csz * 0.55)))).length; }).concat([1]));
+      var maxLines = Math.max.apply(null, cats.map(function (c) { return wrapPx(c, (right - left) / n - 4, xf.font, 9, 2).length; }).concat([1]));
+      if (series.some(function (s) { return s.labels && s.labels.value; })) top += tsz + 2;
       if (xf.show !== false) bottom -= csz * 1.25 * maxLines + 6;
     }
     var plotL = left, plotR = right, plotT = top + 6, plotB = bottom;
@@ -3137,10 +3239,16 @@ $DashboardJs = @'
     var band = (horiz ? plotB - plotT : plotR - plotL) / n;
     var order = function (i) { return horiz ? (xf.reverse ? i : n - 1 - i) : (xf.reverse ? n - 1 - i : i); };
     var C = function (i) { return (horiz ? plotT : plotL) + band * (order(i) + 0.5); };
+    // category names: shortened with an ellipsis to their own space (full name in the tooltip),
+    // smaller when the rows are tighter than the font, and only every k-th one when still crowded
+    var cf = xf.font, cfs = csz;
+    if (horiz && band < csz * 1.15) { var k0 = Math.max(0.75, band / (csz * 1.15)); cf = scaled(xf.font, k0); cfs = csz * k0; }
+    var every = horiz ? Math.max(1, Math.ceil(cfs * 1.1 / band)) : 1;
     if (xf.show !== false) cats.forEach(function (c, i) {
-      if (horiz) o.push('<text x="' + (plotL - 6) + '" y="' + (C(i) + csz * 0.35) + '" text-anchor="end" ' + fontAttr(xf.font, 9, txt) + '>' + esc(c) + '</text>');
-      else wrapText(c, Math.max(4, Math.floor(band / (csz * 0.55)))).forEach(function (ln, k) {
-        o.push('<text x="' + C(i) + '" y="' + (plotB + csz * (k + 1.1)) + '" text-anchor="middle" ' + fontAttr(xf.font, 9, txt) + '>' + esc(ln) + '</text>');
+      if (i % every) return;
+      if (horiz) o.push('<text x="' + (plotL - 6) + '" y="' + (C(i) + cfs * 0.35) + '" text-anchor="end" ' + fontAttr(cf, 9, txt) + '><title>' + esc(c) + '</title>' + esc(clip(c, catW - 8, cf, 9)) + '</text>');
+      else wrapPx(c, band - 4, xf.font, 9, 2).forEach(function (ln, k) {
+        o.push('<text x="' + C(i) + '" y="' + (plotB + csz * (k + 1.1)) + '" text-anchor="middle" ' + fontAttr(xf.font, 9, txt) + '><title>' + esc(c) + '</title>' + esc(ln) + '</text>');
       });
     });
     o.push(horiz ? '<line x1="' + V(0) + '" y1="' + plotT + '" x2="' + V(0) + '" y2="' + plotB + '" stroke="#8c8c8c"/>' : '<line x1="' + plotL + '" y1="' + V(Math.max(A1.min, 0)) + '" x2="' + plotR + '" y2="' + V(Math.max(A1.min, 0)) + '" stroke="#8c8c8c"/>');
@@ -3169,8 +3277,8 @@ $DashboardJs = @'
           if (s.labels.value) t.push(fmt(v, s.labels.format));
           if (s.labels.category) t.push(cats[i] || '');
           if (s.labels.series) t.push(s.name || '');
-          if (t.length) labelsOut.push(horiz ? '<text x="' + (Math.max(p0, p1) + 4) + '" y="' + (c0 + bw / 2 + tsz * 0.35) + '" ' + fontAttr(s.labels.font, 9, txt) + '>' + esc(t.join(', ')) + '</text>'
-            : '<text x="' + (c0 + bw / 2) + '" y="' + (Math.min(p0, p1) - 4) + '" text-anchor="middle" ' + fontAttr(s.labels.font, 9, txt) + '>' + esc(t.join(', ')) + '</text>');
+          if (t.length) labelsOut.push(horiz ? [Math.max(p0, p1) + 4, c0 + bw / 2 + tsz * 0.35, t.join(', '), s.labels.font, 'start']
+            : [c0 + bw / 2, Math.min(p0, p1) - 4, t.join(', '), s.labels.font, 'middle']);
         }
       });
     });
@@ -3186,10 +3294,11 @@ $DashboardJs = @'
       pts.forEach(function (q) {
         tips.push((cats[q[3]] || '') + ' - ' + (s.name || '') + ': ' + fmt(q[2], (s.labels && s.labels.format) || (s.axis === 2 ? y2f.format : yf.format)));
         o.push('<circle cx="' + q[0] + '" cy="' + q[1] + '" r="' + (s.marker ? 4 : 6) + '" fill="' + (s.marker ? (s.markerColor || col) : 'transparent') + '" data-tip="' + (tips.length - 1) + '"/>');
-        if (s.labels && s.labels.value) labelsOut.push('<text x="' + (q[0] + 4) + '" y="' + (q[1] - 6) + '" ' + fontAttr(s.labels.font, 9, txt) + '>' + esc(fmt(q[2], s.labels.format)) + '</text>');
+        if (s.labels && s.labels.value) labelsOut.push([q[0], q[1] - 6, fmt(q[2], s.labels.format), s.labels.font, 'middle']);
       });
     });
-    o = o.concat(labelsOut);
+    // value labels never overlap each other: a label that would is left to the tooltip
+    labelsOut.forEach(function (q) { o.push(put(q[0], q[1], q[2], q[3], q[4], 9)); });
     el.innerHTML = '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none">' + o.join('') + '</svg><div class="ctip"></div>';
     bindTips(el, tips);
   }
