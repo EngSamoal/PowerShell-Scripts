@@ -51,6 +51,11 @@
     colours and fonts in Excel's arrangement, charts redrawn natively from their own data (sharp,
     values on hover). Picture: each page is a high-resolution picture of Excel's rendering (r26 behaviour).
 
+.PARAMETER ChartRender
+    Excel (default): every chart is Excel's own picture of it, taken at high resolution, so it looks
+    exactly as in Excel (labels, callouts, 3D, smoothed lines, colours). Native: charts are redrawn
+    from their data (sharp at any zoom, values on hover, but not identical to Excel).
+
 .PARAMETER PageStartRows
     Only with -PageMode Manual: first row of each page, e.g. 1,40,72,105
 
@@ -99,6 +104,8 @@ param(
     [string]$PageMode = 'Auto',
     [ValidateSet('Rebuilt', 'Picture')]
     [string]$RenderMode = 'Rebuilt',
+    [ValidateSet('Excel', 'Native')]
+    [string]$ChartRender = 'Excel',
     [int[]]$PageStartRows,
     [double]$TitleMinFontSize = 17,
     [double]$MinPageHeightPt = 250,
@@ -110,7 +117,7 @@ param(
     [switch]$OpenWhenDone
 )
 
-$ScriptBuild = '2026.10.22-r30'
+$ScriptBuild = '2026.10.22-r31'
 $SheetName = 'Wkly_Report'          # fixed by design - no other worksheet is ever read
 $Inv = [System.Globalization.CultureInfo]::InvariantCulture
 $ErrRegex = '#(DIV/0!|N/A|VALUE!|REF!|NAME\?|NUM!|NULL!|SPILL!|CALC!|FIELD!|BLOCKED!|CONNECT!|BUSY!|UNKNOWN!|GETTING_DATA)'
@@ -136,6 +143,9 @@ $script:PdfScale = 2
 $script:PdfReady = $null
 $script:PictureMethods = @{}
 $script:BitmapScales = New-Object System.Collections.Generic.List[double]
+$script:ChartScales = New-Object System.Collections.Generic.List[double]
+$script:ChartZoomSet = $false
+$script:ChartShots = @{ sharp = 0; export = 0; fails = 0; why = $null }
 $script:ItemSeq = 0
 
 # ======================================================================================
@@ -862,6 +872,59 @@ function Export-ChartImage {
     return $false
 }
 
+function Export-ChartSharp {
+    # Excel's own screen picture of the chart, taken with the hidden temp copy zoomed to 300%, so the
+    # chart looks exactly as in Excel and stays sharp in the dashboard. $false (with the reason) when it
+    # cannot be taken or is not sharper than Chart.Export; the caller then uses Chart.Export.
+    param($Shape, [string]$Path, [double]$WidthPt, [double]$HeightPt, [ref]$ErrorText)
+    try {
+        if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
+            $ErrorText.Value = 'clipboard access needs Windows PowerShell or PowerShell ISE (STA thread)'
+            return $false
+        }
+        Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+        $null = Initialize-EmfHelper
+        Save-ClipboardOnce
+        if (-not $script:ChartZoomSet) {
+            $script:ChartZoomSet = $true
+            try {
+                $null = $script:XlSheet.Activate()
+                $win = $script:XlApp.ActiveWindow
+                $was = [string]$win.Zoom
+                $win.Zoom = 300
+                Write-Log ("Chart pictures: zoom of the temporary copy set from {0} to 300% so Excel draws the charts at high resolution." -f $was)
+            }
+            catch { Write-Log ("Chart pictures: zoom could not be raised ({0})." -f $_.Exception.Message) 'WARN' }
+        }
+        $err = $null
+        $img = Get-ClipboardPicture -Target $Shape -Appearance 1 -Format 2 -ErrorText ([ref]$err)   # xlScreen, xlBitmap
+        if (-not $img) { $ErrorText.Value = [string]$err; return $false }
+        $sx = $img.Width / ($WidthPt * 96 / 72); $sy = $img.Height / ($HeightPt * 96 / 72)
+        if ($sx -lt 1.3 -or [math]::Abs($sx - $sy) / $sx -gt 0.04) {
+            $img.Dispose()
+            $ErrorText.Value = ('picture came out at {0}x by {1}x the chart size' -f [math]::Round($sx, 2), [math]::Round($sy, 2))
+            return $false
+        }
+        # a hidden Excel window can hand back an empty picture: one colour everywhere means blank
+        $blank = $true
+        try {
+            $first = $img.GetPixel(0, 0).ToArgb()
+            for ($gy = 1; $gy -le 9 -and $blank; $gy++) {
+                for ($gx = 1; $gx -le 9; $gx++) {
+                    if ($img.GetPixel([int]($img.Width * $gx / 10), [int]($img.Height * $gy / 10)).ToArgb() -ne $first) { $blank = $false; break }
+                }
+            }
+        }
+        catch { $blank = $false }
+        if ($blank) { $img.Dispose(); $ErrorText.Value = 'picture was blank'; return $false }
+        $script:ChartScales.Add([math]::Round($sx, 2))
+        $img.Save($Path, ('System.Drawing.Imaging.ImageFormat' -as [type])::Png); $img.Dispose()
+        $ErrorText.Value = $null
+        return $true
+    }
+    catch { $ErrorText.Value = $_.Exception.Message; return $false }
+}
+
 function Get-ClipboardPicture {
     # Asks Excel for a picture of $Target (a range or shape) and reads it from the clipboard.
     # Another program can hold the clipboard for a moment, so every step waits and retries; the
@@ -1385,10 +1448,23 @@ function Read-OneShape {
             $title = $name
             try { if (Test-MsoTrue $Shape.Chart.HasTitle) { $title = [string]$Shape.Chart.ChartTitle.Text } } catch { }
             $exportError = $null
-            $exported = (Export-ChartImage -Shape $Shape -Path $full -ErrorText ([ref]$exportError)) -eq $true
+            $exported = $false
+            if ($ChartRender -eq 'Excel' -and $script:ChartShots.fails -lt 2) {
+                $sharpError = $null
+                $exported = (Export-ChartSharp -Shape $Shape -Path $full -WidthPt $W -HeightPt $H -ErrorText ([ref]$sharpError)) -eq $true
+                if ($exported) { $script:ChartShots.sharp++ }
+                else {
+                    if ($script:ChartShots.sharp -eq 0) { $script:ChartShots.fails++ }   # stops trying after two failures in a row at the start
+                    if (-not $script:ChartShots.why) { $script:ChartShots.why = "'$name': $sharpError" }
+                }
+            }
+            if (-not $exported) {
+                $exported = (Export-ChartImage -Shape $Shape -Path $full -ErrorText ([ref]$exportError)) -eq $true
+                if ($exported) { $script:ChartShots.export++ }
+            }
             $spec = $null
             try { $spec = Get-ChartSpec $Shape } catch { Write-Log ("Chart '{0}': data could not be read ({1}); Excel's chart image is used." -f $name, $_.Exception.Message) 'WARN' }
-            if ($spec -and -not $spec.kind) { Write-Log ("Chart '{0}': chart type {1} is not rebuilt natively; Excel's chart image is used." -f $name, $spec.excelType) }
+            if ($ChartRender -eq 'Native' -and $spec -and -not $spec.kind) { Write-Log ("Chart '{0}': chart type {1} is not rebuilt natively; Excel's chart image is used." -f $name, $spec.excelType) }
             if ($exported) {
                 $Items.Add([pscustomobject]@{ Kind = 'image'; L = $L; T = $T; W = $W; H = $H; Z = $Z; Rot = $rot; Src = "assets/$file"; Alt = $title; IsChart = $true; Spec = $spec })
                 if ((Get-Item -LiteralPath $full).Length -lt 1500) {
@@ -1529,6 +1605,11 @@ function Read-ShapeItems {
     }
     Write-Progress -Activity 'Reading Wkly_Report shapes and charts' -Completed
     Write-Log ("Read {0} shapes ({1} charts exported)." -f $n, $script:ChartIndex)
+    if ($ChartRender -eq 'Excel' -and $script:ChartIndex -gt 0) {
+        $res = ''; if ($script:ChartScales.Count) { $res = ' at ' + (Format-Num (($script:ChartScales | Measure-Object -Minimum).Minimum)) + 'x resolution or better' }
+        Write-Log ("Charts shown as Excel's own picture: {0} sharp screen picture(s){1}, {2} via Chart.Export (normal resolution)." -f $script:ChartShots.sharp, $res, $script:ChartShots.export)
+        if ($script:ChartShots.export -gt 0 -and $script:ChartShots.why) { Write-Log ("Sharp chart picture not available, first reason: {0}" -f $script:ChartShots.why) 'WARN' }
+    }
 }
 
 # ======================================================================================
@@ -2411,7 +2492,7 @@ function ConvertTo-ItemHtml {
             return '<svg class="it" style="{0}" viewBox="0 0 {1} {2}" preserveAspectRatio="none"><line x1="{3}" y1="{4}" x2="{5}" y2="{6}" stroke="{7}" stroke-width="{8}"/></svg>' -f $st, (Format-Num $w), (Format-Num $h), (Format-Num $x1), (Format-Num $y1), (Format-Num $x2), (Format-Num $y2), $It.Color, (Format-Num $It.Weight)
         }
         'image' {
-            if ($It.IsChart -and $It.Spec -and $It.Spec.kind) {
+            if ($It.IsChart -and $It.Spec -and $It.Spec.kind -and ($ChartRender -eq 'Native' -or -not $It.Src)) {
                 $json = $It.Spec | ConvertTo-Json -Depth 8 -Compress
                 $fb = ''
                 if ($It.Src) { $fb = '<img src="{0}" alt="{1}" style="width:100%;height:100%">' -f $It.Src, (ConvertTo-Attr $It.Alt) }
@@ -3599,7 +3680,8 @@ function Invoke-Main {
         try {
             $pc = 0
             if ($RenderMode -eq 'Picture') { $pc = Add-PagePictures -Pages $result.Pages -Ws $ws -Geo $geo -AssetsDir $assets }
-            else { Write-Log 'Render mode Rebuilt: every object is drawn at its exact Excel position; charts are redrawn from their data.' }
+            elseif ($ChartRender -eq 'Excel') { Write-Log 'Render mode Rebuilt: every object is drawn at its exact Excel position; charts are Excel''s own pictures of them (-ChartRender Excel).' }
+            else { Write-Log 'Render mode Rebuilt: every object is drawn at its exact Excel position; charts are redrawn from their data (-ChartRender Native).' }
             $pictureNote = '{0} of {1} pages shown as Excel''s own picture' -f $pc, $result.Pages.Count
         }
         catch { Add-Issue -Severity Warning -Location 'Page pictures' -Message ("Page pictures failed; the re-drawn view is shown: {0}" -f (Format-ErrorDetail $_)) }

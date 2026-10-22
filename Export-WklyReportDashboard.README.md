@@ -25,10 +25,12 @@ It is **read-only**: no worksheet, formula, chart, PivotTable or value is change
       into that sentence, so they can no longer overlap or drift;
     - text uses Excel's line spacing; wrapped text that still needs slightly more room than its box is
       shrunk by at most 15% instead of running over the next object;
-  - **charts are redrawn natively from their own data** - series values, categories, Excel's axis
-    scale and number formats, colours (per bar where set), data labels, legend and title - so they are
-    sharp at any zoom and show values on hover. Blank and error values stay gaps, never 0. A chart
-    type that is not supported is shown as Excel's own image of that chart instead.
+  - **charts are Excel's own pictures of them** (default `-ChartRender Excel`, build r31 and later),
+    taken with the temporary copy zoomed to 300% so they stay sharp. They match Excel exactly: data
+    labels and callouts where Excel puts them, 3D, smoothed lines, rotated axis labels, colours. If that
+    picture cannot be taken on a PC, Excel's normal chart export is used (the log says which).
+    `-ChartRender Native` redraws charts from their data instead (sharp, values on hover, but not
+    identical to Excel).
 - `-RenderMode Picture` shows each page as a high-resolution picture of Excel's rendering instead
   (the previous behaviour).
 - Each run writes a **page inventory** (`page-inventory <date>.json`, next to the log) listing what
@@ -65,6 +67,7 @@ while it runs (it uses the clipboard briefly for the page pictures and restores 
 | `-WorkbookPath` | `C:\Temp\Bi_Wkly_Report-Daily Data.xlsx` | Workbook to read |
 | `-OutputDirectory` | `C:\Temp\ITSM_Dashboard` | Folder for the single `<workbook name>.html` |
 | `-RenderMode` | `Rebuilt` | `Rebuilt` (pages rebuilt from content, native charts) or `Picture` (Excel's rendering as pictures) |
+| `-ChartRender` | `Excel` | `Excel` (Excel's own chart pictures, identical to Excel) or `Native` (redrawn from data, values on hover) |
 | `-PageMode` | `Auto` | `Auto`, `Titles`, `PageBreaks`, `Manual` |
 | `-PageStartRows` | – | With `-PageMode Manual`: e.g. `1,40,72,105` |
 | `-TitleMinFontSize` | `17` | Font size that counts as a page title |
@@ -117,8 +120,9 @@ Always attach the log (path printed at the end of the run) when reporting a prob
   overflows its box in Excel itself can still touch the object below it (shrinking stops at 15%).
 - The page inventory written by r29 also records text alignment and inner margins. If any page still
   differs from Excel, send the new `page-inventory` file and the log from the same run.
-- Native charts reproduce data, colours, scale, labels and legend; Excel's special effects (3D,
-  bevels, glow, gradients inside bars) are drawn flat. Multi-level category labels show one level.
+- With `-ChartRender Excel` (default) charts are pictures: they do not show values on hover.
+- With `-ChartRender Native`, charts reproduce data, colours, scale, labels and legend, but Excel's
+  special effects (3D, bevels, glow, gradients, label callouts) are drawn flat and simplified.
 - Linked/camera pictures (e.g. a picture of a table on another tab) are shown as Excel's picture.
 - The file includes all page content and is typically a few MB; Outlook/Teams previews may not run the
   page's script - download the file and open it in Edge or Chrome.
