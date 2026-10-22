@@ -2,7 +2,8 @@
 
 Turns the `Wkly_Report` worksheet of the weekly ITSM workbook into **one self-contained HTML
 file**: styling, buttons and every page picture are embedded, so the file works on its own when
-sent by email or Teams, offline, in Edge or Chrome. No PDF and no assets folder are produced.
+sent by email or Teams, offline, in Edge or Chrome. From build r32 it also writes a **PDF** and a
+**PowerPoint (.pptx)** copy next to it, with the same name (no assets folder is produced).
 It is **read-only**: no worksheet, formula, chart, PivotTable or value is changed.
 
 ## 1. How it works
@@ -33,6 +34,14 @@ It is **read-only**: no worksheet, formula, chart, PivotTable or value is change
     identical to Excel).
 - `-RenderMode Picture` shows each page as a high-resolution picture of Excel's rendering instead
   (the previous behaviour).
+- **PDF and PowerPoint** (build r32 and later): after the HTML is written, Microsoft Edge (or Chrome)
+  opens that local file in a hidden window and takes one picture of each finished page at twice the
+  screen resolution. Nothing is sent anywhere.
+  - the PDF has one page per dashboard page, each exactly that page's size, so nothing is cut off;
+  - the PowerPoint file has one 16:9 slide per page, with the whole page fitted in. It is written
+    directly, so PowerPoint does not need to be installed;
+  - both are written only when every page was captured; otherwise the log says why, and the HTML is
+    still complete. Close an open copy of the PDF/PPTX before running, or it cannot be replaced.
 - Each run writes a **page inventory** (`page-inventory <date>.json`, next to the log) listing what
   was read from every page - attach it when something differs from Excel.
 
@@ -74,9 +83,11 @@ while it runs (it uses the clipboard briefly for the page pictures and restores 
 | `-MinPageHeightPt` | `250` | Title candidates closer than this belong to the same page |
 | `-DashboardTitle` | `ITSM Executive Dashboard` | Top-bar text |
 | `-Classification` | `CONFIDENTIAL` | Marking on top bar and every page footer |
+| `-SkipPdf` | off | Do not write the PDF |
+| `-SkipPptx` | off | Do not write the PowerPoint file |
 | `-OpenWhenDone` | off | Open the dashboard at the end |
 
-Output: exactly one file, `<workbook name>.html`. Working files go to a private temporary folder that
+Output: `<workbook name>.html`, `.pdf` and `.pptx`. Working files go to a private temporary folder that
 is deleted at the end. The log is written to `%TEMP%\ITSM_Dashboard_logs\` (its path is printed at the end).
 
 ## 4. Using the dashboard
