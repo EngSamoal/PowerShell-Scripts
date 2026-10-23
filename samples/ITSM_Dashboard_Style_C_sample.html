@@ -1,0 +1,532 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ITSM Report Style C</title>
+<style>
+/* ===== Style C "Desert Editorial" - solid colours only (no gradients, shadows or transparency) ===== */
+:root{
+  color-scheme:light;
+  --bg:#efe7d8;--paper:#fbf7ef;--paper-2:#f4ecdd;--ink:#1c1b19;--ink-2:#4a4741;--ink-3:#6f6a60;--rule:#d8cdb8;--rule-2:#c4b69c;
+  --mast:#1c1b19;--mast-ink:#fbf7ef;--mast-ink-2:#b9b09f;--mast-btn:#2e2c28;--mast-btn-h:#3d3a35;
+  --c1:#a52c3c;--c2:#b08216;--c3:#1d8a5c;--c4:#8e5a1c;--c5:#8c8578;
+  --band1:#1d8a5c;--band2:#2b2926;--band3:#b08216;--band4:#8e5a1c;--band-ink:#fbf7ef;--band3-ink:#1c1b19;
+  --good:#1d7a4c;--good-bg:#dcebe0;--warn:#8a6100;--warn-bg:#f3e4bd;--bad:#a52c3c;--bad-bg:#f2d9d6;
+  --tip-bg:#1c1b19;--tip-ink:#fbf7ef;--grid:#e6dccb;--sample:#b08216;--sample-ink:#1c1b19;
+}
+:root[data-theme="dark"]{
+  color-scheme:dark;
+  --bg:#151412;--paper:#1d1c1a;--paper-2:#262421;--ink:#f1ebdf;--ink-2:#cfc6b6;--ink-3:#9d9483;--rule:#34312c;--rule-2:#4a463f;
+  --mast:#0d0c0b;--mast-ink:#f1ebdf;--mast-ink-2:#9d9483;--mast-btn:#262421;--mast-btn-h:#34312c;
+  --c1:#c4505a;--c2:#b08a24;--c3:#2a9468;--c4:#a3692e;--c5:#8c8578;
+  --band1:#1f7a54;--band2:#57514a;--band3:#b08a24;--band4:#8c5a26;--band-ink:#f1ebdf;--band3-ink:#151412;
+  --good:#4fbf86;--good-bg:#173226;--warn:#e0b04a;--warn-bg:#3a2f12;--bad:#e67680;--bad-bg:#3d1c20;
+  --tip-bg:#f1ebdf;--tip-ink:#151412;--grid:#2a2825;--sample:#b08a24;--sample-ink:#151412;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--ink);font:18px/1.45 "Segoe UI",system-ui,-apple-system,Arial,sans-serif;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+h1,h2,h3,.serif{font-family:Georgia,"Times New Roman",serif;font-weight:700}
+.sample{background:var(--sample);color:var(--sample-ink);text-align:center;font-size:14px;font-weight:600;padding:6px 16px;letter-spacing:.3px}
+
+/* masthead + page tabs */
+.mast{position:sticky;top:0;z-index:20;background:var(--mast);color:var(--mast-ink)}
+.mast .row{display:flex;align-items:center;gap:14px;padding:12px 28px}
+.mast .mark{background:var(--c1);color:#fbf7ef;font:700 15px/1 "Segoe UI",sans-serif;letter-spacing:2px;padding:9px 10px}
+.mast h1{margin:0;font-size:24px;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mast h1 span{font:400 16px "Segoe UI",sans-serif;color:var(--mast-ink-2);margin-left:10px}
+.chip{border:2px solid var(--mast-ink-2);color:var(--mast-ink);padding:3px 10px;font-size:15px;white-space:nowrap}
+.btn{background:var(--mast-btn);color:var(--mast-ink);border:0;padding:8px 13px;font:600 15px "Segoe UI",sans-serif;cursor:pointer}
+.btn:hover{background:var(--mast-btn-h)}
+.conf{background:var(--c1);color:#fbf7ef;font-weight:700;letter-spacing:2px;font-size:14px;padding:8px 11px}
+.tabs{display:flex;overflow-x:auto;border-top:1px solid var(--mast-btn);padding:0 20px;scrollbar-width:none}
+.tabs::-webkit-scrollbar{display:none}
+.tabs a{flex:none;color:var(--mast-ink-2);text-decoration:none;padding:10px 14px 9px;font-size:15px;border-bottom:4px solid var(--mast)}
+.tabs a b{color:var(--mast-ink);margin-right:6px;font-variant-numeric:tabular-nums}
+.tabs a:hover{color:var(--mast-ink)}
+.tabs a.on{color:var(--mast-ink);border-bottom-color:var(--c2)}
+
+/* pages */
+main{padding:28px 28px 40px;max-width:1880px;margin:0 auto}
+section.pg{background:var(--paper);border:2px solid var(--ink);margin-bottom:34px;scroll-margin-top:118px}
+.ph{display:flex;align-items:stretch;border-bottom:2px solid var(--ink)}
+.ph .no{flex:none;width:118px;display:grid;place-items:center;font:700 54px/1 Georgia,serif;color:var(--band-ink);background:var(--band)}
+.ph .tt{flex:1;min-width:0;padding:16px 24px}
+.ph h2{margin:0;font-size:34px;letter-spacing:-.3px;line-height:1.1}
+.ph p{margin:6px 0 0;color:var(--ink-3);font-size:17px}
+.ph .per{flex:none;align-self:center;margin-right:24px;font-size:15px;color:var(--ink-2);border:2px solid var(--rule-2);padding:4px 10px;white-space:nowrap}
+section.pg:nth-of-type(4n+1){--band:var(--band1)}section.pg:nth-of-type(4n+2){--band:var(--band2)}
+section.pg:nth-of-type(4n+3){--band:var(--band3);--band-ink:var(--band3-ink)}section.pg:nth-of-type(4n+4){--band:var(--band4)}
+.bd{padding:22px 24px 24px}
+.pf{display:flex;justify-content:space-between;gap:12px;border-top:2px solid var(--ink);padding:9px 24px;font-size:14px;color:var(--ink-3);letter-spacing:.4px}
+.pf b{color:var(--ink)}
+
+/* grid + panels */
+.grid{display:grid;gap:18px}
+.g2{grid-template-columns:1fr 1fr}.g3{grid-template-columns:repeat(3,1fr)}.g4{grid-template-columns:repeat(4,1fr)}
+.g12{grid-template-columns:1.55fr 1fr}.g21{grid-template-columns:1fr 1.55fr}
+.mt{margin-top:18px}
+.panel{background:var(--paper);border:2px solid var(--rule);padding:16px 18px;min-width:0}
+.panel h3{margin:0;font-size:21px}
+.panel .sub{color:var(--ink-3);font-size:15px;margin:2px 0 10px}
+
+/* KPI tiles: labels share one height so numbers line up */
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:0;border:2px solid var(--ink)}
+.kpi{display:flex;flex-direction:column;padding:14px 18px 14px;border-right:2px solid var(--ink);background:var(--paper);min-width:0}
+.kpi:last-child{border-right:0}
+.kpi .lab{font-size:15px;font-weight:600;color:var(--ink-2);text-transform:uppercase;letter-spacing:.6px;line-height:1.3;min-height:2.6em}
+.kpi .val{font:700 42px/1.1 Georgia,serif;letter-spacing:-.5px;margin:6px 0 8px;font-variant-numeric:tabular-nums}
+.kpi .val small{font-size:22px;font-weight:400;color:var(--ink-3)}
+.kpi .meta{margin-top:auto;font-size:15px;color:var(--ink-3);display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.kpi.hero{background:var(--band);color:var(--band-ink)}
+.kpi.hero .lab,.kpi.hero .meta,.kpi.hero .val small{color:var(--band-ink)}
+.meter{height:8px;background:var(--rule);margin-top:8px}.meter i{display:block;height:100%;background:var(--c3)}
+.kpi.hero .meter{background:var(--band-ink)}.kpi.hero .meter i{background:var(--ink)}
+.pill{display:inline-flex;align-items:center;gap:5px;padding:1px 9px;font-size:14px;font-weight:700;white-space:nowrap}
+.ok{color:var(--good);background:var(--good-bg)}.wn{color:var(--warn);background:var(--warn-bg)}.bad{color:var(--bad);background:var(--bad-bg)}
+.kpi.hero .pill{background:var(--band-ink);color:var(--band)}
+
+/* charts */
+.chart{position:relative;width:100%}
+.chart svg{display:block;width:100%;overflow:visible}
+.chart text{font-family:"Segoe UI",system-ui,sans-serif}
+.ax{fill:var(--ink-3);font-size:14px}.lbl{fill:var(--ink-2);font-size:14px;font-weight:600}.gl{stroke:var(--grid)}.base{stroke:var(--ink-3)}
+.legend{display:flex;flex-wrap:wrap;gap:4px 16px;font-size:15px;color:var(--ink-2);margin-top:8px}
+.legend i{display:inline-block;width:12px;height:12px;margin-right:6px;vertical-align:-1px}
+.tip{position:fixed;pointer-events:none;background:var(--tip-bg);color:var(--tip-ink);font-size:15px;padding:6px 10px;display:none;z-index:50;white-space:nowrap}
+.hit{fill:transparent;cursor:default}
+
+/* tables + lists */
+table{width:100%;border-collapse:collapse;font-size:16px}
+th{text-align:left;font-size:13px;text-transform:uppercase;letter-spacing:.7px;color:var(--ink-3);border-bottom:2px solid var(--ink);padding:8px 10px}
+td{padding:10px;border-bottom:1px solid var(--rule);vertical-align:top}
+td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
+.tw{overflow-x:auto}
+.id{display:inline-block;background:var(--ink);color:var(--paper);font-weight:700;font-size:13px;padding:2px 7px}
+.list{margin:0;padding:0;list-style:none}
+.list li{display:flex;gap:14px;padding:12px 0;border-bottom:1px solid var(--rule)}
+.list li:last-child{border-bottom:0}
+.list .k{flex:none;width:40px;height:40px;display:grid;place-items:center;font:700 18px Georgia,serif;background:var(--band);color:var(--band-ink)}
+.list b{display:block;font-size:18px}.list span{color:var(--ink-2);font-size:16px}
+.quote{border-left:8px solid var(--c2);padding:6px 0 6px 18px;font:italic 400 22px/1.45 Georgia,serif;color:var(--ink)}
+
+/* cover */
+#p1 .cv{display:grid;grid-template-columns:1.5fr 1fr;min-height:620px}
+#p1 .cv .hero{background:var(--mast);color:var(--mast-ink);padding:54px 56px;display:flex;flex-direction:column;justify-content:center}
+#p1 .eyebrow{color:var(--c2);letter-spacing:4px;font-weight:700;font-size:16px}
+#p1 h2.big{font-size:84px;line-height:1;margin:18px 0 12px;letter-spacing:-1.5px}
+#p1 .tag{font:italic 24px Georgia,serif;color:var(--mast-ink-2);margin-bottom:30px}
+#p1 dl{display:grid;grid-template-columns:max-content 1fr;gap:8px 26px;margin:0;font-size:19px}
+#p1 dt{color:var(--mast-ink-2)}#p1 dd{margin:0;font-weight:600}
+#p1 .stack{display:grid;grid-template-rows:repeat(3,1fr)}
+#p1 .stack .kpi{border-right:0;border-bottom:2px solid var(--ink);justify-content:center;padding:22px 30px}
+#p1 .stack .kpi:last-child{border-bottom:0}
+#p1 .stack .kpi .lab{min-height:0}
+#p1 .stack .kpi .val{font-size:64px}
+#p1 .s1{background:var(--c1);color:#fbf7ef}#p1 .s2{background:var(--band1);color:var(--band-ink)}#p1 .s3{background:var(--band3);color:var(--band3-ink)}
+#p1 .stack .kpi .lab,#p1 .stack .kpi .meta{color:inherit}
+
+/* present + print */
+.hud{display:none}
+body.present .mast,body.present .sample{display:none}
+body.present main{max-width:none;padding:22px 34px}
+body.present section.pg{display:none;margin:0;min-height:calc(100vh - 44px)}
+body.present section.pg.cur{display:block}
+body.present .hud{display:flex;position:fixed;right:18px;bottom:18px;gap:6px;align-items:center;background:var(--mast);color:var(--mast-ink);padding:5px 6px 5px 14px;font-size:14px;z-index:30}
+@media (max-width:1100px){.g2,.g3,.g4,.g12,.g21,#p1 .cv{grid-template-columns:1fr}#p1 h2.big{font-size:54px}.kpi{border-right:0;border-bottom:2px solid var(--ink)}.mast .chip{display:none}}
+@media (max-width:640px){.mast h1 span{display:none}#p1 h2.big{font-size:40px;overflow-wrap:anywhere}main{padding:16px}.mast .row{padding:10px 16px;flex-wrap:wrap}.ph .no{width:72px;font-size:34px}.ph .per{display:none}.ph h2{font-size:26px}#p1 .cv .hero{padding:30px 22px}}
+@media print{@page{size:A4 landscape;margin:8mm}.mast,.sample,.hud{display:none!important}main{padding:0;max-width:none}section.pg{break-after:page;margin:0}}
+</style>
+</head>
+<body>
+<div class="sample">SAMPLE · Style C · all names and numbers are FAKE</div>
+<header class="mast">
+  <div class="row">
+    <span class="mark">ITSM</span>
+    <h1>IT Service Management Report<span>Weekly · Wkly_Report</span></h1>
+    <span class="chip">Week 40 · 1 Jan – 22 Oct 2026</span>
+    <button class="btn" id="theme" title="Switch light / dark">Light / Dark</button>
+    <button class="btn" id="present" title="One page at a time (P)">Present</button>
+    <button class="btn" onclick="window.print()">Print</button>
+    <span class="conf">CONFIDENTIAL</span>
+  </div>
+  <nav class="tabs" id="tabs"></nav>
+</header>
+
+<main id="content">
+
+<!-- 1 cover -->
+<section class="pg" id="p1" data-t="Cover">
+  <div class="cv">
+    <div class="hero">
+      <div class="eyebrow">IT SERVICE MANAGEMENT · WEEK 40</div>
+      <h2 class="big">ITSM Comprehensive Report</h2>
+      <div class="tag">Incidents, service requests and SLA performance, year to date</div>
+      <dl><dt>Reporting period</dt><dd>1 January – 22 October 2026</dd><dt>Report date</dt><dd>22 October 2026</dd><dt>Prepared by</dt><dd>Service Management Office</dd><dt>Audience</dt><dd>IT Leadership</dd></dl>
+    </div>
+    <div class="stack">
+      <div class="kpi s1"><div class="lab">Incidents logged</div><div class="val">12,430</div><div class="meta">98.6% closed</div></div>
+      <div class="kpi s2"><div class="lab">Service requests</div><div class="val">14,975</div><div class="meta">97.9% fulfilled</div></div>
+      <div class="kpi s3"><div class="lab">Resolution SLA met</div><div class="val">99.1%</div><div class="meta">target 95%</div></div>
+    </div>
+  </div>
+  <div class="pf"><span>IT Service Management · CONFIDENTIAL</span><span>Page <b>1</b> of 10</span></div>
+</section>
+
+<!-- 2 executive summary -->
+<section class="pg" id="p2" data-t="Executive Summary">
+  <div class="ph"><div class="no">02</div><div class="tt"><h2>Executive Summary</h2><p>Key performance indicators, year to date</p></div><div class="per">1 Jan – 22 Oct 2026</div></div>
+  <div class="bd">
+    <div class="kpis">
+      <div class="kpi hero"><div class="lab">Total incidents</div><div class="val">12,430</div><div class="meta">Jan – Oct</div></div>
+      <div class="kpi"><div class="lab">Incident closure rate (closed + resolved)</div><div class="val">98.6%</div><div class="meta"><span class="pill ok">✓ Met</span>12,256 / 12,430</div></div>
+      <div class="kpi"><div class="lab">Service requests</div><div class="val">14,975</div><div class="meta">Jan – Oct</div></div>
+      <div class="kpi"><div class="lab">SR completion rate this period</div><div class="val">97.9%</div><div class="meta"><span class="pill ok">✓ Met</span>14,660 / 14,975</div></div>
+      <div class="kpi"><div class="lab">Mean time to resolve</div><div class="val">3:12<small> h</small></div><div class="meta">SLA 40 h</div></div>
+      <div class="kpi"><div class="lab">Open backlog</div><div class="val">489</div><div class="meta"><span class="pill wn">▲ 4% vs last week</span></div></div>
+    </div>
+    <div class="grid g12 mt">
+      <div class="panel"><h3>Monthly volume</h3><div class="sub">Incidents and service requests, stacked = total</div><div class="chart" data-c='{"t":"columns","stack":true,"cats":["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct"],"series":[{"n":"Incidents","v":[1180,1040,1310,1475,1290,1220,1350,1185,1240,1140]},{"n":"Service requests","v":[1420,1310,1505,1660,1550,1480,1610,1420,1560,1460]}],"h":330}'></div></div>
+      <div class="panel"><h3>Incident status</h3><div class="sub">Share of all incidents</div><div class="chart" data-c='{"t":"donut","cats":["Closed","Resolved","In progress","On hold"],"v":[11890,366,128,46],"colors":["c3","c2","c4","c1"],"center":"12,430","csub":"incidents","h":330}'></div></div>
+    </div>
+    <div class="grid g2 mt">
+      <div class="panel"><h3>Weekly incidents</h3><div class="sub">Created vs closed, last 8 weeks</div><div class="chart" data-c='{"t":"columns","cats":["W33","W34","W35","W36","W37","W38","W39","W40"],"series":[{"n":"Created","v":[290,305,276,312,298,284,301,279]},{"n":"Closed","v":[286,309,270,315,301,280,296,284]}],"h":270}'></div></div>
+      <div class="panel"><h3>Highlights</h3><div class="sub">This reporting period</div>
+        <ul class="list">
+          <li><span class="k">1</span><div><b>Resolution SLA held above 99%</b><span>For the sixth week in a row, against a 95% target.</span></div></li>
+          <li><span class="k">2</span><div><b>Backlog up 4% week on week</b><span>Driven by a spike in access requests after the system migration.</span></div></li>
+          <li><span class="k">3</span><div><b>Self-service share reached 31%</b><span>Up from 24% at the start of the year.</span></div></li>
+        </ul></div>
+    </div>
+  </div>
+  <div class="pf"><span>IT Service Management · CONFIDENTIAL</span><span>Page <b>2</b> of 10</span></div>
+</section>
+
+<!-- 3 incident summary -->
+<section class="pg" id="p3" data-t="Incident Summary">
+  <div class="ph"><div class="no">03</div><div class="tt"><h2>Incident Summary</h2><p>Volume, priority and classification</p></div><div class="per">1 Jan – 22 Oct 2026</div></div>
+  <div class="bd">
+    <div class="kpis">
+      <div class="kpi hero"><div class="lab">Total incidents</div><div class="val">12,430</div><div class="meta">year to date</div></div>
+      <div class="kpi"><div class="lab">Closed</div><div class="val">11,890</div><div class="meta">95.7% of total</div></div>
+      <div class="kpi"><div class="lab">Resolved</div><div class="val">366</div><div class="meta">awaiting closure</div></div>
+      <div class="kpi"><div class="lab">Closure rate</div><div class="val">98.6%</div><div class="meter"><i style="width:98.6%"></i></div><div class="meta">target 95%</div></div>
+      <div class="kpi"><div class="lab">Quarterly volume</div><div class="val" style="font-size:30px">3,530 → 3,985 → 3,775</div><div class="meta"><span class="pill wn">▲ 13% Q1→Q2</span><span class="pill ok">▼ 5% Q2→Q3</span></div></div>
+    </div>
+    <div class="grid g21 mt">
+      <div class="panel"><h3>Incidents by priority</h3><div class="sub">Count of incidents</div><div class="chart" data-c='{"t":"donut","cats":["P1 Critical","P2 High","P3 Moderate","P4 Low"],"v":[9,31,4870,7520],"center":"12,430","csub":"incidents","h":340}'></div></div>
+      <div class="panel"><h3>Incidents by classification</h3><div class="sub">Count and share of total</div><div class="chart" data-c='{"t":"hbars","share":true,"cats":["Software","Hardware","Network","Access","Email & collaboration","Security","Applications","Telephony","Not classified"],"v":[2640,2215,1890,1610,1420,1120,880,520,135],"h":340}'></div></div>
+    </div>
+  </div>
+  <div class="pf"><span>IT Service Management · CONFIDENTIAL</span><span>Page <b>3</b> of 10</span></div>
+</section>
+
+<!-- 4 service requests -->
+<section class="pg" id="p4" data-t="Service Requests">
+  <div class="ph"><div class="no">04</div><div class="tt"><h2>Service Request Trends</h2><p>Monthly volume and top categories</p></div><div class="per">1 Jan – 22 Oct 2026</div></div>
+  <div class="bd">
+    <div class="kpis">
+      <div class="kpi hero"><div class="lab">Service requests</div><div class="val">14,975</div><div class="meta">year to date</div></div>
+      <div class="kpi"><div class="lab">Fulfilled</div><div class="val">14,660</div><div class="meta">97.9%</div></div>
+      <div class="kpi"><div class="lab">SR SLA met</div><div class="val">98.2%</div><div class="meter"><i style="width:98.2%"></i></div><div class="meta">target 95%</div></div>
+      <div class="kpi"><div class="lab">Average fulfilment</div><div class="val">1.4<small> days</small></div><div class="meta">target 3 days</div></div>
+    </div>
+    <div class="grid g2 mt">
+      <div class="panel"><h3>Monthly service requests</h3><div class="sub">Requests logged per month</div><div class="chart" data-c='{"t":"line","cats":["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct"],"series":[{"n":"Requests","v":[1420,1310,1505,1660,1550,1480,1610,1420,1560,1460]}],"h":320}'></div></div>
+      <div class="panel"><h3>Top 10 request categories</h3><div class="sub">Count and share of all requests</div><div class="chart" data-c='{"t":"hbars","share":true,"color":"c4","cats":["Software installation","Access to shared folder","New starter equipment","Email distribution list","Mobile device setup","Password policy exception","Printer access","VPN access","Meeting room equipment","Licence transfer"],"v":[3920,2310,1880,1410,1220,990,860,720,610,480],"h":320}'></div></div>
+    </div>
+  </div>
+  <div class="pf"><span>IT Service Management · CONFIDENTIAL</span><span>Page <b>4</b> of 10</span></div>
+</section>
+
+<!-- 5 SLA -->
+<section class="pg" id="p5" data-t="SLA & MTTR">
+  <div class="ph"><div class="no">05</div><div class="tt"><h2>SLA Compliance &amp; MTTR</h2><p>Response and resolution against targets</p></div><div class="per">1 Jan – 22 Oct 2026</div></div>
+  <div class="bd">
+    <div class="kpis">
+      <div class="kpi hero"><div class="lab">Resolution SLA</div><div class="val">99.1%</div><div class="meta"><span class="pill">✓ Met</span>12,318 / 12,430</div></div>
+      <div class="kpi"><div class="lab">Response SLA</div><div class="val">98.7%</div><div class="meta"><span class="pill ok">✓ Met</span>10,880 / 11,023</div></div>
+      <div class="kpi"><div class="lab">Resolution breaches</div><div class="val">112</div><div class="meta"><span class="pill bad">! Breached</span>incidents</div></div>
+      <div class="kpi"><div class="lab">Response breaches</div><div class="val">143</div><div class="meta"><span class="pill bad">! Breached</span>incidents</div></div>
+    </div>
+    <div class="grid g3 mt">
+      <div class="panel"><h3>Resolution SLA</h3><div class="sub">Incidents resolved within SLA</div><div class="chart" data-c='{"t":"donut","cats":["Within SLA","Breached"],"v":[12318,112],"colors":["c3","c1"],"center":"99.1%","csub":"within SLA","h":300}'></div></div>
+      <div class="panel"><h3>Response SLA</h3><div class="sub">Incidents responded to within SLA</div><div class="chart" data-c='{"t":"donut","cats":["Within SLA","Breached"],"v":[10880,143],"colors":["c3","c1"],"center":"98.7%","csub":"within SLA","h":300}'></div></div>
+      <div class="panel"><h3>MTTR vs SLA budget</h3><div class="sub">How much of each SLA is used</div>
+        <div style="margin-top:14px"><div class="lbl" style="font-size:16px">Response · 12.4 of 30 min</div><div class="kpi" style="padding:0;border:0;background:none"><div class="val">41%</div></div><div class="meter"><i style="width:41%;background:var(--c2)"></i></div></div>
+        <div style="margin-top:22px"><div class="lbl" style="font-size:16px">Resolution · 3:12 h of 40 h</div><div class="kpi" style="padding:0;border:0;background:none"><div class="val">8%</div></div><div class="meter"><i style="width:8%"></i></div></div>
+      </div>
+    </div>
+    <div class="panel mt"><h3>What the numbers mean</h3>
+      <div class="grid g3" style="gap:0 26px">
+        <ul class="list"><li><span class="k">↑</span><div><b>Response uses 41% of its SLA</b><span>Comfortable headroom for peak days.</span></div></li></ul>
+        <ul class="list"><li><span class="k">✓</span><div><b>Resolution far inside target</b><span>3 h 12 min average against a 40-hour budget.</span></div></li></ul>
+        <ul class="list"><li><span class="k">!</span><div><b>Watch response weekly</b><span>The tighter metric; a volume spike could push it toward breach.</span></div></li></ul>
+      </div>
+    </div>
+  </div>
+  <div class="pf"><span>IT Service Management · CONFIDENTIAL</span><span>Page <b>5</b> of 10</span></div>
+</section>
+
+<!-- 6 priority & category -->
+<section class="pg" id="p6" data-t="Priority & Category">
+  <div class="ph"><div class="no">06</div><div class="tt"><h2>Priority &amp; Category Breakdown</h2><p>Incidents and service requests side by side</p></div><div class="per">1 Jan – 22 Oct 2026</div></div>
+  <div class="bd">
+    <div class="grid g2">
+      <div class="panel"><h3>Priority distribution</h3><div class="sub">Incidents vs service requests</div><div class="chart" data-c='{"t":"columns","cats":["P1 Critical","P2 High","P3 Moderate","P4 Low"],"series":[{"n":"Incidents","v":[9,31,4870,7520]},{"n":"Service requests","v":[2,18,3410,11545]}],"h":330}'></div></div>
+      <div class="panel"><h3>Category overview</h3><div class="sub">Top categories, both record types</div>
+        <div class="tw"><table><thead><tr><th>Category</th><th class="n">Incidents</th><th class="n">Requests</th><th class="n">Share</th></tr></thead><tbody>
+          <tr><td>Software</td><td class="n">2,640</td><td class="n">3,920</td><td class="n">23.9%</td></tr>
+          <tr><td>Access</td><td class="n">1,610</td><td class="n">2,310</td><td class="n">14.3%</td></tr>
+          <tr><td>Hardware</td><td class="n">2,215</td><td class="n">1,880</td><td class="n">14.9%</td></tr>
+          <tr><td>Network</td><td class="n">1,890</td><td class="n">720</td><td class="n">9.5%</td></tr>
+          <tr><td>Email &amp; collaboration</td><td class="n">1,420</td><td class="n">1,410</td><td class="n">10.3%</td></tr>
+          <tr><td>Other</td><td class="n">2,655</td><td class="n">4,735</td><td class="n">27.0%</td></tr>
+        </tbody></table></div></div>
+    </div>
+  </div>
+  <div class="pf"><span>IT Service Management · CONFIDENTIAL</span><span>Page <b>6</b> of 10</span></div>
+</section>
+
+<!-- 7 agents -->
+<section class="pg" id="p7" data-t="Agents & Teams">
+  <div class="ph"><div class="no">07</div><div class="tt"><h2>Agent &amp; Team Performance</h2><p>Incident resolution, top agents and teams</p></div><div class="per">1 Jan – 22 Oct 2026</div></div>
+  <div class="bd">
+    <div class="grid g2">
+      <div class="panel"><h3>Top 10 agents by ticket volume</h3><div class="sub">Incidents resolved</div><div class="chart" data-c='{"t":"hbars","cats":["Agent Alpha","Agent Bravo","Agent Charlie","Agent Delta","Agent Echo","Agent Foxtrot","Agent Golf","Agent Hotel","Agent India","Agent Juliet"],"v":[1890,1540,1430,1410,1360,1290,1250,1080,1050,960],"color":"c3","h":380}'></div></div>
+      <div class="panel"><h3>Assignment groups</h3><div class="sub">Resolved incidents and SLA by team</div>
+        <div class="tw"><table><thead><tr><th>Team</th><th class="n">Resolved</th><th class="n">Avg time</th><th class="n">SLA</th></tr></thead><tbody>
+          <tr><td>Service Desk L1</td><td class="n">6,120</td><td class="n">0:48</td><td class="n"><span class="pill ok">99.6%</span></td></tr>
+          <tr><td>End-user Support</td><td class="n">2,310</td><td class="n">4:05</td><td class="n"><span class="pill ok">98.9%</span></td></tr>
+          <tr><td>Network Operations</td><td class="n">1,410</td><td class="n">6:40</td><td class="n"><span class="pill ok">98.1%</span></td></tr>
+          <tr><td>Applications Support</td><td class="n">1,180</td><td class="n">9:15</td><td class="n"><span class="pill wn">96.2%</span></td></tr>
+          <tr><td>Security Operations</td><td class="n">760</td><td class="n">3:30</td><td class="n"><span class="pill ok">99.0%</span></td></tr>
+          <tr><td>Infrastructure</td><td class="n">476</td><td class="n">12:10</td><td class="n"><span class="pill bad">93.8%</span></td></tr>
+        </tbody></table></div></div>
+    </div>
+  </div>
+  <div class="pf"><span>IT Service Management · CONFIDENTIAL</span><span>Page <b>7</b> of 10</span></div>
+</section>
+
+<!-- 8 resolution time -->
+<section class="pg" id="p8" data-t="Resolution Time">
+  <div class="ph"><div class="no">08</div><div class="tt"><h2>Resolution Time Analysis</h2><p>How long tickets stay open</p></div><div class="per">1 Jan – 22 Oct 2026</div></div>
+  <div class="bd">
+    <div class="grid g2">
+      <div class="panel"><h3>Incident ageing</h3><div class="sub">Incidents by time to resolve, share of total</div><div class="chart" data-c='{"t":"columns","share":true,"cats":["0–2 days","3–5 days","6–10 days","11–15 days","15+ days"],"series":[{"n":"Incidents","v":[8910,2420,780,210,110]}],"pcolors":["c3","c3","c2","c1","c1"],"h":320}'></div></div>
+      <div class="panel"><h3>Service request ageing</h3><div class="sub">Requests by time to fulfil, share of total</div><div class="chart" data-c='{"t":"columns","share":true,"cats":["0–2 days","3–5 days","6–10 days","11–15 days","15+ days"],"series":[{"n":"Requests","v":[9870,3480,1210,290,125]}],"pcolors":["c3","c3","c2","c1","c1"],"h":320}'></div></div>
+    </div>
+    <div class="quote mt">71.7% of incidents are resolved within two days; only 0.9% stay open longer than 15 days.</div>
+  </div>
+  <div class="pf"><span>IT Service Management · CONFIDENTIAL</span><span>Page <b>8</b> of 10</span></div>
+</section>
+
+<!-- 9 risks -->
+<section class="pg" id="p9" data-t="Risks">
+  <div class="ph"><div class="no">09</div><div class="tt"><h2>Risks &amp; Mitigations</h2><p>Open risks to service performance</p></div><div class="per">As of 22 Oct 2026</div></div>
+  <div class="bd">
+    <div class="tw"><table><thead><tr><th>ID</th><th>Risk</th><th>Impact</th><th>Mitigation</th><th>Owner</th><th>Status</th></tr></thead><tbody>
+      <tr><td><span class="id">R1</span></td><td>Backlog growth after system migration</td><td><span class="pill bad">High</span></td><td>Temporary second-line rota; daily backlog review</td><td>Service Desk Lead</td><td><span class="pill wn">Monitoring</span></td></tr>
+      <tr><td><span class="id">R2</span></td><td>Response SLA pressure in peak weeks</td><td><span class="pill wn">Medium</span></td><td>Auto-assignment rules; peak-hour staffing</td><td>Operations Manager</td><td><span class="pill ok">On track</span></td></tr>
+      <tr><td><span class="id">R3</span></td><td>Unclassified tickets distort reporting</td><td><span class="pill wn">Medium</span></td><td>Mandatory category at closure</td><td>Process Owner</td><td><span class="pill ok">On track</span></td></tr>
+      <tr><td><span class="id">R4</span></td><td>Knowledge articles out of date</td><td><span class="pill ok">Low</span></td><td>Quarterly article review cycle</td><td>Knowledge Manager</td><td><span class="pill wn">Planned</span></td></tr>
+      <tr><td><span class="id">R5</span></td><td>Single point of knowledge in Infrastructure team</td><td><span class="pill bad">High</span></td><td>Cross-training plan; runbooks for top 20 tasks</td><td>Infrastructure Lead</td><td><span class="pill wn">Monitoring</span></td></tr>
+    </tbody></table></div>
+  </div>
+  <div class="pf"><span>IT Service Management · CONFIDENTIAL</span><span>Page <b>9</b> of 10</span></div>
+</section>
+
+<!-- 10 summary -->
+<section class="pg" id="p10" data-t="Summary">
+  <div class="ph"><div class="no">10</div><div class="tt"><h2>Summary &amp; Recommendations</h2><p>Where we are and what we do next</p></div><div class="per">Week 40</div></div>
+  <div class="bd">
+    <div class="grid g2">
+      <div class="panel"><h3>Summary</h3>
+        <ul class="list">
+          <li><span class="k">1</span><div><b>Service levels are strong</b><span>Resolution SLA 99.1% and response SLA 98.7%, both above target.</span></div></li>
+          <li><span class="k">2</span><div><b>Demand is steady</b><span>About 1,250 incidents and 1,500 requests a month, with an April peak.</span></div></li>
+          <li><span class="k">3</span><div><b>Backlog needs attention</b><span>Up 4% this week; access requests are the main driver.</span></div></li>
+        </ul></div>
+      <div class="panel"><h3>Recommendations</h3>
+        <ul class="list">
+          <li><span class="k">A</span><div><b>Automate access requests</b><span>Self-service approval flow for standard folder access.</span></div></li>
+          <li><span class="k">B</span><div><b>Make category mandatory</b><span>Removes unclassified tickets from the reports.</span></div></li>
+          <li><span class="k">C</span><div><b>Review Infrastructure SLA</b><span>93.8% this period; agree an improvement plan.</span></div></li>
+        </ul></div>
+    </div>
+  </div>
+  <div class="pf"><span>IT Service Management · CONFIDENTIAL</span><span>Page <b>10</b> of 10</span></div>
+</section>
+
+</main>
+<div class="hud"><span id="hpos"></span><button class="btn" id="hp">◀</button><button class="btn" id="hn">▶</button><button class="btn" id="hx">Exit</button></div>
+<div class="tip" id="tip"></div>
+
+<script>
+(function () {
+  var secs = [].slice.call(document.querySelectorAll('section.pg'));
+  // page tabs
+  var tabs = document.getElementById('tabs');
+  secs.forEach(function (s, i) {
+    var a = document.createElement('a'); a.href = '#' + s.id;
+    a.innerHTML = '<b>' + String(i + 1).padStart(2, '0') + '</b>' + s.getAttribute('data-t');
+    tabs.appendChild(a);
+  });
+  var links = [].slice.call(tabs.querySelectorAll('a'));
+  function track() {
+    var k = 0, y = window.innerHeight * 0.35;
+    secs.forEach(function (s, i) { if (s.getBoundingClientRect().top <= y) k = i; });
+    links.forEach(function (l, i) { l.classList.toggle('on', i === k); });
+  }
+  window.addEventListener('scroll', track, { passive: true }); track();
+
+  // theme
+  document.getElementById('theme').onclick = function () {
+    var r = document.documentElement; r.dataset.theme = r.dataset.theme === 'dark' ? 'light' : 'dark'; drawAll();
+  };
+
+  // ---- charts (SVG, solid colours) ----
+  function css(v) { return getComputedStyle(document.documentElement).getPropertyValue('--' + v).trim(); }
+  function col(k) { return css(k); }
+  var pal = ['c1', 'c2', 'c3', 'c4', 'c5'];
+  function nf(v) { return Number(v).toLocaleString('en-US'); }
+  function pct(v, t) { return (t ? v / t * 100 : 0).toFixed(1) + '%'; }
+  var tip = document.getElementById('tip');
+  function bindTip(el) {
+    el.addEventListener('mousemove', function (e) {
+      var t = e.target.getAttribute && e.target.getAttribute('data-tip');
+      if (!t) { tip.style.display = 'none'; return; }
+      tip.innerHTML = t; tip.style.display = 'block';
+      tip.style.left = Math.min(e.clientX + 14, window.innerWidth - tip.offsetWidth - 8) + 'px'; tip.style.top = (e.clientY + 14) + 'px';
+    });
+    el.addEventListener('mouseleave', function () { tip.style.display = 'none'; });
+  }
+  function esc(t) { return String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;'); }
+  var mctx = document.createElement('canvas').getContext('2d');
+  function tw(t, sz, w) { mctx.font = (w || 400) + ' ' + sz + 'px "Segoe UI",system-ui,sans-serif'; return mctx.measureText(String(t)).width; }
+  function clip(t, max, sz) { t = String(t); if (tw(t, sz) <= max) return t; while (t.length > 1 && tw(t + '…', sz) > max) t = t.slice(0, -1); return t + '…'; }
+  function nice(max) { var p = Math.pow(10, Math.floor(Math.log10(max || 1))), f = max / p; var s = f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10; return s * p; }
+  function legend(items) { return '<div class="legend">' + items.map(function (it) { return '<span><i style="background:' + col(it[1]) + '"></i>' + esc(it[0]) + '</span>'; }).join('') + '</div>'; }
+
+  function columns(el, o) {
+    var W = el.clientWidth, H = o.h || 300, L = 54, R = 10, T = 26, B = 34;
+    var n = o.cats.length, ser = o.series, stack = !!o.stack;
+    var tot = o.cats.map(function (c, i) { return ser.reduce(function (a, s) { return a + s.v[i]; }, 0); });
+    var mx = stack ? Math.max.apply(null, tot) : Math.max.apply(null, ser.map(function (s) { return Math.max.apply(null, s.v); }));
+    var step = nice(mx / 4), top = Math.ceil(mx * 1.12 / step) * step;
+    var sum = tot.reduce(function (a, b) { return a + b; }, 0);
+    var y = function (v) { return T + (H - T - B) * (1 - v / top); };
+    var g = '', band = (W - L - R) / n, gw = band * 0.62, bw = stack ? gw : (gw - 2 * (ser.length - 1)) / ser.length;
+    for (var t = 0; t <= top + 1e-9; t += step) g += '<line class="gl" x1="' + L + '" x2="' + (W - R) + '" y1="' + y(t) + '" y2="' + y(t) + '"/><text class="ax" x="' + (L - 8) + '" y="' + (y(t) + 5) + '" text-anchor="end">' + nf(t) + '</text>';
+    o.cats.forEach(function (c, i) {
+      var x0 = L + band * i + (band - gw) / 2, base = 0;
+      ser.forEach(function (s, k) {
+        var v = s.v[i], ck = (o.pcolors && o.pcolors[i]) || pal[k];
+        var x = stack ? x0 : x0 + k * (bw + 2), yt = stack ? y(base + v) : y(v), yb = stack ? y(base) : y(0);
+        g += '<rect x="' + x.toFixed(1) + '" y="' + yt.toFixed(1) + '" width="' + bw.toFixed(1) + '" height="' + Math.max(0, yb - yt - (stack && k > 0 ? 2 : 0)).toFixed(1) + '" fill="' + col(ck) + '" data-tip="' + esc(c + ' · ' + s.n + ': <b>' + nf(v) + '</b>') + '"/>';
+        if (!stack && (ser.length === 1 || n <= 8)) g += '<text class="lbl" x="' + (x + bw / 2).toFixed(1) + '" y="' + (yt - 6).toFixed(1) + '" text-anchor="middle">' + (o.share ? pct(v, sum) : nf(v)) + '</text>';
+        base += v;
+      });
+      if (stack) g += '<text class="lbl" x="' + (x0 + gw / 2).toFixed(1) + '" y="' + (y(tot[i]) - 6).toFixed(1) + '" text-anchor="middle">' + nf(tot[i]) + '</text>';
+      g += '<text class="ax" x="' + (L + band * i + band / 2).toFixed(1) + '" y="' + (H - 10) + '" text-anchor="middle">' + esc(clip(c, band - 4, 14)) + '</text>';
+    });
+    g += '<line class="base" x1="' + L + '" x2="' + (W - R) + '" y1="' + y(0) + '" y2="' + y(0) + '"/>';
+    el.innerHTML = '<svg viewBox="0 0 ' + W + ' ' + H + '" height="' + H + '">' + g + '</svg>' + (ser.length > 1 ? legend(ser.map(function (s, k) { return [s.n, pal[k]]; })) : '');
+  }
+
+  function hbars(el, o) {
+    var W = el.clientWidth, n = o.cats.length, rowH = Math.max(26, Math.min(40, ((o.h || 320) - 10) / n)), H = rowH * n + 8;
+    var lw = Math.min(Math.max.apply(null, o.cats.map(function (c) { return tw(c, 15); })) + 22, W * 0.42);
+    var sum = o.v.reduce(function (a, b) { return a + b; }, 0), mx = Math.max.apply(null, o.v);
+    var vw = tw(o.share ? '0,000 · 00.0%' : '0,000', 14, 600) + 12, bwMax = W - lw - vw;
+    var g = '';
+    o.cats.forEach(function (c, i) {
+      var v = o.v[i], yy = i * rowH + 4, bw = Math.max(2, bwMax * v / mx), bh = rowH - 10;
+      g += '<text class="ax" x="' + (lw - 10) + '" y="' + (yy + bh / 2 + 5) + '" text-anchor="end" style="fill:var(--ink-2);font-size:15px">' + esc(clip(c, lw - 12, 15)) + '</text>';
+      g += '<rect x="' + lw + '" y="' + yy + '" width="' + bw.toFixed(1) + '" height="' + bh + '" fill="' + col(o.color || 'c3') + '" data-tip="' + esc(c + ': <b>' + nf(v) + '</b>' + (o.share ? ' · ' + pct(v, sum) : '')) + '"/>';
+      g += '<text class="lbl" x="' + (lw + bw + 8).toFixed(1) + '" y="' + (yy + bh / 2 + 5) + '">' + nf(v) + (o.share ? ' · ' + pct(v, sum) : '') + '</text>';
+    });
+    el.innerHTML = '<svg viewBox="0 0 ' + W + ' ' + H + '" height="' + H + '">' + g + '</svg>';
+  }
+
+  function donut(el, o) {
+    var W = el.clientWidth, H = o.h || 300, legendH = 34 * Math.ceil(o.cats.length / 2), D = Math.min(W, H - 10) - 10, R = D / 2, r0 = R * 0.62, cx = W / 2, cy = R + 6;
+    var sum = o.v.reduce(function (a, b) { return a + b; }, 0), a = -Math.PI / 2, g = '', cols = o.colors || pal;
+    function P(rr, ang) { return (cx + rr * Math.cos(ang)).toFixed(2) + ',' + (cy + rr * Math.sin(ang)).toFixed(2); }
+    o.v.forEach(function (v, i) {
+      var a2 = a + v / sum * Math.PI * 2, big = a2 - a > Math.PI ? 1 : 0, gap = 0.012;
+      var s = a + (v / sum > 0.02 ? gap : 0), e = a2 - (v / sum > 0.02 ? gap : 0);
+      if (e - s < 0.004) e = s + 0.004;
+      g += '<path d="M' + P(R, s) + ' A' + R + ',' + R + ' 0 ' + big + ' 1 ' + P(R, e) + ' L' + P(r0, e) + ' A' + r0 + ',' + r0 + ' 0 ' + big + ' 0 ' + P(r0, s) + 'Z" fill="' + col(cols[i]) + '" data-tip="' + esc(o.cats[i] + ': <b>' + nf(v) + '</b> · ' + pct(v, sum)) + '"/>';
+      a = a2;
+    });
+    if (o.center) g += '<text x="' + cx + '" y="' + (cy + 4) + '" text-anchor="middle" style="font:700 ' + Math.round(R * 0.36) + 'px Georgia,serif;fill:var(--ink)">' + esc(o.center) + '</text><text x="' + cx + '" y="' + (cy + R * 0.3) + '" text-anchor="middle" class="ax" style="font-size:15px">' + esc(o.csub || '') + '</text>';
+    el.innerHTML = '<svg viewBox="0 0 ' + W + ' ' + (D + 12) + '" height="' + (D + 12) + '">' + g + '</svg>' +
+      '<div class="legend">' + o.cats.map(function (c, i) { return '<span><i style="background:' + col(cols[i]) + '"></i>' + esc(c) + ' · <b>' + nf(o.v[i]) + '</b> (' + pct(o.v[i], sum) + ')</span>'; }).join('') + '</div>';
+  }
+
+  function line(el, o) {
+    var W = el.clientWidth, H = o.h || 300, L = 54, R = 16, T = 26, B = 34, n = o.cats.length;
+    var mx = Math.max.apply(null, o.series.map(function (s) { return Math.max.apply(null, s.v); }));
+    var step = nice(mx / 4), top = Math.ceil(mx * 1.15 / step) * step;
+    var y = function (v) { return T + (H - T - B) * (1 - v / top); }, x = function (i) { return L + (W - L - R) * (i + 0.5) / n; };
+    var g = '';
+    for (var t = 0; t <= top + 1e-9; t += step) g += '<line class="gl" x1="' + L + '" x2="' + (W - R) + '" y1="' + y(t) + '" y2="' + y(t) + '"/><text class="ax" x="' + (L - 8) + '" y="' + (y(t) + 5) + '" text-anchor="end">' + nf(t) + '</text>';
+    o.series.forEach(function (s, k) {
+      var c = col(pal[k]);
+      g += '<polyline fill="none" stroke="' + c + '" stroke-width="3" stroke-linejoin="round" points="' + s.v.map(function (v, i) { return x(i).toFixed(1) + ',' + y(v).toFixed(1); }).join(' ') + '"/>';
+      var hi = s.v.indexOf(Math.max.apply(null, s.v)), lo = s.v.indexOf(Math.min.apply(null, s.v));
+      s.v.forEach(function (v, i) {
+        g += '<circle cx="' + x(i).toFixed(1) + '" cy="' + y(v).toFixed(1) + '" r="5" fill="' + c + '" stroke="' + css('paper') + '" stroke-width="2"/><circle class="hit" cx="' + x(i).toFixed(1) + '" cy="' + y(v).toFixed(1) + '" r="14" data-tip="' + esc(o.cats[i] + ' · ' + s.n + ': <b>' + nf(v) + '</b>') + '"/>';
+        if (i === hi || i === lo || i === n - 1) g += '<text class="lbl" x="' + x(i).toFixed(1) + '" y="' + (y(v) - 12).toFixed(1) + '" text-anchor="middle">' + nf(v) + '</text>';
+      });
+    });
+    o.cats.forEach(function (c, i) { g += '<text class="ax" x="' + x(i).toFixed(1) + '" y="' + (H - 10) + '" text-anchor="middle">' + esc(c) + '</text>'; });
+    g += '<line class="base" x1="' + L + '" x2="' + (W - R) + '" y1="' + y(0) + '" y2="' + y(0) + '"/>';
+    el.innerHTML = '<svg viewBox="0 0 ' + W + ' ' + H + '" height="' + H + '">' + g + '</svg>';
+  }
+
+  var charts = [].slice.call(document.querySelectorAll('.chart[data-c]'));
+  charts.forEach(bindTip);
+  function drawAll() {
+    charts.forEach(function (el) {
+      try {
+        var o = JSON.parse(el.getAttribute('data-c'));
+        if (!el.clientWidth) return;
+        ({ columns: columns, hbars: hbars, donut: donut, line: line })[o.t](el, o);
+      } catch (e) { el.innerHTML = '<div style="color:var(--bad)">Chart could not be drawn</div>'; }
+    });
+  }
+  // KPI rows: labels of one row share a height, so the numbers line up
+  function alignKpis() {
+    [].forEach.call(document.querySelectorAll('.kpis'), function (g) {
+      var rows = {}, ks = [].slice.call(g.children);
+      ks.forEach(function (k) { var l = k.querySelector('.lab'); if (!l) return; l.style.minHeight = ''; (rows[k.offsetTop] = rows[k.offsetTop] || []).push(l); });
+      Object.keys(rows).forEach(function (r) { var m = 0; rows[r].forEach(function (l) { m = Math.max(m, l.offsetHeight); }); rows[r].forEach(function (l) { l.style.minHeight = m + 'px'; }); });
+    });
+  }
+  var rt; window.addEventListener('resize', function () { clearTimeout(rt); rt = setTimeout(function () { alignKpis(); drawAll(); }, 120); });
+  alignKpis(); drawAll();
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(function () { alignKpis(); drawAll(); });
+
+  // present
+  var cur = 0;
+  function show(i) { cur = Math.max(0, Math.min(secs.length - 1, i)); secs.forEach(function (s, k) { s.classList.toggle('cur', k === cur); }); document.getElementById('hpos').textContent = (cur + 1) + ' / ' + secs.length; alignKpis(); drawAll(); }
+  function start() { var k = links.findIndex(function (l) { return l.classList.contains('on'); }); document.body.classList.add('present'); show(Math.max(0, k)); if (document.documentElement.requestFullscreen) document.documentElement.requestFullscreen().catch(function () { }); }
+  function stop() { document.body.classList.remove('present'); if (document.fullscreenElement) document.exitFullscreen(); drawAll(); secs[cur].scrollIntoView(); }
+  document.getElementById('present').onclick = start;
+  document.getElementById('hp').onclick = function () { show(cur - 1); };
+  document.getElementById('hn').onclick = function () { show(cur + 1); };
+  document.getElementById('hx').onclick = stop;
+  document.addEventListener('keydown', function (e) {
+    if (!document.body.classList.contains('present')) { if (e.key === 'p' || e.key === 'P') start(); return; }
+    if (['ArrowRight', 'PageDown', ' '].indexOf(e.key) >= 0) { e.preventDefault(); show(cur + 1); }
+    if (['ArrowLeft', 'PageUp'].indexOf(e.key) >= 0) show(cur - 1);
+    if (e.key === 'Escape') stop();
+  });
+  document.addEventListener('fullscreenchange', function () { if (!document.fullscreenElement && document.body.classList.contains('present')) stop(); });
+})();
+</script>
+</body>
+</html>
