@@ -36,6 +36,9 @@ body{margin:0;background:var(--bg);color:var(--ink);font:18px/1.45 "Segoe UI",sy
 .bar h1 span{font-weight:400;color:var(--bar-ink-2);margin-left:10px;font-size:16px}
 .btn{background:var(--bar-btn);color:var(--bar-ink);border:0;padding:7px 12px;font:600 14px "Segoe UI",sans-serif;cursor:pointer;letter-spacing:.3px}
 .btn:hover{background:var(--bar-btn-h)}
+.zoom{display:flex;align-items:center;gap:3px}
+.zoom .btn{min-width:34px;padding:7px 10px}
+.zoom span{min-width:52px;text-align:center;font-size:14px;color:var(--bar-ink-2);font-variant-numeric:tabular-nums}
 .conf{color:var(--gold);font-size:13px;font-weight:700;letter-spacing:2.5px;border:2px solid var(--gold);padding:4px 9px}
 
 /* stage: one page at a time */
@@ -162,6 +165,7 @@ body.all .dock,body.all .prog,body.narrow .dock,body.narrow .prog{display:none}
 <header class="bar">
   <span class="dot"></span>
   <h1>IT Service Management Briefing<span>Week 40 · 1 Jan – 22 Oct 2026</span></h1>
+  <div class="zoom"><button class="btn" id="zOut" title="Zoom out (-)">−</button><span id="zVal">100%</span><button class="btn" id="zIn" title="Zoom in (+)">+</button><button class="btn" id="zFit" title="Fit the page to the screen">Fit</button></div>
   <button class="btn" id="all" title="Show every page one after another">All pages</button>
   <button class="btn" id="theme">Light / Dark</button>
   <button class="btn" id="full" title="Full screen (F)">Full screen</button>
@@ -476,20 +480,40 @@ body.all .dock,body.all .prog,body.narrow .dock,body.narrow .prog{display:none}
   document.getElementById('all').onclick = function () {
     body.classList.toggle('all');
     this.textContent = body.classList.contains('all') ? 'One page' : 'All pages';
-    drawAll(); if (!body.classList.contains('all')) go(cur);
+    fitStage(); drawAll(); if (!body.classList.contains('all')) go(cur);
   };
   document.getElementById('theme').onclick = function () {
     var r = document.documentElement; r.dataset.theme = r.dataset.theme === 'dark' ? 'light' : 'dark'; drawAll();
   };
   function narrowCheck() { body.classList.toggle('narrow', window.innerWidth <= 980); fitStage(); }
   // pages are designed for 1920 x 1080; on smaller screens the page is scaled down (never below 72%) so it fits without scrolling
+  // zoom: the automatic fit times the viewer's own zoom (- / + / Fit, remembered on this PC)
+  var userZoom = 1;
+  try { userZoom = parseFloat(localStorage.getItem('itsmC.zoom')) || 1; } catch (e) { }
   function fitStage() {
-    var st = document.getElementById('stage');
-    if (body.classList.contains('narrow') || body.classList.contains('all')) { st.style.zoom = ''; return; }
-    var avail = window.innerHeight - st.getBoundingClientRect().top - document.querySelector('.dock').offsetHeight - 4;
-    var z = Math.max(0.72, Math.min(1, window.innerWidth / 1920, avail / 925));
-    st.style.zoom = z < 0.995 ? z : '';
+    var st = document.getElementById('stage'), fit = 1;
+    if (!body.classList.contains('narrow') && !body.classList.contains('all')) {
+      st.style.zoom = '';
+      var avail = window.innerHeight - st.getBoundingClientRect().top - document.querySelector('.dock').offsetHeight - 4;
+      fit = Math.max(0.72, Math.min(1, window.innerWidth / 1920, avail / 925));
+    }
+    var z = fit * userZoom;
+    st.style.zoom = Math.abs(z - 1) > 0.005 ? z : '';
+    document.getElementById('zVal').textContent = Math.round(userZoom * 100) + '%';
   }
+  function setZoom(z) {
+    userZoom = Math.max(0.5, Math.min(2, Math.round(z * 10) / 10));
+    try { localStorage.setItem('itsmC.zoom', String(userZoom)); } catch (e) { }
+    fitStage(); drawAll();
+  }
+  document.getElementById('zIn').onclick = function () { setZoom(userZoom + 0.1); };
+  document.getElementById('zOut').onclick = function () { setZoom(userZoom - 0.1); };
+  document.getElementById('zFit').onclick = function () { setZoom(1); };
+  document.addEventListener('keydown', function (e) {
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    if (e.key === '+' || e.key === '=') setZoom(userZoom + 0.1);
+    if (e.key === '-' || e.key === '_') setZoom(userZoom - 0.1);
+  });
 
   // ---- charts (SVG, solid colours, direct labels, hover values)
   function cv(n) { return getComputedStyle(document.documentElement).getPropertyValue('--' + n).trim(); }
