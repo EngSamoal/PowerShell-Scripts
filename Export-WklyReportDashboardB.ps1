@@ -58,6 +58,17 @@
 .PARAMETER OpenWhenDone
     Open the dashboard in the default browser when finished.
 
+.PARAMETER SkipPdf
+    Do not write <workbook name>.pdf. By default a PDF is written next to the HTML: one PDF page per
+    dashboard page as shown in Present mode (1920 px wide), each exactly that page's size.
+
+.PARAMETER SkipPptx
+    Do not write <workbook name>.pptx. By default a PowerPoint file (16:9) is written next to the HTML:
+    one slide per dashboard page, each page fitted whole. PowerPoint itself is not needed.
+
+    The PDF and PowerPoint pages are pictures of the finished dashboard pages, taken by Microsoft Edge
+    (or Chrome) in a hidden window from the local HTML file, with no network access.
+
 .EXAMPLE
     .\Export-WklyReportDashboardB.ps1 -OpenWhenDone
 
@@ -76,10 +87,12 @@ param(
     [double]$MinPageHeightPt = 250,
     [string]$DashboardTitle = 'IT Service Management',
     [string]$Classification = 'CONFIDENTIAL',
+    [switch]$SkipPdf,
+    [switch]$SkipPptx,
     [switch]$OpenWhenDone
 )
 
-$ScriptBuild = '2026.10.22-B3'
+$ScriptBuild = '2026.10.23-B4'
 $SheetName = 'Wkly_Report'          # fixed by design - no other worksheet is ever read
 $Inv = [System.Globalization.CultureInfo]::InvariantCulture
 $ErrRegex = '#(DIV/0!|N/A|VALUE!|REF!|NAME\?|NUM!|NULL!|SPILL!|CALC!|FIELD!|BLOCKED!|CONNECT!|BUSY!|UNKNOWN!|GETTING_DATA)'
@@ -3772,6 +3785,23 @@ body.present .rail,body.present .scrim,body.present .top,body.present .sample{di
 body.present main{margin:0;padding:24px 40px}
 body.present section{display:none;min-height:calc(100vh - 48px)}
 body.present section.cur{display:block}
+body.present section:not(.cur){display:none!important}   /* the cover's own display rule must not show it on other pages */
+/* ?shot=N: page N alone as in Present mode, at least 1920 x 1080 (used for the PDF and PowerPoint files) */
+body.shot .hud{display:none!important}
+body.shot section.cur{min-height:1032px}
+/* the cover's window-height sizes, fixed to what a 1920 x 1080 screen gives (1vh = 10.8px, 1vw = 19.2px),
+   so the picture matches presenting on a normal screen whatever the size of the hidden window */
+body.shot #s1{height:1032px!important}   /* fills the 1080 frame: 24px margin above and below */
+body.shot #s1 .hero{padding:43.2px 86.4px}
+body.shot #s1 .eyebrow{font-size:20px}
+body.shot #s1 h1{font-size:96px;margin:23.76px 0 15.12px}
+body.shot #s1 .tg{font-size:26px;margin-bottom:43.2px}
+body.shot #s1 .kv{font-size:25.92px;gap:15.12px 28px}
+body.shot #s1 .stat{padding:21.6px 38.4px}
+body.shot #s1 .stat .lab{font-size:22px}
+body.shot #s1 .stat .val{font-size:75.6px}
+body.shot #s1 .stat .meta{font-size:18px}
+body.shot #s1 .conf-big{margin-top:43.2px}
 .hud{display:none}
 body.present .hud{display:flex;position:fixed;right:18px;bottom:18px;gap:6px;align-items:center;background:var(--surface);border:1px solid var(--line);border-radius:999px;padding:5px 6px 5px 14px;font-size:12px;box-shadow:var(--shadow);z-index:30}
 @media (max-width:1280px){.g6{grid-template-columns:repeat(3,1fr)}.g5{grid-template-columns:repeat(3,1fr)}.enh{grid-template-columns:repeat(3,1fr)}}
@@ -3905,6 +3935,12 @@ function stop(){document.body.classList.remove('present');if(document.fullscreen
 document.getElementById('present').onclick=start;document.getElementById('hp').onclick=function(){show(cur-1);};document.getElementById('hn').onclick=function(){show(cur+1);};document.getElementById('hx').onclick=stop;
 document.addEventListener('keydown',function(e){if(!document.body.classList.contains('present'))return;if(['ArrowRight','PageDown',' '].indexOf(e.key)>=0){e.preventDefault();show(cur+1);}if(['ArrowLeft','PageUp'].indexOf(e.key)>=0)show(cur-1);if(e.key==='Escape')stop();});
 document.addEventListener('fullscreenchange',function(){if(!document.fullscreenElement&&document.body.classList.contains('present'))stop();});
+// ?shot=N: page N alone (PDF / PowerPoint pictures); a check mark 20px below the page marks where it ends
+var shotM=/[?&]shot=(\d+)/.exec(location.search);
+if(shotM){document.body.classList.add('present','shot');show(parseInt(shotM[1],10)-1);
+  var mark=function(){var o=document.getElementById('shotmark');if(o)o.parentNode.removeChild(o);var r=secs[cur].getBoundingClientRect(),m=document.createElement('div');m.id='shotmark';
+    m.style.cssText='position:absolute;left:20px;width:10px;height:10px;background:rgb(1,2,3);top:'+(Math.ceil(r.bottom+window.scrollY)+24+20)+'px';document.body.appendChild(m);};
+  mark();window.addEventListener('load',mark);setTimeout(mark,1500);if(document.fonts&&document.fonts.ready)document.fonts.ready.then(mark);}
 })();
 
 '@
@@ -3912,6 +3948,362 @@ document.addEventListener('fullscreenchange',function(){if(!document.fullscreenE
 # ======================================================================================
 #  Main
 # ======================================================================================
+
+# ======================================================================================
+#  PDF and PowerPoint copies: one picture per dashboard page, taken from the finished HTML
+# ======================================================================================
+
+function Find-HeadlessBrowser {
+    # Microsoft Edge (part of Windows), then Google Chrome. Only used to open the local HTML file and
+    # take a picture of each page; no web address is ever opened. Returns every one found.
+    $candidates = New-Object System.Collections.Generic.List[string]
+    foreach ($exe in @('Microsoft\Edge\Application\msedge.exe', 'Google\Chrome\Application\chrome.exe')) {
+        foreach ($base in @(${env:ProgramFiles(x86)}, $env:ProgramFiles, $env:LOCALAPPDATA)) {
+            if ($base) { $candidates.Add((Join-Path $base $exe)) }
+        }
+        foreach ($hive in @('HKLM:', 'HKCU:')) {
+            try { $v = (Get-ItemProperty -LiteralPath ("$hive\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\" + (Split-Path $exe -Leaf)) -ErrorAction Stop).'(default)'; if ($v) { $candidates.Add([string]$v) } } catch { }
+        }
+    }
+    $found = New-Object System.Collections.Generic.List[string]
+    foreach ($c in $candidates) {
+        if (-not $c -or -not (Test-Path -LiteralPath $c -PathType Leaf)) { continue }
+        $full = (Resolve-Path -LiteralPath $c).ProviderPath
+        if (-not ($found | Where-Object { $_ -ieq $full })) { $found.Add($full) }
+    }
+    return , $found
+}
+
+function Get-HeadlessPolicyNote {
+    # Organisations can switch off the hidden (headless) mode of Edge/Chrome by policy; report it.
+    param([string]$Browser)
+    $key = if ($Browser -match 'msedge') { 'Microsoft\Edge' } else { 'Google\Chrome' }
+    foreach ($hive in @('HKLM:', 'HKCU:')) {
+        try {
+            $v = (Get-ItemProperty -LiteralPath "$hive\SOFTWARE\Policies\$key" -ErrorAction Stop).HeadlessModeEnabled
+            if ($null -ne $v) {
+                $what = ''
+                if ([int]$v -eq 0) { $what = ' (hidden mode switched off by the organisation)' }
+                return ('policy {0}\SOFTWARE\Policies\{1}\HeadlessModeEnabled = {2}{3}' -f $hive, $key, $v, $what)
+            }
+        }
+        catch { }
+    }
+    return 'no HeadlessModeEnabled policy set'
+}
+
+function Stop-ShotBrowsers {
+    # Closes browser copies this script started that are still running: only processes whose command
+    # line contains this run's own private folder; the user's own Edge/Chrome windows are never touched.
+    param([string]$ShotDir)
+    try {
+        $mine = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop | Where-Object { $_.CommandLine -and $_.CommandLine.IndexOf($ShotDir, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 })
+        foreach ($pr in $mine) { try { Stop-Process -Id $pr.ProcessId -Force -ErrorAction SilentlyContinue } catch { } }
+        if ($mine.Count) { Write-Log ("{0} browser process(es) started by this script for the page pictures were closed." -f $mine.Count) }
+    }
+    catch { }
+}
+
+function Invoke-HeadlessShot {
+    # Runs the browser once; returns $null when the picture was written, else the reason, including the
+    # browser's exit code and its own error output.
+    param([string]$Browser, [string]$Arguments, [string]$Raw)
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $Browser
+    $psi.Arguments = $Arguments
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardError = $true
+    $psi.RedirectStandardOutput = $true
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $errTask = $proc.StandardError.ReadToEndAsync()
+    $outTask = $proc.StandardOutput.ReadToEndAsync()
+    if (-not $proc.WaitForExit(120000)) {
+        try { $proc.Kill() } catch { }   # only the browser this script started
+        return 'browser did not finish in 2 minutes'
+    }
+    # When PowerShell runs as Administrator, Edge hands the job to a non-administrator copy of itself
+    # and exits at once; that copy writes the picture a few seconds later. Wait for it (up to 60 s)
+    # until the file exists and has stopped growing.
+    $last = -1
+    for ($t = 0; $t -lt 120; $t++) {
+        $len = -1
+        if (Test-Path -LiteralPath $Raw) { try { $len = (Get-Item -LiteralPath $Raw).Length } catch { } }
+        if ($len -gt 0 -and $len -eq $last) { return $null }
+        $last = $len
+        Start-Sleep -Milliseconds 500
+    }
+    $text = ''
+    try { if ($errTask.Wait(3000)) { $text += $errTask.Result } } catch { }
+    try { if ($outTask.Wait(1000)) { $text += $outTask.Result } } catch { }
+    $text = (($text -split "`r?`n") | Where-Object { $_.Trim() } | Select-Object -Last 6) -join ' / '
+    if ($text.Length -gt 600) { $text = $text.Substring($text.Length - 600) }
+    if (-not $text) { $text = 'no message from the browser' }
+    return ('no picture written (exit code {0}; browser said: {1})' -f $proc.ExitCode, $text)
+}
+
+function ConvertTo-JpegFile {
+    # PNG page picture -> high-quality JPEG (keeps the PDF small; PDF readers show JPEG directly).
+    param([string]$PngPath, [string]$JpegPath, [int]$Quality = 92)
+    Add-Type -AssemblyName System.Drawing
+    $img = [System.Drawing.Image]::FromFile($PngPath)
+    try {
+        $codec = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { $_.MimeType -eq 'image/jpeg' } | Select-Object -First 1
+        $ep = New-Object System.Drawing.Imaging.EncoderParameters 1
+        $ep.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter ([System.Drawing.Imaging.Encoder]::Quality), ([int64]$Quality)
+        $img.Save($JpegPath, $codec, $ep)
+    }
+    finally { $img.Dispose() }
+}
+
+function Write-ImagePdf {
+    # A PDF with one page per dashboard page; every PDF page has exactly that page's size, so the
+    # whole page is shown with nothing cut off. $Shots items: Jpeg, WPx, HPx, WPt, HPt, Title.
+    param($Shots, [string]$Path, [string]$Title)
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+    $fs = [System.IO.File]::Create($Path)
+    try {
+        $offsets = New-Object System.Collections.Generic.List[long]
+        $ascii = [System.Text.Encoding]::ASCII
+        $put = { param([string]$t) $b = $ascii.GetBytes($t); $fs.Write($b, 0, $b.Length) }
+        $obj = { param([int]$n) while ($offsets.Count -lt $n) { $offsets.Add(0) }; $offsets[$n - 1] = $fs.Position; & $put ("{0} 0 obj`n" -f $n) }
+        & $put "%PDF-1.4`n%"
+        $fs.Write([byte[]](0xE2, 0xE3, 0xCF, 0xD3, 0x0A), 0, 5)
+        $n = $Shots.Count
+        # objects: 1 catalog, 2 pages, 3 info, then 3 per page (page, content, image)
+        $kids = (0..($n - 1) | ForEach-Object { '{0} 0 R' -f (4 + 3 * $_) }) -join ' '
+        & $obj 1; & $put "<< /Type /Catalog /Pages 2 0 R >>`nendobj`n"
+        & $obj 2; & $put ("<< /Type /Pages /Kids [{0}] /Count {1} >>`nendobj`n" -f $kids, $n)
+        $safeTitle = ($Title -replace '[^\x20-\x7E]', '' -replace '([\\()])', '\$1')
+        & $obj 3; & $put ("<< /Title ({0}) /Producer (Export-WklyReportDashboard) >>`nendobj`n" -f $safeTitle)
+        for ($i = 0; $i -lt $n; $i++) {
+            $s = $Shots[$i]
+            $pg = 4 + 3 * $i
+            $w = [string]::Format($inv, '{0:0.##}', [double]$s.WPt); $h = [string]::Format($inv, '{0:0.##}', [double]$s.HPt)
+            $content = "q $w 0 0 $h 0 0 cm /Im0 Do Q"
+            $jpeg = [System.IO.File]::ReadAllBytes($s.Jpeg)
+            & $obj $pg; & $put ("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {0} {1}] /Resources << /XObject << /Im0 {2} 0 R >> >> /Contents {3} 0 R >>`nendobj`n" -f $w, $h, ($pg + 2), ($pg + 1))
+            & $obj ($pg + 1); & $put ("<< /Length {0} >>`nstream`n{1}`nendstream`nendobj`n" -f $content.Length, $content)
+            & $obj ($pg + 2); & $put ("<< /Type /XObject /Subtype /Image /Width {0} /Height {1} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length {2} >>`nstream`n" -f $s.WPx, $s.HPx, $jpeg.Length)
+            $fs.Write($jpeg, 0, $jpeg.Length)
+            & $put "`nendstream`nendobj`n"
+        }
+        $xref = $fs.Position
+        & $put ("xref`n0 {0}`n0000000000 65535 f `n" -f ($offsets.Count + 1))
+        foreach ($o in $offsets) { & $put ("{0:D10} 00000 n `n" -f $o) }
+        & $put ("trailer`n<< /Size {0} /Root 1 0 R /Info 3 0 R >>`nstartxref`n{1}`n%%EOF`n" -f ($offsets.Count + 1), $xref)
+    }
+    finally { $fs.Dispose() }
+}
+
+function Write-ImagePptx {
+    # A PowerPoint file (16:9) with one slide per dashboard page. Each page picture is fitted whole
+    # into its slide (never cropped) and centred. Written directly as Open XML: PowerPoint is not needed.
+    param($Shots, [string]$Path, [string]$Title)
+    Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+    $SW = 12192000; $SH = 6858000                     # 13.333 x 7.5 in
+    $nsA = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+    $nsR = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+    $nsP = 'http://schemas.openxmlformats.org/presentationml/2006/main'
+    $relNs = 'http://schemas.openxmlformats.org/package/2006/relationships'
+    $rt = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+    $hdr = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' + "`r`n"
+    $esc = { param($t) [System.Security.SecurityElement]::Escape([string]$t) }
+    $tree = '<p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>'
+    $n = $Shots.Count
+    $parts = [ordered]@{}
+    $ct = '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="png" ContentType="image/png"/>' +
+        '<Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>' +
+        '<Override PartName="/ppt/slideMasters/slideMaster1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideMaster+xml"/>' +
+        '<Override PartName="/ppt/slideLayouts/slideLayout1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml"/>' +
+        '<Override PartName="/ppt/theme/theme1.xml" ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/>' +
+        '<Override PartName="/ppt/presProps.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presProps+xml"/>' +
+        '<Override PartName="/ppt/viewProps.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.viewProps+xml"/>' +
+        '<Override PartName="/ppt/tableStyles.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.tableStyles+xml"/>' +
+        '<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>' +
+        '<Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>'
+    for ($i = 1; $i -le $n; $i++) { $ct += '<Override PartName="/ppt/slides/slide{0}.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>' -f $i }
+    $parts['[Content_Types].xml'] = $ct + '</Types>'
+    $parts['_rels/.rels'] = "<Relationships xmlns=`"$relNs`"><Relationship Id=`"rId1`" Type=`"$rt/officeDocument`" Target=`"ppt/presentation.xml`"/><Relationship Id=`"rId2`" Type=`"http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties`" Target=`"docProps/core.xml`"/><Relationship Id=`"rId3`" Type=`"$rt/extended-properties`" Target=`"docProps/app.xml`"/></Relationships>"
+    $now = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    $parts['docProps/core.xml'] = '<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><dc:title>' + (& $esc $Title) + '</dc:title><dc:creator>Export-WklyReportDashboard</dc:creator><dcterms:created xsi:type="dcterms:W3CDTF">' + $now + '</dcterms:created><dcterms:modified xsi:type="dcterms:W3CDTF">' + $now + '</dcterms:modified></cp:coreProperties>'
+    $parts['docProps/app.xml'] = '<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"><Application>Microsoft Office PowerPoint</Application><Slides>' + $n + '</Slides></Properties>'
+    $sldIds = ''; $presRels = "<Relationship Id=`"rId1`" Type=`"$rt/slideMaster`" Target=`"slideMasters/slideMaster1.xml`"/><Relationship Id=`"rId2`" Type=`"$rt/theme`" Target=`"theme/theme1.xml`"/><Relationship Id=`"rId3`" Type=`"$rt/presProps`" Target=`"presProps.xml`"/><Relationship Id=`"rId4`" Type=`"$rt/viewProps`" Target=`"viewProps.xml`"/><Relationship Id=`"rId5`" Type=`"$rt/tableStyles`" Target=`"tableStyles.xml`"/>"
+    for ($i = 1; $i -le $n; $i++) {
+        $sldIds += '<p:sldId id="{0}" r:id="rId{1}"/>' -f (255 + $i), (9 + $i)
+        $presRels += "<Relationship Id=`"rId$(9 + $i)`" Type=`"$rt/slide`" Target=`"slides/slide$i.xml`"/>"
+    }
+    $parts['ppt/presentation.xml'] = "<p:presentation xmlns:a=`"$nsA`" xmlns:r=`"$nsR`" xmlns:p=`"$nsP`" saveSubsetFonts=`"1`"><p:sldMasterIdLst><p:sldMasterId id=`"2147483648`" r:id=`"rId1`"/></p:sldMasterIdLst><p:sldIdLst>$sldIds</p:sldIdLst><p:sldSz cx=`"$SW`" cy=`"$SH`"/><p:notesSz cx=`"6858000`" cy=`"9144000`"/></p:presentation>"
+    $parts['ppt/_rels/presentation.xml.rels'] = "<Relationships xmlns=`"$relNs`">$presRels</Relationships>"
+    $parts['ppt/presProps.xml'] = "<p:presentationPr xmlns:a=`"$nsA`" xmlns:r=`"$nsR`" xmlns:p=`"$nsP`"/>"
+    $parts['ppt/viewProps.xml'] = "<p:viewPr xmlns:a=`"$nsA`" xmlns:r=`"$nsR`" xmlns:p=`"$nsP`"><p:normalViewPr><p:restoredLeft sz=`"15620`"/><p:restoredTop sz=`"94660`"/></p:normalViewPr><p:gridSpacing cx=`"76200`" cy=`"76200`"/></p:viewPr>"
+    $parts['ppt/tableStyles.xml'] = "<a:tblStyleLst xmlns:a=`"$nsA`" def=`"{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}`"/>"
+    $parts['ppt/slideMasters/slideMaster1.xml'] = "<p:sldMaster xmlns:a=`"$nsA`" xmlns:r=`"$nsR`" xmlns:p=`"$nsP`"><p:cSld><p:bg><p:bgPr><a:solidFill><a:srgbClr val=`"FFFFFF`"/></a:solidFill><a:effectLst/></p:bgPr></p:bg><p:spTree>$tree</p:spTree></p:cSld><p:clrMap bg1=`"lt1`" tx1=`"dk1`" bg2=`"lt2`" tx2=`"dk2`" accent1=`"accent1`" accent2=`"accent2`" accent3=`"accent3`" accent4=`"accent4`" accent5=`"accent5`" accent6=`"accent6`" hlink=`"hlink`" folHlink=`"folHlink`"/><p:sldLayoutIdLst><p:sldLayoutId id=`"2147483649`" r:id=`"rId1`"/></p:sldLayoutIdLst></p:sldMaster>"
+    $parts['ppt/slideMasters/_rels/slideMaster1.xml.rels'] = "<Relationships xmlns=`"$relNs`"><Relationship Id=`"rId1`" Type=`"$rt/slideLayout`" Target=`"../slideLayouts/slideLayout1.xml`"/><Relationship Id=`"rId2`" Type=`"$rt/theme`" Target=`"../theme/theme1.xml`"/></Relationships>"
+    $parts['ppt/slideLayouts/slideLayout1.xml'] = "<p:sldLayout xmlns:a=`"$nsA`" xmlns:r=`"$nsR`" xmlns:p=`"$nsP`" type=`"blank`" preserve=`"1`"><p:cSld name=`"Blank`"><p:spTree>$tree</p:spTree></p:cSld><p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sldLayout>"
+    $parts['ppt/slideLayouts/_rels/slideLayout1.xml.rels'] = "<Relationships xmlns=`"$relNs`"><Relationship Id=`"rId1`" Type=`"$rt/slideMaster`" Target=`"../slideMasters/slideMaster1.xml`"/></Relationships>"
+    $fill3 = '<a:solidFill><a:schemeClr val="phClr"/></a:solidFill>'
+    $line = '<a:ln w="9525"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln>'
+    $clr = { param($nm, $v) "<a:$nm><a:srgbClr val=`"$v`"/></a:$nm>" }
+    $parts['ppt/theme/theme1.xml'] = "<a:theme xmlns:a=`"$nsA`" name=`"Office Theme`"><a:themeElements><a:clrScheme name=`"Office`"><a:dk1><a:sysClr val=`"windowText`" lastClr=`"000000`"/></a:dk1><a:lt1><a:sysClr val=`"window`" lastClr=`"FFFFFF`"/></a:lt1>" +
+        (& $clr 'dk2' '44546A') + (& $clr 'lt2' 'E7E6E6') + (& $clr 'accent1' '4472C4') + (& $clr 'accent2' 'ED7D31') + (& $clr 'accent3' 'A5A5A5') + (& $clr 'accent4' 'FFC000') + (& $clr 'accent5' '5B9BD5') + (& $clr 'accent6' '70AD47') + (& $clr 'hlink' '0563C1') + (& $clr 'folHlink' '954F72') +
+        "</a:clrScheme><a:fontScheme name=`"Office`"><a:majorFont><a:latin typeface=`"Calibri Light`"/><a:ea typeface=`"`"/><a:cs typeface=`"`"/></a:majorFont><a:minorFont><a:latin typeface=`"Calibri`"/><a:ea typeface=`"`"/><a:cs typeface=`"`"/></a:minorFont></a:fontScheme>" +
+        "<a:fmtScheme name=`"Office`"><a:fillStyleLst>$fill3$fill3$fill3</a:fillStyleLst><a:lnStyleLst>$line$line$line</a:lnStyleLst><a:effectStyleLst><a:effectStyle><a:effectLst/></a:effectStyle><a:effectStyle><a:effectLst/></a:effectStyle><a:effectStyle><a:effectLst/></a:effectStyle></a:effectStyleLst><a:bgFillStyleLst>$fill3$fill3$fill3</a:bgFillStyleLst></a:fmtScheme></a:themeElements></a:theme>"
+    for ($i = 1; $i -le $n; $i++) {
+        $s = $Shots[$i - 1]
+        $wE = [double]$s.WPt * 12700; $hE = [double]$s.HPt * 12700
+        $k = [math]::Min($SW / $wE, $SH / $hE)
+        $cx = [int64][math]::Floor($wE * $k); $cy = [int64][math]::Floor($hE * $k)
+        $x = [int64](($SW - $cx) / 2); $y = [int64](($SH - $cy) / 2)
+        $parts["ppt/slides/slide$i.xml"] = "<p:sld xmlns:a=`"$nsA`" xmlns:r=`"$nsR`" xmlns:p=`"$nsP`"><p:cSld><p:spTree>$tree<p:pic><p:nvPicPr><p:cNvPr id=`"2`" name=`"Page $($s.Index)`" descr=`"$(& $esc $s.Title)`"/><p:cNvPicPr><a:picLocks noChangeAspect=`"1`"/></p:cNvPicPr><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:embed=`"rId2`"/><a:stretch><a:fillRect/></a:stretch></p:blipFill><p:spPr><a:xfrm><a:off x=`"$x`" y=`"$y`"/><a:ext cx=`"$cx`" cy=`"$cy`"/></a:xfrm><a:prstGeom prst=`"rect`"><a:avLst/></a:prstGeom></p:spPr></p:pic></p:spTree></p:cSld><p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sld>"
+        $parts["ppt/slides/_rels/slide$i.xml.rels"] = "<Relationships xmlns=`"$relNs`"><Relationship Id=`"rId1`" Type=`"$rt/slideLayout`" Target=`"../slideLayouts/slideLayout1.xml`"/><Relationship Id=`"rId2`" Type=`"$rt/image`" Target=`"../media/image$i.png`"/></Relationships>"
+    }
+    if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Force }
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    $zip = [System.IO.Compression.ZipFile]::Open($Path, [System.IO.Compression.ZipArchiveMode]::Create)
+    try {
+        foreach ($name in $parts.Keys) {
+            $e = $zip.CreateEntry($name)
+            $writer = New-Object System.IO.StreamWriter($e.Open(), $utf8)
+            try { $writer.Write($hdr + $parts[$name]) } finally { $writer.Dispose() }
+        }
+        for ($i = 1; $i -le $n; $i++) {
+            $e = $zip.CreateEntry("ppt/media/image$i.png", [System.IO.Compression.CompressionLevel]::NoCompression)
+            $st = $e.Open()
+            try { $b = [System.IO.File]::ReadAllBytes($Shots[$i - 1].Path); $st.Write($b, 0, $b.Length) } finally { $st.Dispose() }
+        }
+    }
+    finally { $zip.Dispose() }
+}
+
+function Save-MarkedCrop {
+    # Design B pages flow with the window, so their height is found from the dashboard's check mark,
+    # drawn $Gap pixels below the page: everything above it is the page. Returns the page height in pixels.
+    # No mark means the browser did not show the page in full; nothing is cropped then.
+    param([string]$Source, [string]$Target, [int]$W, [int]$MarkX, [int]$Gap, [int]$MinH)
+    Add-Type -AssemblyName System.Drawing
+    $img = [System.Drawing.Bitmap]::FromFile($Source)
+    try {
+        if ($img.Width -lt $W) { throw ('picture is {0} px wide, narrower than the page ({1} px)' -f $img.Width, $W) }
+        $markY = -1
+        for ($y = 0; $y -lt $img.Height; $y++) {
+            $c = $img.GetPixel($MarkX, $y)
+            if ([math]::Abs($c.R - 1) + [math]::Abs($c.G - 2) + [math]::Abs($c.B - 3) -le 9) { $markY = $y; break }
+        }
+        if ($markY -lt 0) { throw 'check mark not found' }
+        $h = $markY - $Gap
+        if ($h -lt $MinH) { throw ('page came out only {0} px high' -f $h) }
+        $crop = $img.Clone((New-Object System.Drawing.Rectangle 0, 0, $W, $h), [System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
+        try { $crop.Save($Target, [System.Drawing.Imaging.ImageFormat]::Png) } finally { $crop.Dispose() }
+        return $h
+    }
+    finally { $img.Dispose() }
+}
+
+function Export-PageShotsB {
+    # Opens the finished dashboard in a hidden browser window (?shot=N shows page N alone, as in
+    # Present mode, 1920 px wide and at least 1080 px high) and saves one picture per page at twice
+    # that resolution. A page taller than the window is taken again with a taller window, so nothing
+    # is cut off. Page 1 decides which browser/mode works; when none does, the rest is skipped.
+    param([string]$HtmlPath, $Titles, [string]$ShotDir, [ref]$ErrorText)
+    $shots = New-Object System.Collections.Generic.List[object]
+    $browsers = Find-HeadlessBrowser
+    if ($browsers.Count -eq 0) { $ErrorText.Value = 'Microsoft Edge / Google Chrome was not found on this PC'; return , $shots }
+    New-Item -ItemType Directory -Path $ShotDir -Force | Out-Null
+    $url = (New-Object System.Uri($HtmlPath)).AbsoluteUri
+    $scale = 2; $wCss = 1920
+    $errs = New-Object System.Collections.Generic.List[string]
+    $working = $null
+    for ($i = 1; $i -le $Titles.Count; $i++) {
+        $raw = Join-Path $ShotDir ('raw-{0:D2}.png' -f $i)
+        $png = Join-Path $ShotDir ('page-{0:D2}.png' -f $i)
+        $combos = New-Object System.Collections.Generic.List[object]
+        if ($working) { $combos.Add($working) }
+        else { foreach ($br in $browsers) { foreach ($mode in @('--headless=new', '--headless')) { $combos.Add([pscustomobject]@{ Browser = $br; Mode = $mode }) } } }
+        $hPx = 0
+        foreach ($cb in $combos) {
+            $who = '{0} {1}' -f (Split-Path $cb.Browser -Leaf), $cb.Mode
+            foreach ($winH in @(2400, 8200)) {
+                if (Test-Path -LiteralPath $raw) { Remove-Item -LiteralPath $raw -Force }
+                $profileDir = Join-Path $ShotDir ('browser-profile-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+                $argList = @($cb.Mode, '--do-not-de-elevate', '--disable-gpu', '--no-first-run', '--no-default-browser-check', '--hide-scrollbars', '--disable-extensions',
+                    '--disable-sync', '--disable-background-networking', '--disable-component-update', '--disable-default-apps', '--mute-audio',
+                    '--enable-logging=stderr', '--v=0',
+                    # no network at all for this hidden browser (local file, no external references)
+                    '--proxy-server=http://127.0.0.1:9', '--no-pings', '--disable-domain-reliability', '--disable-client-side-phishing-detection',
+                    ('"--user-data-dir={0}"' -f $profileDir), ('--force-device-scale-factor={0}' -f $scale), ('--window-size={0},{1}' -f $wCss, $winH),
+                    '--virtual-time-budget=5000', ('"--screenshot={0}"' -f $raw), ('"{0}?shot={1}"' -f $url, $i))
+                try {
+                    $why = Invoke-HeadlessShot -Browser $cb.Browser -Arguments ($argList -join ' ') -Raw $raw
+                    if ($why) { $errs.Add(('page {0} ({1}): {2}' -f $i, $who, $why)); break }
+                    $hPx = [int](Save-MarkedCrop -Source $raw -Target $png -W ($wCss * $scale) -MarkX (25 * $scale) -Gap (20 * $scale) -MinH (500 * $scale))
+                    if (-not $working) { $working = $cb; Write-Log ("PDF/PowerPoint pages: pictures taken with {0} ({1}, hidden, local file only, no network)." -f $cb.Browser, $cb.Mode) }
+                    break
+                }
+                catch {
+                    $errs.Add(('page {0} ({1}, window {2} px high): {3}' -f $i, $who, $winH, $_.Exception.Message))
+                    if ($_.Exception.Message -ne 'check mark not found') { break }
+                }
+            }
+            if ($hPx -gt 0) { break }
+        }
+        if ($hPx -gt 0) {
+            $shots.Add([pscustomobject]@{ Index = $i; Title = [string]$Titles[$i - 1]; Path = $png; WPx = $wCss * $scale; HPx = $hPx; WPt = $wCss * 0.75; HPt = $hPx / $scale * 0.75 })
+        }
+        elseif (-not $working) {
+            foreach ($br in $browsers) { $errs.Add(('{0}: {1}' -f (Split-Path $br -Leaf), (Get-HeadlessPolicyNote $br))) }
+            break   # no browser works on this PC: the other pages would fail the same way
+        }
+    }
+    Stop-ShotBrowsers -ShotDir $ShotDir
+    Get-ChildItem -LiteralPath $ShotDir -Directory -Filter 'browser-profile-*' -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    $ErrorText.Value = $null
+    if ($errs.Count) { $ErrorText.Value = ($errs -join ' | ') }
+    return , $shots
+}
+
+function Export-PdfAndPptx {
+    # Writes <workbook name>.pdf and .pptx next to the HTML, from one picture per finished page.
+    # Both are written only when every page was captured, so neither can silently miss a page.
+    param([string]$HtmlPath, $Titles, [string]$OutDir, [string]$BaseName, [string]$Title)
+    $shotDir = Join-Path $script:WorkDir 'page-shots'
+    $err = $null
+    $shots = Export-PageShotsB -HtmlPath $HtmlPath -Titles $Titles -ShotDir $shotDir -ErrorText ([ref]$err)
+    if ($shots.Count -ne $Titles.Count) {
+        Add-Issue -Severity Warning -Location 'PDF / PowerPoint' -Message ("Not written: pictures were taken of {0} of {1} page(s) [{2}]. The HTML dashboard is complete." -f $shots.Count, $Titles.Count, $err)
+        Write-Log ("PDF and PowerPoint files not written: pictures were taken of {0} of {1} page(s) [{2}]." -f $shots.Count, $Titles.Count, $err) 'WARN'
+        return
+    }
+    if ($err) { Write-Log ("Page pictures needed a second try: {0}" -f $err) }
+    $targets = @()
+    if (-not $SkipPdf) { $targets += 'pdf' }
+    if (-not $SkipPptx) { $targets += 'pptx' }
+    foreach ($kind in $targets) {
+        $final = Join-Path $OutDir ($BaseName + '.' + $kind)
+        $tmp = Join-Path $script:WorkDir ('out.' + $kind)
+        try {
+            if ($kind -eq 'pdf') {
+                foreach ($s in $shots) {
+                    $jpg = [System.IO.Path]::ChangeExtension($s.Path, '.jpg')
+                    ConvertTo-JpegFile -PngPath $s.Path -JpegPath $jpg
+                    $s | Add-Member -NotePropertyName Jpeg -NotePropertyValue $jpg -Force
+                }
+                Write-ImagePdf -Shots $shots -Path $tmp -Title $Title
+            }
+            else { Write-ImagePptx -Shots $shots -Path $tmp -Title $Title }
+            Copy-Item -LiteralPath $tmp -Destination $final -Force
+            $mb = [math]::Round((Get-Item -LiteralPath $final).Length / 1MB, 1)
+            $what = if ($kind -eq 'pdf') { 'PDF: {0} page(s), each sized to its dashboard page' -f $shots.Count } else { 'PowerPoint: {0} slide(s) (16:9), each page fitted whole' -f $shots.Count }
+            Write-Log ("{0} ({1} MB) written: {2}" -f $what, $mb, $final) 'OK'
+        }
+        catch {
+            $why = $_.Exception.Message
+            if ($why -match 'being used by another process') { $why = 'the file is open (close it in PowerPoint / the PDF viewer and run again)' }
+            Add-Issue -Severity Warning -Location ('{0} file' -f $kind.ToUpperInvariant()) -Message ("Not written: {0}" -f $why)
+            Write-Log ("{0} file not written: {1}" -f $kind.ToUpperInvariant(), $why) 'WARN'
+        }
+    }
+}
 
 function Invoke-Main {
     Write-Log "Export-WklyReportDashboardB (Design B) build $ScriptBuild" 'OK'
@@ -4120,6 +4512,14 @@ function Invoke-Main {
     $nativeCharts = [regex]::Matches($written, 'class="chart" data-c=').Count
     Write-Log ("Validation: {0} page(s) in the file (expected {1}), {2} chart(s) redrawn from data, {3} external reference(s) (expected 0)." -f $sections, $result.Pages.Count, $nativeCharts, $externalRefs) $validLevel
     Write-Log "Dashboard written: $index" 'OK'
+    if (-not ($SkipPdf -and $SkipPptx)) {
+        try {
+            $titles = New-Object System.Collections.Generic.List[string]
+            for ($k = 0; $k -lt $sections; $k++) { $t = ''; if ($k -lt $result.Pages.Count) { $t = [string]$result.Pages[$k].Title }; $titles.Add($t) }
+            Export-PdfAndPptx -HtmlPath $index -Titles $titles -OutDir $outDir -BaseName $meta.BaseName -Title ('{0} - {1}' -f $DashboardTitle, $meta.FileName)
+        }
+        catch { Write-Log ("PDF / PowerPoint files not written: {0}" -f (Format-ErrorDetail $_)) 'WARN' }
+    }
 
 
     $errs = @($script:Issues | Where-Object { $_.Severity -eq 'Error' }).Count

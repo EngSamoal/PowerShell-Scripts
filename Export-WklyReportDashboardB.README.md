@@ -5,7 +5,16 @@ the same read-only way, but presents it in **Design B**: charcoal, green and gol
 panel per page with a coloured header bar, and large text for presenting.
 
 The output is **one self-contained HTML file**, named after the workbook, for example
-`Bi_Wkly_Report-Daily Data.html`. It works offline and can be sent by email or Teams.
+`Bi_Wkly_Report-Daily Data.html`. It works offline and can be sent by email or Teams. From build B4 a
+**PDF** and a **PowerPoint (.pptx)** copy with the same name are written next to it:
+
+- each page is shown as in Present mode, 1920 px wide and at least 1080 px high, so most pages fill a
+  16:9 slide exactly; a longer page is kept whole (taller PDF page, fitted whole on its slide);
+- the pictures are taken by Microsoft Edge (or Chrome) in a hidden window from the local HTML file, with no
+  network access; PowerPoint does not need to be installed;
+- both files are written only when every page was captured; otherwise the log says why, and the HTML is
+  still complete. Close an open copy of the PDF/PPTX before running, or it cannot be replaced.
+- `-SkipPdf` / `-SkipPptx` turn them off.
 
 ## Safety (same as the original script)
 
@@ -24,7 +33,7 @@ cd C:\Temp
 .\Export-WklyReportDashboardB.ps1 -OpenWhenDone
 ```
 
-The first line printed shows the build, for example `Export-WklyReportDashboardB (Design B) build 2026.10.22-B3`.
+The first line printed shows the build, for example `Export-WklyReportDashboardB (Design B) build 2026.10.23-B4`.
 
 | Parameter | Default |
 |---|---|
