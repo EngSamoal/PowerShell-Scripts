@@ -92,7 +92,7 @@ param(
     [switch]$OpenWhenDone
 )
 
-$ScriptBuild = '2026.10.23-B4'
+$ScriptBuild = '2026.10.23-B5'
 $SheetName = 'Wkly_Report'          # fixed by design - no other worksheet is ever read
 $Inv = [System.Globalization.CultureInfo]::InvariantCulture
 $ErrRegex = '#(DIV/0!|N/A|VALUE!|REF!|NAME\?|NUM!|NULL!|SPILL!|CALC!|FIELD!|BLOCKED!|CONNECT!|BUSY!|UNKNOWN!|GETTING_DATA)'
@@ -3590,7 +3590,7 @@ function New-DesignBSite {
 
 $DesignBShell = @'
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -3754,7 +3754,22 @@ section:nth-of-type(3n+2){--sec:#262a31}section:nth-of-type(3n+3){--sec:#13805a}
 .pfoot{display:flex;justify-content:space-between;padding:10px 24px;border-top:1px solid var(--line);font-size:15px;color:var(--ink-3);background:var(--surface-2)}
 .pfoot b{color:var(--sec)}
 section{padding-top:0}
-.pbd .card.stat{border-top:3px solid var(--sec);background:linear-gradient(180deg,color-mix(in srgb,var(--sec) 7%,var(--surface)),var(--surface) 70%)}
+.pbd .card.stat{border-top:3px solid var(--sec);background:color-mix(in srgb,var(--sec) 7%,var(--surface))}
+/* tiles in a row: labels share one height (set by alignTiles), so every number starts on the same line;
+   the detail line sits at the bottom of each tile */
+.grid>.stat{display:flex;flex-direction:column}
+.grid>.stat>.meta{margin-top:auto}
+.pfoot b{font-weight:700}
+:root[data-theme="dark"] .pfoot b{color:var(--ink)}
+/* light mode: solid tints of each page's colour (charcoal / green / gold); cards and charts stay white */
+:root[data-theme="light"] section{--sec-bg:#e6f0ea;--sec-tile:#d3e7da}
+:root[data-theme="light"] section:nth-of-type(3n+2){--sec-bg:#e8ebef;--sec-tile:#d9dee5}
+:root[data-theme="light"] section:nth-of-type(3n+3){--sec-bg:#e3f0e8;--sec-tile:#cfe6d8}
+:root[data-theme="light"] section:nth-of-type(3n+4){--sec-bg:#f6edd9;--sec-tile:#efdcb2}
+:root[data-theme="light"] .page{background:var(--sec-bg)}
+:root[data-theme="light"] .pbd .card.stat{background:var(--sec-tile)}
+:root[data-theme="light"] .pfoot{background:var(--sec-tile)}
+:root[data-theme="light"] #s1 .stat{background:#f6edd9}
 .pbd .card h3{color:color-mix(in srgb,var(--sec) 70%,var(--ink))}
 :root[data-theme="dark"] .pbd .card h3{color:var(--ink)}
 @media (prefers-color-scheme:dark){:root:not([data-theme="light"]) .pbd .card h3{color:var(--ink)}}
@@ -3935,10 +3950,18 @@ function stop(){document.body.classList.remove('present');if(document.fullscreen
 document.getElementById('present').onclick=start;document.getElementById('hp').onclick=function(){show(cur-1);};document.getElementById('hn').onclick=function(){show(cur+1);};document.getElementById('hx').onclick=stop;
 document.addEventListener('keydown',function(e){if(!document.body.classList.contains('present'))return;if(['ArrowRight','PageDown',' '].indexOf(e.key)>=0){e.preventDefault();show(cur+1);}if(['ArrowLeft','PageUp'].indexOf(e.key)>=0)show(cur-1);if(e.key==='Escape')stop();});
 document.addEventListener('fullscreenchange',function(){if(!document.fullscreenElement&&document.body.classList.contains('present'))stop();});
+// tiles side by side: the labels of one row get the same height, so the numbers line up
+function alignTiles(){[].forEach.call(document.querySelectorAll('.grid'),function(g){
+  var ts=[].filter.call(g.children,function(c){return c.classList.contains('stat');});if(ts.length<2)return;
+  ['lab'].forEach(function(k){var rows={};
+    ts.forEach(function(t){var e=t.querySelector('.'+k);if(!e)return;e.style.minHeight='';(rows[t.offsetTop]=rows[t.offsetTop]||[]).push(e);});
+    Object.keys(rows).forEach(function(r){var m=0;rows[r].forEach(function(e){m=Math.max(m,e.offsetHeight);});if(m>0)rows[r].forEach(function(e){e.style.minHeight=m+'px';});});});});}
+try{alignTiles();window.addEventListener('load',alignTiles);window.addEventListener('resize',alignTiles);if(document.fonts&&document.fonts.ready)document.fonts.ready.then(alignTiles);
+  var show0=show;show=function(i){show0(i);alignTiles();};var setZoom0=setZoom;setZoom=function(z){setZoom0(z);alignTiles();};}catch(e){}
 // ?shot=N: page N alone (PDF / PowerPoint pictures); a check mark 20px below the page marks where it ends
 var shotM=/[?&]shot=(\d+)/.exec(location.search);
 if(shotM){document.body.classList.add('present','shot');show(parseInt(shotM[1],10)-1);
-  var mark=function(){var o=document.getElementById('shotmark');if(o)o.parentNode.removeChild(o);var r=secs[cur].getBoundingClientRect(),m=document.createElement('div');m.id='shotmark';
+  var mark=function(){alignTiles();var o=document.getElementById('shotmark');if(o)o.parentNode.removeChild(o);var r=secs[cur].getBoundingClientRect(),m=document.createElement('div');m.id='shotmark';
     m.style.cssText='position:absolute;left:20px;width:10px;height:10px;background:rgb(1,2,3);top:'+(Math.ceil(r.bottom+window.scrollY)+24+20)+'px';document.body.appendChild(m);};
   mark();window.addEventListener('load',mark);setTimeout(mark,1500);if(document.fonts&&document.fonts.ready)document.fonts.ready.then(mark);}
 })();

@@ -33,7 +33,7 @@ cd C:\Temp
 .\Export-WklyReportDashboardB.ps1 -OpenWhenDone
 ```
 
-The first line printed shows the build, for example `Export-WklyReportDashboardB (Design B) build 2026.10.23-B4`.
+The first line printed shows the build, for example `Export-WklyReportDashboardB (Design B) build 2026.10.23-B5`.
 
 | Parameter | Default |
 |---|---|
@@ -87,6 +87,10 @@ Pages are detected on every run, so the dashboard follows the workbook when page
 - **A chart type that is not redrawn is shown as Excel's own picture of that chart.**
 
 ## Using the dashboard
+
+- Dark mode is the default (build B5); **Light / Dark** switches. In light mode each page panel, its KPI
+  tiles and its footer are solid tints of the page colour (charcoal, green or gold); cards stay white.
+- KPI tiles side by side share one label height, so their numbers line up on one line.
 
 - **☰ Pages** (top left) opens the page list. Pages always use the full width.
 - **− / + / Fit** (or the keys `-` and `+`) zoom. Charts redraw sharply at every zoom level.
