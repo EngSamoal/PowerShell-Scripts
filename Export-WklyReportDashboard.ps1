@@ -130,7 +130,7 @@ param(
     [switch]$OpenWhenDone
 )
 
-$ScriptBuild = '2026.10.23-r33'
+$ScriptBuild = '2026.10.23-r34'
 $SheetName = 'Wkly_Report'          # fixed by design - no other worksheet is ever read
 $Inv = [System.Globalization.CultureInfo]::InvariantCulture
 $ErrRegex = '#(DIV/0!|N/A|VALUE!|REF!|NAME\?|NUM!|NULL!|SPILL!|CALC!|FIELD!|BLOCKED!|CONNECT!|BUSY!|UNKNOWN!|GETTING_DATA)'
@@ -3604,6 +3604,18 @@ function Get-HeadlessPolicyNote {
     return 'no HeadlessModeEnabled policy set'
 }
 
+function Stop-ShotBrowsers {
+    # Closes browser copies this script started that are still running: only processes whose command
+    # line contains this run's own private folder; the user's own Edge/Chrome windows are never touched.
+    param([string]$ShotDir)
+    try {
+        $mine = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop | Where-Object { $_.CommandLine -and $_.CommandLine.IndexOf($ShotDir, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 })
+        foreach ($pr in $mine) { try { Stop-Process -Id $pr.ProcessId -Force -ErrorAction SilentlyContinue } catch { } }
+        if ($mine.Count) { Write-Log ("{0} browser process(es) started by this script for the page pictures were closed." -f $mine.Count) }
+    }
+    catch { }
+}
+
 function Invoke-HeadlessShot {
     # Runs the browser once; returns $null when the picture was written, else the reason, including the
     # browser's exit code and its own error output.
@@ -3622,7 +3634,17 @@ function Invoke-HeadlessShot {
         try { $proc.Kill() } catch { }   # only the browser this script started
         return 'browser did not finish in 2 minutes'
     }
-    if ((Test-Path -LiteralPath $Raw) -and (Get-Item -LiteralPath $Raw).Length -gt 0) { return $null }
+    # When PowerShell runs as Administrator, Edge hands the job to a non-administrator copy of itself
+    # and exits at once; that copy writes the picture a few seconds later. Wait for it (up to 60 s)
+    # until the file exists and has stopped growing.
+    $last = -1
+    for ($t = 0; $t -lt 120; $t++) {
+        $len = -1
+        if (Test-Path -LiteralPath $Raw) { try { $len = (Get-Item -LiteralPath $Raw).Length } catch { } }
+        if ($len -gt 0 -and $len -eq $last) { return $null }
+        $last = $len
+        Start-Sleep -Milliseconds 500
+    }
     $text = ''
     try { if ($errTask.Wait(3000)) { $text += $errTask.Result } } catch { }
     try { if ($outTask.Wait(1000)) { $text += $outTask.Result } } catch { }
@@ -3659,7 +3681,6 @@ function Export-PageShots {
     $browsers = Find-HeadlessBrowser
     if ($browsers.Count -eq 0) { $ErrorText.Value = 'Microsoft Edge / Google Chrome was not found on this PC'; return , $shots }
     New-Item -ItemType Directory -Path $ShotDir -Force | Out-Null
-    $profileDir = Join-Path $ShotDir 'browser-profile'
     $url = (New-Object System.Uri($HtmlPath)).AbsoluteUri
     $scale = 2
     $errs = New-Object System.Collections.Generic.List[string]
@@ -3675,9 +3696,15 @@ function Export-PageShots {
         $ok = $false
         foreach ($cb in $combos) {
             if (Test-Path -LiteralPath $raw) { Remove-Item -LiteralPath $raw -Force }
-            $argList = @($cb.Mode, '--disable-gpu', '--no-first-run', '--no-default-browser-check', '--hide-scrollbars', '--disable-extensions',
+            # a fresh profile folder per attempt: a copy of the browser still finishing the previous
+            # page can never block this one ("profile in use", exit code 21)
+            $profileDir = Join-Path $ShotDir ('browser-profile-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+            $argList = @($cb.Mode, '--do-not-de-elevate', '--disable-gpu', '--no-first-run', '--no-default-browser-check', '--hide-scrollbars', '--disable-extensions',
                 '--disable-sync', '--disable-background-networking', '--disable-component-update', '--disable-default-apps', '--mute-audio',
                 '--enable-logging=stderr', '--v=0',
+                # no network at all for this hidden browser: the dashboard is a local file with no
+                # external references, and the browser's own background calls (updates etc.) go nowhere
+                '--proxy-server=http://127.0.0.1:9', '--no-pings', '--disable-domain-reliability', '--disable-client-side-phishing-detection',
                 ('"--user-data-dir={0}"' -f $profileDir), ('--force-device-scale-factor={0}' -f $scale), ('--window-size={0},{1}' -f ($wPx + 200), ($hPx + 200)),
                 '--virtual-time-budget=5000', ('"--screenshot={0}"' -f $raw), ('"{0}?shot={1}"' -f $url, $p.Index))
             $who = '{0} {1}' -f (Split-Path $cb.Browser -Leaf), $cb.Mode
@@ -3698,7 +3725,8 @@ function Export-PageShots {
             break   # no browser works on this PC: the other pages would fail the same way
         }
     }
-    Remove-Item -LiteralPath $profileDir -Recurse -Force -ErrorAction SilentlyContinue
+    Stop-ShotBrowsers -ShotDir $ShotDir
+    Get-ChildItem -LiteralPath $ShotDir -Directory -Filter 'browser-profile-*' -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
     $ErrorText.Value = $null
     if ($errs.Count) { $ErrorText.Value = ($errs -join ' | ') }
     return , $shots

@@ -36,7 +36,7 @@ It is **read-only**: no worksheet, formula, chart, PivotTable or value is change
   (the previous behaviour).
 - **PDF and PowerPoint** (build r32 and later): after the HTML is written, Microsoft Edge (or Chrome)
   opens that local file in a hidden window and takes one picture of each finished page at twice the
-  screen resolution. Nothing is sent anywhere.
+  screen resolution. Nothing is sent anywhere: that hidden browser has no network access at all.
   - the PDF has one page per dashboard page, each exactly that page's size, so nothing is cut off;
   - the PowerPoint file has one 16:9 slide per page, with the whole page fitted in. It is written
     directly, so PowerPoint does not need to be installed;
