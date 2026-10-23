@@ -130,7 +130,7 @@ param(
     [switch]$OpenWhenDone
 )
 
-$ScriptBuild = '2026.10.22-r32'
+$ScriptBuild = '2026.10.23-r33'
 $SheetName = 'Wkly_Report'          # fixed by design - no other worksheet is ever read
 $Inv = [System.Globalization.CultureInfo]::InvariantCulture
 $ErrRegex = '#(DIV/0!|N/A|VALUE!|REF!|NAME\?|NUM!|NULL!|SPILL!|CALC!|FIELD!|BLOCKED!|CONNECT!|BUSY!|UNKNOWN!|GETTING_DATA)'
@@ -3566,21 +3566,70 @@ $DashboardJs = @'
 # ======================================================================================
 
 function Find-HeadlessBrowser {
-    # Microsoft Edge (part of Windows) first, then Google Chrome. Only used to open the local HTML
-    # file and take a picture of each page; no web address is ever opened.
+    # Microsoft Edge (part of Windows), then Google Chrome. Only used to open the local HTML file and
+    # take a picture of each page; no web address is ever opened. Returns every one found.
     $candidates = New-Object System.Collections.Generic.List[string]
-    foreach ($base in @(${env:ProgramFiles(x86)}, $env:ProgramFiles, $env:LOCALAPPDATA)) {
-        if (-not $base) { continue }
-        $candidates.Add((Join-Path $base 'Microsoft\Edge\Application\msedge.exe'))
-        $candidates.Add((Join-Path $base 'Google\Chrome\Application\chrome.exe'))
-    }
-    foreach ($key in @('msedge.exe', 'chrome.exe')) {
+    foreach ($exe in @('Microsoft\Edge\Application\msedge.exe', 'Google\Chrome\Application\chrome.exe')) {
+        foreach ($base in @(${env:ProgramFiles(x86)}, $env:ProgramFiles, $env:LOCALAPPDATA)) {
+            if ($base) { $candidates.Add((Join-Path $base $exe)) }
+        }
         foreach ($hive in @('HKLM:', 'HKCU:')) {
-            try { $v = (Get-ItemProperty -LiteralPath "$hive\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\$key" -ErrorAction Stop).'(default)'; if ($v) { $candidates.Add([string]$v) } } catch { }
+            try { $v = (Get-ItemProperty -LiteralPath ("$hive\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\" + (Split-Path $exe -Leaf)) -ErrorAction Stop).'(default)'; if ($v) { $candidates.Add([string]$v) } } catch { }
         }
     }
-    foreach ($c in $candidates) { if ($c -and (Test-Path -LiteralPath $c -PathType Leaf)) { return $c } }
-    return $null
+    $found = New-Object System.Collections.Generic.List[string]
+    foreach ($c in $candidates) {
+        if (-not $c -or -not (Test-Path -LiteralPath $c -PathType Leaf)) { continue }
+        $full = (Resolve-Path -LiteralPath $c).ProviderPath
+        if (-not ($found | Where-Object { $_ -ieq $full })) { $found.Add($full) }
+    }
+    return , $found
+}
+
+function Get-HeadlessPolicyNote {
+    # Organisations can switch off the hidden (headless) mode of Edge/Chrome by policy; report it.
+    param([string]$Browser)
+    $key = if ($Browser -match 'msedge') { 'Microsoft\Edge' } else { 'Google\Chrome' }
+    foreach ($hive in @('HKLM:', 'HKCU:')) {
+        try {
+            $v = (Get-ItemProperty -LiteralPath "$hive\SOFTWARE\Policies\$key" -ErrorAction Stop).HeadlessModeEnabled
+            if ($null -ne $v) {
+                $what = ''
+                if ([int]$v -eq 0) { $what = ' (hidden mode switched off by the organisation)' }
+                return ('policy {0}\SOFTWARE\Policies\{1}\HeadlessModeEnabled = {2}{3}' -f $hive, $key, $v, $what)
+            }
+        }
+        catch { }
+    }
+    return 'no HeadlessModeEnabled policy set'
+}
+
+function Invoke-HeadlessShot {
+    # Runs the browser once; returns $null when the picture was written, else the reason, including the
+    # browser's exit code and its own error output.
+    param([string]$Browser, [string]$Arguments, [string]$Raw)
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $Browser
+    $psi.Arguments = $Arguments
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardError = $true
+    $psi.RedirectStandardOutput = $true
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $errTask = $proc.StandardError.ReadToEndAsync()
+    $outTask = $proc.StandardOutput.ReadToEndAsync()
+    if (-not $proc.WaitForExit(120000)) {
+        try { $proc.Kill() } catch { }   # only the browser this script started
+        return 'browser did not finish in 2 minutes'
+    }
+    if ((Test-Path -LiteralPath $Raw) -and (Get-Item -LiteralPath $Raw).Length -gt 0) { return $null }
+    $text = ''
+    try { if ($errTask.Wait(3000)) { $text += $errTask.Result } } catch { }
+    try { if ($outTask.Wait(1000)) { $text += $outTask.Result } } catch { }
+    $text = (($text -split "`r?`n") | Where-Object { $_.Trim() } | Select-Object -Last 6) -join ' / '
+    if ($text.Length -gt 600) { $text = $text.Substring($text.Length - 600) }
+    if (-not $text) { $text = 'no message from the browser' }
+    return ('no picture written (exit code {0}; browser said: {1})' -f $proc.ExitCode, $text)
 }
 
 function Save-CroppedPng {
@@ -3604,42 +3653,49 @@ function Export-PageShots {
     # Opens the finished dashboard in a hidden browser window (?shot=N shows page N alone at its exact
     # size) and saves one picture per page at twice the screen resolution. The window is made larger
     # than the page and the picture cropped to the page, so nothing at the edges can be cut off.
+    # Page 1 decides which browser/mode works; when none does, the reasons are reported and the rest skipped.
     param([string]$HtmlPath, $Pages, [string]$ShotDir, [ref]$ErrorText)
     $shots = New-Object System.Collections.Generic.List[object]
-    $browser = Find-HeadlessBrowser
-    if (-not $browser) { $ErrorText.Value = 'Microsoft Edge / Google Chrome was not found on this PC'; return , $shots }
-    Write-Log ("PDF/PowerPoint pages: pictures taken with {0} (hidden, local file only)." -f $browser)
+    $browsers = Find-HeadlessBrowser
+    if ($browsers.Count -eq 0) { $ErrorText.Value = 'Microsoft Edge / Google Chrome was not found on this PC'; return , $shots }
     New-Item -ItemType Directory -Path $ShotDir -Force | Out-Null
     $profileDir = Join-Path $ShotDir 'browser-profile'
     $url = (New-Object System.Uri($HtmlPath)).AbsoluteUri
     $scale = 2
     $errs = New-Object System.Collections.Generic.List[string]
+    $working = $null
     foreach ($p in $Pages) {
         $wPx = [int][math]::Ceiling([double]$p.Width * 4 / 3)
         $hPx = [int][math]::Ceiling(([double]$p.EndY - [double]$p.StartY) * 4 / 3)
         $raw = Join-Path $ShotDir ('raw-{0:D2}.png' -f $p.Index)
         $png = Join-Path $ShotDir ('page-{0:D2}.png' -f $p.Index)
+        $combos = New-Object System.Collections.Generic.List[object]
+        if ($working) { $combos.Add($working) }
+        else { foreach ($br in $browsers) { foreach ($mode in @('--headless=new', '--headless')) { $combos.Add([pscustomobject]@{ Browser = $br; Mode = $mode }) } } }
         $ok = $false
-        foreach ($mode in @('--headless=new', '--headless')) {
+        foreach ($cb in $combos) {
             if (Test-Path -LiteralPath $raw) { Remove-Item -LiteralPath $raw -Force }
-            $argList = @($mode, '--disable-gpu', '--no-first-run', '--no-default-browser-check', '--hide-scrollbars', '--disable-extensions',
+            $argList = @($cb.Mode, '--disable-gpu', '--no-first-run', '--no-default-browser-check', '--hide-scrollbars', '--disable-extensions',
                 '--disable-sync', '--disable-background-networking', '--disable-component-update', '--disable-default-apps', '--mute-audio',
+                '--enable-logging=stderr', '--v=0',
                 ('"--user-data-dir={0}"' -f $profileDir), ('--force-device-scale-factor={0}' -f $scale), ('--window-size={0},{1}' -f ($wPx + 200), ($hPx + 200)),
                 '--virtual-time-budget=5000', ('"--screenshot={0}"' -f $raw), ('"{0}?shot={1}"' -f $url, $p.Index))
+            $who = '{0} {1}' -f (Split-Path $cb.Browser -Leaf), $cb.Mode
             try {
-                $proc = Start-Process -FilePath $browser -ArgumentList ($argList -join ' ') -PassThru -WindowStyle Hidden
-                if (-not $proc.WaitForExit(120000)) {
-                    try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch { }   # only the browser this script started
-                    $errs.Add(('page {0} ({1}): browser did not finish in 2 minutes' -f $p.Index, $mode)); continue
-                }
-                if (-not (Test-Path -LiteralPath $raw)) { $errs.Add(('page {0} ({1}): no picture written' -f $p.Index, $mode)); continue }
+                $why = Invoke-HeadlessShot -Browser $cb.Browser -Arguments ($argList -join ' ') -Raw $raw
+                if ($why) { $errs.Add(('page {0} ({1}): {2}' -f $p.Index, $who, $why)); continue }
                 $null = Save-CroppedPng -Source $raw -Target $png -W ($wPx * $scale) -H ($hPx * $scale) -MarkX (($wPx + 25) * $scale) -MarkY (25 * $scale)
+                if (-not $working) { $working = $cb; Write-Log ("PDF/PowerPoint pages: pictures taken with {0} ({1}, hidden, local file only)." -f $cb.Browser, $cb.Mode) }
                 $ok = $true; break
             }
-            catch { $errs.Add(('page {0} ({1}): {2}' -f $p.Index, $mode, $_.Exception.Message)) }
+            catch { $errs.Add(('page {0} ({1}): {2}' -f $p.Index, $who, $_.Exception.Message)) }
         }
         if ($ok) {
             $shots.Add([pscustomobject]@{ Index = $p.Index; Title = [string]$p.Title; Path = $png; WPx = $wPx * $scale; HPx = $hPx * $scale; WPt = $wPx * 0.75; HPt = $hPx * 0.75 })
+        }
+        elseif (-not $working) {
+            foreach ($br in $browsers) { $errs.Add(('{0}: {1}' -f (Split-Path $br -Leaf), (Get-HeadlessPolicyNote $br))) }
+            break   # no browser works on this PC: the other pages would fail the same way
         }
     }
     Remove-Item -LiteralPath $profileDir -Recurse -Force -ErrorAction SilentlyContinue
