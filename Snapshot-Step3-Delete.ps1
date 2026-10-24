@@ -1,9 +1,9 @@
 # Snapshot-Step3-Delete.ps1
-# STEP 3 of 3 - Deletes the snapshots listed in the Step 2 file, 10 at a time.
+# STEP 3 of 3 - Deletes all the snapshots that Step 2 selected, 10 at a time.
 #
 # Run     : .\Snapshot-Step3-Delete.ps1
 #           It shows what will be deleted and asks you to type DELETE before doing anything.
-# Input   : C:\temp\SnapshotCleanup\2-SnapshotsToDelete.csv   (from Step 2, after your review)
+# Input   : C:\temp\SnapshotCleanup\2-SnapshotsToDelete.csv   (created by Step 2 - no editing needed)
 # Output  : C:\temp\SnapshotCleanup\3-DeleteResults_<time>.csv  (result of every snapshot)
 #           C:\temp\SnapshotCleanup\3-DeleteLog_<time>.log      (full screen log)
 #
@@ -22,7 +22,7 @@ param(
     [string]$OutputFolder = 'C:\temp\SnapshotCleanup'
 )
 
-$ScriptBuild = 'Snapshot-Step3-Delete 2026.10.24-r2'
+$ScriptBuild = 'Snapshot-Step3-Delete 2026.10.24-r3'
 Write-Host $ScriptBuild -ForegroundColor Cyan
 $ErrorActionPreference = 'Stop'
 
@@ -77,7 +77,7 @@ function Invoke-SnapshotDelete {
     if ($rows.Count -eq 0) { Write-Host "$inCsv is empty - nothing to delete." -ForegroundColor Yellow; return }
     foreach ($col in 'VCenter', 'VM', 'SnapshotName', 'VMId', 'SnapshotId') {
         if (-not ($rows[0].PSObject.Properties.Name -contains $col)) {
-            Write-Host "The CSV is missing column '$col'. When editing in Excel only delete whole rows, and save as CSV." -ForegroundColor Red; return
+            Write-Host "The CSV is missing column '$col'. Run Step 2 again to recreate it." -ForegroundColor Red; return
         }
     }
     $list = New-Object System.Collections.ArrayList

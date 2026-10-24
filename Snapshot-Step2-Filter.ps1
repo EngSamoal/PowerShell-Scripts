@@ -7,8 +7,7 @@
 #           DESCRIPTION contains the second word; upper/lower case does not matter)
 # Input  : C:\temp\SnapshotCleanup\1-AllSnapshots.csv
 # Output : C:\temp\SnapshotCleanup\2-SnapshotsToDelete.csv
-#          Open it in Excel and CHECK IT. Delete any row you want to keep, then save (as CSV).
-#          Step 3 deletes exactly the rows in this file - nothing else.
+#          Step 3 deletes every snapshot in this file - nothing else. No editing needed.
 # Next   : .\Snapshot-Step3-Delete.ps1
 param(
     [string]$NameKeyword,                                   # word that must be in the snapshot name
@@ -18,7 +17,7 @@ param(
     [string]$OutputFolder = 'C:\temp\SnapshotCleanup'
 )
 
-$ScriptBuild = 'Snapshot-Step2-Filter 2026.10.24-r2'
+$ScriptBuild = 'Snapshot-Step2-Filter 2026.10.24-r3'
 Write-Host $ScriptBuild -ForegroundColor Cyan
 $ErrorActionPreference = 'Stop'
 
@@ -70,5 +69,4 @@ $vmCount = @($selected | ForEach-Object { "$($_.VCenter)|$($_.VMId)" } | Select-
 Write-Host ("Matched: {0} of {1} snapshots, on {2} VM(s), {3} GB" -f $selected.Count, $all.Count, $vmCount, $totalGB) -ForegroundColor Green
 Write-Host "Saved to: $outCsv" -ForegroundColor Green
 Write-Host ''
-Write-Host 'NEXT: open the file above in Excel and remove any row you want to KEEP, save it,' -ForegroundColor Cyan
-Write-Host '      then run  .\Snapshot-Step3-Delete.ps1' -ForegroundColor Cyan
+Write-Host 'NEXT: run  .\Snapshot-Step3-Delete.ps1   to delete the snapshots listed above' -ForegroundColor Cyan
