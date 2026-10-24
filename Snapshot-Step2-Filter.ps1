@@ -16,7 +16,7 @@ param(
     [string]$OutputFolder = 'C:\temp\SnapshotCleanup'
 )
 
-$ScriptBuild = 'Snapshot-Step2-Filter 2026.10.24-r7'
+$ScriptBuild = 'Snapshot-Step2-Filter 2026.10.24-r8'
 Write-Host $ScriptBuild -ForegroundColor Cyan
 $ErrorActionPreference = 'Stop'
 
@@ -78,7 +78,8 @@ $selected | Select-Object VM,
     @{N='Description';E={($_.Description -replace '\s*[\r\n]+\s*', ' / ').Trim()}},
     Created,
     @{N='SizeGB';E={[math]::Round($_.SizeGB,2)}},
-    @{N='Parent';E={$_.ParentSnapshot.Name}} | Format-Table -AutoSize | Out-String -Width 4096 | Write-Host
+    @{N='Parent';E={$_.ParentSnapshot.Name}} | Out-GridView -Title "Step 2 - $($selected.Count) snapshot(s) that Step 3 will delete"
+Write-Host 'The matching snapshots are open in the grid window.' -ForegroundColor Green
 $totalGB = [math]::Round(($selected | Measure-Object SizeGB -Sum).Sum + 0, 2)
 $vmCount = @($selected | ForEach-Object { "$($_.VCenter)|$($_.VM.Id)" } | Select-Object -Unique).Count
 Write-Host ("Matched: {0} of {1} snapshots, on {2} VM(s), {3} GB" -f $selected.Count, $all.Count, $vmCount, $totalGB) -ForegroundColor Green
