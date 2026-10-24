@@ -367,7 +367,24 @@ try {
         @('G40', 'PowerShell 7 pwsh.exe', 'C:\Program Files\PowerShell\7\pwsh.exe', '7.5.10'),
         @('G45', 'Mozilla Firefox firefox.exe', 'C:\Program Files\Mozilla Firefox\firefox.exe', '157.0'),
         @('G44', 'Splunk Universal Forwarder splunkd.exe', 'C:\Program Files\SplunkUniversalForwarder\bin\splunkd.exe', ''),
-        @('G43', 'Binalyze AIR agent AIR.exe', 'C:\Program Files (x86)\Binalyze\AIR\agent\AIR.exe', ''))
+        @('G43', 'Binalyze AIR agent AIR.exe', 'C:\Program Files (x86)\Binalyze\AIR\agent\AIR.exe', ''),
+        @('G51', 'VMware Tools vmtoolsd.exe', 'C:\Program Files\VMware\VMware Tools\vmtoolsd.exe', '12.5.4'),
+        @('G49', 'Azure Data Studio azuredatastudio.exe', 'C:\Program Files\Azure Data Studio\azuredatastudio.exe', ''),
+        @('G47', 'OLE DB Driver msoledbsql.dll', (Join-Path $env:SystemRoot 'System32\msoledbsql.dll'), ''),
+        @('G47', 'ODBC Driver 17 msodbcsql17.dll', (Join-Path $env:SystemRoot 'System32\msodbcsql17.dll'), ''))
+    foreach ($fw in 'Microsoft.NETCore.App', 'Microsoft.AspNetCore.App') {
+        $fp = Join-Path $env:ProgramFiles "dotnet\shared\$fw"
+        if (Test-Path -LiteralPath $fp) { $vers = @(Get-ChildItem -LiteralPath $fp -Directory | ForEach-Object Name); Add-Row '' G50 ".NET runtime $fw" ($vers -join ', ') '8.0.x >= 8.0.31 (no older 8.0 folders)' ($vers -join ', ') 'Info' 'Patch by OS team / application owner - not scripted' }
+    }
+    $sqlRoot = 'HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server'
+    if (Test-Path -LiteralPath "$sqlRoot\Instance Names\SQL") {
+        $ik = Get-Item -LiteralPath "$sqlRoot\Instance Names\SQL"
+        foreach ($iname in $ik.GetValueNames()) {
+            $iid = $ik.GetValue($iname); $pl = Get-Reg "SOFTWARE\Microsoft\Microsoft SQL Server\$iid\Setup" 'PatchLevel'; $ed = Get-Reg "SOFTWARE\Microsoft\Microsoft SQL Server\$iid\Setup" 'Edition'
+            $st = 'Manual Review'; try { if ($iid -like 'MSSQL16.*' -and [version]$pl -ge [version]'16.0.1200.5') { $st = 'Already Compliant' } elseif ($iid -notlike 'MSSQL16.*') { $st = 'Info' } } catch { $st = 'Manual Review' }
+            Add-Row '' G47 "SQL Server instance $iname ($iid, $ed)" $pl 'SQL Server 2022: >= 16.0.1200.5' $pl $st 'Patch by DBA / application owner - not scripted'
+        }
+    }
     foreach ($vc in $verChecks) {
         if (Test-Path -LiteralPath $vc[2]) {
             $fv = (Get-Item -LiteralPath $vc[2]).VersionInfo.FileVersion
