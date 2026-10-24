@@ -23,6 +23,11 @@
     Targets are read from C:\temp\vmlist.txt (one vCenter VM name per line) unless -VMName or
     -VMListPath is given.
 
+    The guest credential is read from C:\wincred.xml unless -GuestCredential or -CredentialPath is
+    given. Create the file once, as the same Windows user on the same machine that runs the script
+    (Export-Clixml encrypts it with that user's DPAPI key, so it cannot be read elsewhere):
+        Get-Credential | Export-Clixml -Path C:\wincred.xml
+
 .EXAMPLE
     # 1) Assessment of every VM in C:\temp\vmlist.txt (no change)
     .\Invoke-QualysRemediation.ps1
@@ -35,7 +40,8 @@
 param(
     [string[]]$VMName,
     [string]$VMListPath = 'C:\temp\vmlist.txt',
-    [Parameter(Mandatory)][pscredential]$GuestCredential,
+    [pscredential]$GuestCredential,
+    [string]$CredentialPath = 'C:\wincred.xml',
     [switch]$Apply,
     [switch]$IncludeMediumRisk,
     [switch]$IncludeUserProfiles,
@@ -50,6 +56,16 @@ if (-not $VMName) {
     if (-not (Test-Path -LiteralPath $VMListPath)) { throw "No -VMName given and VM list file not found: $VMListPath" }
     $VMName = @(Get-Content -LiteralPath $VMListPath | ForEach-Object { $_.Trim() } | Where-Object { $_ -and -not $_.StartsWith('#') } | Select-Object -Unique)
     if ($VMName.Count -eq 0) { throw "VM list file is empty: $VMListPath" }
+}
+
+# Guest credential: -GuestCredential wins; otherwise the Export-Clixml file at -CredentialPath
+if (-not $GuestCredential) {
+    if (-not (Test-Path -LiteralPath $CredentialPath)) {
+        throw "No -GuestCredential given and credential file not found: $CredentialPath. Create it once with: Get-Credential | Export-Clixml -Path $CredentialPath"
+    }
+    try { $GuestCredential = Import-Clixml -LiteralPath $CredentialPath }
+    catch { throw "Could not read $CredentialPath ($($_.Exception.Message)). The file only opens for the Windows user and machine that created it - recreate it with: Get-Credential | Export-Clixml -Path $CredentialPath" }
+    if ($GuestCredential -isnot [pscredential]) { throw "$CredentialPath does not contain a credential. Recreate it with: Get-Credential | Export-Clixml -Path $CredentialPath" }
 }
 
 $GuestPayload = @'
@@ -633,7 +649,7 @@ function Write-Log([string]$Message, [string]$Level = 'INFO') {
 
 $guestDir = 'C:\Windows\Temp\QRem'
 $all = New-Object System.Collections.Generic.List[object]
-Write-Log "Mode=$mode Tiers=$tiers UserProfiles=$userFlg Targets=$($VMName -join ',') Operator=$env:USERNAME"
+Write-Log "Mode=$mode Tiers=$tiers UserProfiles=$userFlg Targets=$($VMName -join ',') Operator=$env:USERNAME GuestUser=$($GuestCredential.UserName)"
 
 foreach ($name in $VMName) {
     try {
