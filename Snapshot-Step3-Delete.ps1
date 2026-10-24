@@ -22,7 +22,7 @@ param(
     [string]$OutputFolder = 'C:\temp\SnapshotCleanup'
 )
 
-$ScriptBuild = 'Snapshot-Step3-Delete 2026.10.24-r3'
+$ScriptBuild = 'Snapshot-Step3-Delete 2026.10.24-r4'
 Write-Host $ScriptBuild -ForegroundColor Cyan
 $ErrorActionPreference = 'Stop'
 
@@ -107,7 +107,7 @@ function Invoke-SnapshotDelete {
 
     # ---- Confirm ----
     $batches = New-DeleteBatches $list $BatchSize
-    $list | Format-Table VCenter, VM, SnapshotName, Description, Created, SizeGB -AutoSize | Out-String -Width 250 | Write-Host
+    $list | Format-Table VCenter, VM, SnapshotName, Description, Created, SizeGB -AutoSize -Wrap | Out-String -Width 250 | Write-Host
     Write-Host ("About to DELETE {0} snapshot(s) in {1} batch(es) of up to {2}." -f $list.Count, $batches.Count, $BatchSize) -ForegroundColor Red
     $answer = Read-Host 'Type DELETE to continue (anything else cancels)'
     if ($answer -cne 'DELETE') { Write-Host 'Cancelled - nothing was deleted.' -ForegroundColor Yellow; return }

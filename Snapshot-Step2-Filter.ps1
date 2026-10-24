@@ -17,7 +17,7 @@ param(
     [string]$OutputFolder = 'C:\temp\SnapshotCleanup'
 )
 
-$ScriptBuild = 'Snapshot-Step2-Filter 2026.10.24-r3'
+$ScriptBuild = 'Snapshot-Step2-Filter 2026.10.24-r4'
 Write-Host $ScriptBuild -ForegroundColor Cyan
 $ErrorActionPreference = 'Stop'
 
@@ -63,7 +63,7 @@ $selected | Export-Csv -Path $outCsv -NoTypeInformation -Encoding UTF8
 if ($selected.Count -eq 0) {
     Write-Host "No snapshot matched (out of $($all.Count)). Nothing to delete." -ForegroundColor Yellow; return
 }
-$selected | Format-Table VCenter, VM, SnapshotName, Description, Created, SizeGB -AutoSize | Out-String -Width 250 | Write-Host
+$selected | Format-Table VCenter, VM, SnapshotName, Description, Created, SizeGB -AutoSize -Wrap | Out-String -Width 250 | Write-Host
 $totalGB = [math]::Round(($selected | Measure-Object SizeGB -Sum).Sum + 0, 2)
 $vmCount = @($selected | ForEach-Object { "$($_.VCenter)|$($_.VMId)" } | Select-Object -Unique).Count
 Write-Host ("Matched: {0} of {1} snapshots, on {2} VM(s), {3} GB" -f $selected.Count, $all.Count, $vmCount, $totalGB) -ForegroundColor Green

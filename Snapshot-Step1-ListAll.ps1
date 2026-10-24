@@ -10,7 +10,7 @@ param(
     [string]$OutputFolder = 'C:\temp\SnapshotCleanup'
 )
 
-$ScriptBuild = 'Snapshot-Step1-ListAll 2026.10.24-r3'
+$ScriptBuild = 'Snapshot-Step1-ListAll 2026.10.24-r4'
 Write-Host $ScriptBuild -ForegroundColor Cyan
 $ErrorActionPreference = 'Stop'
 
@@ -61,7 +61,7 @@ foreach ($srv in $servers) {
 
 $all = @($all | Sort-Object Created)
 $all | Export-Csv -Path $outCsv -NoTypeInformation -Encoding UTF8
-if ($all.Count -gt 0) { $all | Format-Table VCenter, VM, SnapshotName, Description, Created, SizeGB -AutoSize | Out-String -Width 250 | Write-Host }
+if ($all.Count -gt 0) { $all | Format-Table VCenter, VM, SnapshotName, Description, Created, SizeGB -AutoSize -Wrap | Out-String -Width 250 | Write-Host }
 $totalGB = [math]::Round(($all | Measure-Object SizeGB -Sum).Sum + 0, 2)
 Write-Host ''
 Write-Host ("Snapshots found: {0}  ({1} GB)" -f $all.Count, $totalGB) -ForegroundColor Green
