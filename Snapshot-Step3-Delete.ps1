@@ -22,9 +22,29 @@ param(
     [string]$OutputFolder = 'C:\temp\SnapshotCleanup'
 )
 
-$ScriptBuild = 'Snapshot-Step3-Delete 2026.10.24-r4'
+$ScriptBuild = 'Snapshot-Step3-Delete 2026.10.24-r5'
 Write-Host $ScriptBuild -ForegroundColor Cyan
 $ErrorActionPreference = 'Stop'
+
+function Write-SnapshotTable($Rows) {
+    # One line per snapshot, full text, columns aligned. Line breaks inside a
+    # description are shown as ' / ' so a row never splits over several lines.
+    $cols = 'VCenter', 'VM', 'Created', 'SizeGB', 'SnapshotName', 'Description'
+    $lines = @(foreach ($r in @($Rows)) {
+        , @(foreach ($c in $cols) { (([string]$r.$c) -replace '\s*[\r\n]+\s*', ' / ' -replace '\t', ' ').Trim() })
+    })
+    $widths = @(for ($i = 0; $i -lt $cols.Count; $i++) {
+        $w = $cols[$i].Length
+        foreach ($l in $lines) { if ($l[$i].Length -gt $w) { $w = $l[$i].Length } }
+        $w
+    })
+    $fmt = { param($vals) (@(for ($i = 0; $i -lt $vals.Count; $i++) { if ($i -eq $vals.Count - 1) { $vals[$i] } else { $vals[$i].PadRight($widths[$i]) } }) -join '  ') }
+    Write-Host ''
+    Write-Host (& $fmt $cols)
+    Write-Host (& $fmt @($widths | ForEach-Object { '-' * $_ }))
+    foreach ($l in $lines) { Write-Host (& $fmt $l) }
+    Write-Host ''
+}
 
 function Get-RowKey($Row) { '{0}|{1}|{2}' -f $Row.VCenter, $Row.VMId, $Row.SnapshotId }
 
@@ -107,7 +127,7 @@ function Invoke-SnapshotDelete {
 
     # ---- Confirm ----
     $batches = New-DeleteBatches $list $BatchSize
-    $list | Format-Table VCenter, VM, SnapshotName, Description, Created, SizeGB -AutoSize -Wrap | Out-String -Width 250 | Write-Host
+    Write-SnapshotTable $list
     Write-Host ("About to DELETE {0} snapshot(s) in {1} batch(es) of up to {2}." -f $list.Count, $batches.Count, $BatchSize) -ForegroundColor Red
     $answer = Read-Host 'Type DELETE to continue (anything else cancels)'
     if ($answer -cne 'DELETE') { Write-Host 'Cancelled - nothing was deleted.' -ForegroundColor Yellow; return }

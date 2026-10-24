@@ -10,9 +10,29 @@ param(
     [string]$OutputFolder = 'C:\temp\SnapshotCleanup'
 )
 
-$ScriptBuild = 'Snapshot-Step1-ListAll 2026.10.24-r4'
+$ScriptBuild = 'Snapshot-Step1-ListAll 2026.10.24-r5'
 Write-Host $ScriptBuild -ForegroundColor Cyan
 $ErrorActionPreference = 'Stop'
+
+function Write-SnapshotTable($Rows) {
+    # One line per snapshot, full text, columns aligned. Line breaks inside a
+    # description are shown as ' / ' so a row never splits over several lines.
+    $cols = 'VCenter', 'VM', 'Created', 'SizeGB', 'SnapshotName', 'Description'
+    $lines = @(foreach ($r in @($Rows)) {
+        , @(foreach ($c in $cols) { (([string]$r.$c) -replace '\s*[\r\n]+\s*', ' / ' -replace '\t', ' ').Trim() })
+    })
+    $widths = @(for ($i = 0; $i -lt $cols.Count; $i++) {
+        $w = $cols[$i].Length
+        foreach ($l in $lines) { if ($l[$i].Length -gt $w) { $w = $l[$i].Length } }
+        $w
+    })
+    $fmt = { param($vals) (@(for ($i = 0; $i -lt $vals.Count; $i++) { if ($i -eq $vals.Count - 1) { $vals[$i] } else { $vals[$i].PadRight($widths[$i]) } }) -join '  ') }
+    Write-Host ''
+    Write-Host (& $fmt $cols)
+    Write-Host (& $fmt @($widths | ForEach-Object { '-' * $_ }))
+    foreach ($l in $lines) { Write-Host (& $fmt $l) }
+    Write-Host ''
+}
 
 if (-not (Get-Command Get-Snapshot -ErrorAction SilentlyContinue)) {
     try { Import-Module VMware.VimAutomation.Core -ErrorAction Stop -WarningAction SilentlyContinue }
@@ -61,7 +81,7 @@ foreach ($srv in $servers) {
 
 $all = @($all | Sort-Object Created)
 $all | Export-Csv -Path $outCsv -NoTypeInformation -Encoding UTF8
-if ($all.Count -gt 0) { $all | Format-Table VCenter, VM, SnapshotName, Description, Created, SizeGB -AutoSize -Wrap | Out-String -Width 250 | Write-Host }
+if ($all.Count -gt 0) { Write-SnapshotTable $all }
 $totalGB = [math]::Round(($all | Measure-Object SizeGB -Sum).Sum + 0, 2)
 Write-Host ''
 Write-Host ("Snapshots found: {0}  ({1} GB)" -f $all.Count, $totalGB) -ForegroundColor Green
