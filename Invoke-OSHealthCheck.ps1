@@ -20,9 +20,14 @@
     Nothing is changed on the target servers.
 
     Output (in -OutputPath):
-        OSHealthCheck_<timestamp>.xlsx   Summary / Disks / StoppedServices / Events / RunInfo sheets
-        OSHealthCheck_<timestamp>.csv    Summary sheet as CSV (backup copy)
-        OSHealthCheck_<timestamp>.log    Run log
+        OSHealthCheck_<SERVER>_<timestamp>.xlsx   Summary / Disks / StoppedServices / Events sheets
+        OSHealthCheck_<SERVER>_<timestamp>.log    Run log (kept out of the report)
+        OSHealthCheck_<SERVER>_<timestamp>.csv    Only written if the .xlsx could not be
+
+    Typical use: run it locally on each VM, copy every VM's .xlsx into one folder, then run
+    it once with -ConsolidatePath <folder> to merge them into one report
+    (OSHealthCheck_Consolidated_<timestamp>.xlsx). If the same server appears in more than
+    one report, only its newest report is used.
 
     The .xlsx is written natively (Open XML) - no Excel installation and no
     ImportExcel module are needed on the machine running the script.
@@ -39,11 +44,20 @@
     Credential for remote servers (not used for the local machine).
 
 .PARAMETER OutputPath
-    Folder for the .xlsx/.csv/.log (created if missing). Default C:\Temp\OSHealthCheck.
+    Folder for the .xlsx/.log (created if missing). Default C:\Temp\OSHealthCheck.
+    With -ConsolidatePath, defaults to the consolidate folder itself.
+
+.PARAMETER ConsolidatePath
+    Folder (searched recursively) holding the per-VM .xlsx reports. Runs no health checks;
+    only merges the reports into one workbook.
 
 .EXAMPLE
     .\Invoke-OSHealthCheck.ps1
     Checks the local server.
+
+.EXAMPLE
+    .\Invoke-OSHealthCheck.ps1 -ConsolidatePath C:\Temp\AllReports
+    Merges every per-VM report in C:\Temp\AllReports into one consolidated report.
 
 .EXAMPLE
     .\Invoke-OSHealthCheck.ps1 -ComputerListPath C:\Temp\servers.txt -Credential (Get-Credential)
@@ -62,6 +76,9 @@ param(
     [System.Management.Automation.PSCredential]$Credential,
 
     [string]$OutputPath = 'C:\Temp\OSHealthCheck',
+
+    # Merge mode: folder of per-VM reports to consolidate (no checks are run)
+    [string]$ConsolidatePath,
 
     # Look-back window for System log Critical/Error events
     [ValidateRange(1, 90)][int]$EventDays = 7,
@@ -109,7 +126,7 @@ process {
 
 end {
 
-$ScriptBuild = '2026-10-24.1'
+$ScriptBuild = '2026-10-25.1'
 Write-Host "Invoke-OSHealthCheck.ps1 - build $ScriptBuild" -ForegroundColor Magenta
 
 $ErrorActionPreference = 'Stop'
@@ -592,9 +609,208 @@ function Export-SimpleXlsx {
     Move-Item -LiteralPath $tmp -Destination $Path -Force
 }
 
+function ConvertFrom-XlsxColumnName {
+    param([string]$Letters)
+    $n = 0
+    foreach ($ch in $Letters.ToUpperInvariant().ToCharArray()) { $n = $n * 26 + ([int]$ch - 64) }
+    $n
+}
+
+function Import-SimpleXlsx {
+    # Reads every sheet of an .xlsx into objects keyed by the header row. Handles both files
+    # written by this script and files re-saved by Excel (shared strings, date styles).
+    param([Parameter(Mandatory)][string]$Path)
+
+    Add-Type -AssemblyName System.IO.Compression
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+    $nsRel = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+    # FileShare.ReadWrite so a report that is open in Excel can still be read.
+    $fs = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+    try {
+        $zip = New-Object System.IO.Compression.ZipArchive($fs, [System.IO.Compression.ZipArchiveMode]::Read)
+        try {
+            $readXml = {
+                param([string]$Name)
+                $e = $zip.GetEntry($Name)
+                if (-not $e) { return $null }
+                $sr = New-Object System.IO.StreamReader($e.Open())
+                try { [xml]$sr.ReadToEnd() } finally { $sr.Dispose() }
+            }
+
+            $shared = New-Object System.Collections.Generic.List[string]
+            $ss = & $readXml 'xl/sharedStrings.xml'
+            if ($ss) {
+                foreach ($si in $ss.GetElementsByTagName('si')) {
+                    $shared.Add((@($si.GetElementsByTagName('t') | Where-Object { $_.ParentNode.LocalName -ne 'rPh' } | ForEach-Object { $_.InnerText }) -join ''))
+                }
+            }
+
+            # Which cell styles are dates (built-in date formats or custom ones with d/m/y/h/s)
+            $dateXf = @{}
+            $st = & $readXml 'xl/styles.xml'
+            if ($st) {
+                $custom = @{}
+                foreach ($nf in $st.GetElementsByTagName('numFmt')) { $custom[[int]$nf.GetAttribute('numFmtId')] = $nf.GetAttribute('formatCode') }
+                $cellXfs = $st.GetElementsByTagName('cellXfs')
+                if ($cellXfs.Count -gt 0) {
+                    $i = 0
+                    foreach ($xf in $cellXfs[0].ChildNodes) {
+                        if ($xf.LocalName -ne 'xf') { continue }
+                        $id = 0; [void][int]::TryParse($xf.GetAttribute('numFmtId'), [ref]$id)
+                        $dateXf[$i] = (($id -ge 14 -and $id -le 22) -or ($id -ge 45 -and $id -le 47) -or
+                                       ($custom.ContainsKey($id) -and (($custom[$id] -replace '"[^"]*"|\[[^\]]*\]|\\.', '') -match '[dmyhs]')))
+                        $i++
+                    }
+                }
+            }
+
+            $wb   = & $readXml 'xl/workbook.xml'
+            $rels = & $readXml 'xl/_rels/workbook.xml.rels'
+            $relMap = @{}
+            foreach ($rel in $rels.GetElementsByTagName('Relationship')) { $relMap[$rel.GetAttribute('Id')] = $rel.GetAttribute('Target') }
+
+            $book = [ordered]@{}
+            foreach ($sh in $wb.GetElementsByTagName('sheet')) {
+                $target = [string]$relMap[$sh.GetAttribute('id', $nsRel)]
+                if (-not $target) { continue }
+                $entry = if ($target.StartsWith('/')) { $target.TrimStart('/') } else { 'xl/' + $target }
+                $doc = & $readXml $entry
+                if (-not $doc) { continue }
+
+                $grid = New-Object System.Collections.Generic.List[object]
+                foreach ($row in $doc.GetElementsByTagName('row')) {
+                    $cells = @{}; $col = 0
+                    foreach ($c in $row.ChildNodes) {
+                        if ($c.LocalName -ne 'c') { continue }
+                        $ref = $c.GetAttribute('r')
+                        $col = if ($ref -match '^([A-Za-z]+)') { ConvertFrom-XlsxColumnName $Matches[1] } else { $col + 1 }
+                        $t = $c.GetAttribute('t')
+                        $vNode = @($c.GetElementsByTagName('v'))
+                        $v = if ($vNode.Count) { $vNode[0].InnerText } else { $null }
+                        $val = switch ($t) {
+                            'inlineStr' { $is = @($c.GetElementsByTagName('is')); if ($is.Count) { $is[0].InnerText } else { $null } }
+                            's'         { if ($null -ne $v) { $shared[[int]$v] } else { $null } }
+                            'b'         { if ($v -eq '1') { 'Yes' } else { 'No' } }
+                            'str'       { $v }
+                            'e'         { $v }
+                            default {
+                                if ($null -eq $v -or $v -eq '') { $null }
+                                else {
+                                    $d = [double]::Parse($v, [System.Globalization.NumberStyles]::Float, $inv)
+                                    $sIdx = $c.GetAttribute('s')
+                                    if ($sIdx -and $dateXf[[int]$sIdx]) { [datetime]::FromOADate($d) }
+                                    elseif ($d -eq [math]::Truncate($d) -and [math]::Abs($d) -lt 1e15) { [long]$d }
+                                    else { $d }
+                                }
+                            }
+                        }
+                        $cells[$col] = $val
+                    }
+                    $grid.Add($cells)
+                }
+                if ($grid.Count -eq 0) { $book[$sh.GetAttribute('name')] = @(); continue }
+
+                $header = $grid[0]
+                $colIdx = @($header.Keys | Where-Object { $header[$_] } | Sort-Object)
+                $rows = New-Object System.Collections.Generic.List[object]
+                for ($r = 1; $r -lt $grid.Count; $r++) {
+                    $o = [ordered]@{}; $any = $false
+                    foreach ($ci in $colIdx) {
+                        $o[[string]$header[$ci]] = $grid[$r][$ci]
+                        if ($null -ne $grid[$r][$ci] -and [string]$grid[$r][$ci] -ne '') { $any = $true }
+                    }
+                    if ($any) { $rows.Add([pscustomobject]$o) }
+                }
+                $book[$sh.GetAttribute('name')] = $rows.ToArray()
+            }
+            $book
+        } finally { $zip.Dispose() }
+    } finally { $fs.Dispose() }
+}
+
+function Join-RowsUnion {
+    # Gives every row the same columns (union, first-seen order) so they can share one sheet.
+    param([object[]]$Rows)
+    $cols = New-Object System.Collections.Generic.List[string]
+    foreach ($r in $Rows) { foreach ($p in $r.PSObject.Properties.Name) { if (-not $cols.Contains($p)) { $cols.Add($p) } } }
+    foreach ($r in $Rows) {
+        $o = [ordered]@{}
+        foreach ($c in $cols) { $o[$c] = if ($r.PSObject.Properties[$c]) { $r.$c } else { $null } }
+        [pscustomobject]$o
+    }
+}
+
+function Invoke-Consolidation {
+    param([string]$SourcePath, [string]$DestPath)
+
+    if (-not (Test-Path -LiteralPath $SourcePath -PathType Container)) { throw "Consolidate folder not found: $SourcePath" }
+    if (-not (Test-Path -LiteralPath $DestPath)) { New-Item -ItemType Directory -Path $DestPath -Force | Out-Null }
+    $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $outXlsx = Join-Path $DestPath "OSHealthCheck_Consolidated_$stamp.xlsx"
+    $script:LogFile = Join-Path $DestPath "OSHealthCheck_Consolidated_$stamp.log"
+
+    $files = @(Get-ChildItem -LiteralPath $SourcePath -Filter '*.xlsx' -File -Recurse |
+               Where-Object { $_.Name -notlike 'OSHealthCheck_Consolidated_*' -and $_.Name -notlike '~$*' } |
+               Sort-Object FullName)
+    Write-Log "Consolidating from $SourcePath - $($files.Count) .xlsx file(s) found"
+
+    $books = @{}
+    $best  = @{}   # SERVER -> @{ When; File; Row }
+    $skipped = 0
+    foreach ($f in $files) {
+        try { $book = Import-SimpleXlsx -Path $f.FullName }
+        catch { Write-Log "Skipped $($f.Name): cannot read ($($_.Exception.Message))" 'WARN'; $skipped++; continue }
+        $sum = @($book['Summary'] | Where-Object { $_ })
+        if ($sum.Count -eq 0 -or -not $sum[0].PSObject.Properties['Server'] -or -not $sum[0].PSObject.Properties['Status']) {
+            Write-Log "Skipped $($f.Name): not an OS health check report" 'WARN'; $skipped++; continue
+        }
+        $books[$f.FullName] = $book
+        foreach ($s in $sum) {
+            if (-not $s.Server) { continue }
+            $key  = ([string]$s.Server).ToUpperInvariant()
+            $when = $s.CollectedAt -as [datetime]
+            if (-not $when) { $when = $f.LastWriteTime }
+            if (-not $best.ContainsKey($key)) {
+                $best[$key] = @{ When = $when; File = $f.FullName; Row = $s }
+            } elseif ($when -gt $best[$key].When) {
+                Write-Log "$($s.Server): newer report $($f.Name) replaces $(Split-Path $best[$key].File -Leaf)" 'WARN'
+                $best[$key] = @{ When = $when; File = $f.FullName; Row = $s }
+            } else {
+                Write-Log "$($s.Server): older duplicate in $($f.Name) ignored" 'WARN'
+            }
+        }
+    }
+    if ($best.Count -eq 0) { Write-Log 'No valid reports found - nothing written' 'ERROR'; return }
+
+    $rank = @{ 'Critical' = 0; 'Warning' = 1; 'OK' = 2 }
+    $servers = @($best.Keys | Sort-Object @{ Expression = { $r = $rank[[string]$best[$_].Row.Status]; if ($null -eq $r) { 3 } else { $r } } }, @{ Expression = { $_ } })
+
+    $sheets = @(@{ Name = 'Summary'; Rows = @(Join-RowsUnion -Rows @($servers | ForEach-Object { $best[$_].Row })) })
+    foreach ($name in 'Disks', 'StoppedServices', 'Events') {
+        $rows = foreach ($key in $servers) {
+            $book = $books[$best[$key].File]
+            @($book[$name]) | Where-Object { $_ -and $_.PSObject.Properties['Server'] -and ([string]$_.Server).ToUpperInvariant() -eq $key }
+        }
+        $sheets += @{ Name = $name; Rows = @(Join-RowsUnion -Rows @($rows)) }
+    }
+
+    Export-SimpleXlsx -Path $outXlsx -Sheets $sheets
+    $st = @($servers | ForEach-Object { [string]$best[$_].Row.Status })
+    Write-Log ("Consolidated {0} server(s) from {1} report(s), {2} file(s) skipped. OK={3} Warning={4} Critical={5}" -f `
+        $servers.Count, $books.Count, $skipped, @($st | Where-Object { $_ -eq 'OK' }).Count,
+        @($st | Where-Object { $_ -eq 'Warning' }).Count, @($st | Where-Object { $_ -eq 'Critical' }).Count)
+    Write-Log "Excel written: $outXlsx"
+}
+
 # ---------------------------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------------------------
+if ($ConsolidatePath) {
+    $dest = if ($PSBoundParameters.ContainsKey('OutputPath')) { $OutputPath } else { $ConsolidatePath }
+    Invoke-Consolidation -SourcePath $ConsolidatePath -DestPath $dest
+    return
+}
+
 $targets = New-Object System.Collections.Generic.List[string]
 foreach ($n in $pipedNames) { $targets.Add($n) }
 if ($ComputerListPath) {
@@ -608,9 +824,11 @@ if ($targets.Count -eq 0) { $targets = @($env:COMPUTERNAME) }
 
 if (-not (Test-Path -LiteralPath $OutputPath)) { New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null }
 $stamp    = Get-Date -Format 'yyyyMMdd_HHmmss'
-$xlsxPath = Join-Path $OutputPath "OSHealthCheck_$stamp.xlsx"
-$csvPath  = Join-Path $OutputPath "OSHealthCheck_$stamp.csv"
-$script:LogFile = Join-Path $OutputPath "OSHealthCheck_$stamp.log"
+# One server -> its name goes in the file name, so per-VM reports never collide when collected.
+$baseName = if ($targets.Count -eq 1) { "OSHealthCheck_$($targets[0] -replace '[^\w\.-]', '_')_$stamp" } else { "OSHealthCheck_$stamp" }
+$xlsxPath = Join-Path $OutputPath "$baseName.xlsx"
+$csvPath  = Join-Path $OutputPath "$baseName.csv"
+$script:LogFile = Join-Path $OutputPath "$baseName.log"
 
 Write-Log "Build $ScriptBuild - run by $env:USERDOMAIN\$env:USERNAME on $env:COMPUTERNAME"
 Write-Log "Targets ($($targets.Count)): $($targets -join ', ')"
@@ -669,40 +887,21 @@ foreach ($t in $targets) {
     $events   += $rows.Events
 }
 
-$runInfo = @(
-    [pscustomobject]@{ Setting = 'Script build';        Value = $ScriptBuild }
-    [pscustomobject]@{ Setting = 'Run at';              Value = (Get-Date) }
-    [pscustomobject]@{ Setting = 'Run by';              Value = "$env:USERDOMAIN\$env:USERNAME" }
-    [pscustomobject]@{ Setting = 'Run from';            Value = $env:COMPUTERNAME }
-    [pscustomobject]@{ Setting = 'Servers checked';     Value = $targets.Count }
-    [pscustomobject]@{ Setting = 'Servers OK';          Value = @($summary | Where-Object Status -eq 'OK').Count }
-    [pscustomobject]@{ Setting = 'Servers Warning';     Value = @($summary | Where-Object Status -eq 'Warning').Count }
-    [pscustomobject]@{ Setting = 'Servers Critical';    Value = @($summary | Where-Object Status -eq 'Critical').Count }
-    [pscustomobject]@{ Setting = 'Disk warn / crit %';  Value = "$DiskWarnPct / $DiskCritPct" }
-    [pscustomobject]@{ Setting = 'Free RAM warn %';     Value = $RamWarnPct }
-    [pscustomobject]@{ Setting = 'Patch age warn days'; Value = $PatchWarnDays }
-    [pscustomobject]@{ Setting = 'Uptime warn days';    Value = $UptimeWarnDays }
-    [pscustomobject]@{ Setting = 'Event window days';   Value = $EventDays }
-    [pscustomobject]@{ Setting = 'Error events warn';   Value = $ErrorEventWarn }
-    [pscustomobject]@{ Setting = 'Service exclusions';  Value = ($ServiceExclusions -join ', ') }
-)
-
-# CSV first - it is the fallback if the .xlsx cannot be written.
-try {
-    $summary | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding UTF8
-    Write-Log "CSV written: $csvPath"
-} catch { Write-Log "CSV export failed: $($_.Exception.Message)" 'ERROR' }
-
 try {
     Export-SimpleXlsx -Path $xlsxPath -Sheets @(
         @{ Name = 'Summary';         Rows = $summary }
         @{ Name = 'Disks';           Rows = $disks }
         @{ Name = 'StoppedServices'; Rows = $services }
         @{ Name = 'Events';          Rows = $events }
-        @{ Name = 'RunInfo';         Rows = $runInfo }
     )
     Write-Log "Excel written: $xlsxPath"
-} catch { Write-Log "Excel export failed: $($_.Exception.Message) - use the CSV instead" 'ERROR' }
+} catch {
+    Write-Log "Excel export failed: $($_.Exception.Message) - writing CSV instead" 'ERROR'
+    try {
+        $summary | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding UTF8
+        Write-Log "CSV written: $csvPath"
+    } catch { Write-Log "CSV export failed: $($_.Exception.Message)" 'ERROR' }
+}
 
 Write-Host ''
 $summary | Format-Table Server, Status, Issues -AutoSize -Wrap | Out-String -Width 220 | Write-Host
