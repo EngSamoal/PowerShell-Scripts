@@ -9,10 +9,21 @@
         RAM total/free, every fixed disk's free space, last installed KB + patch age,
         pending reboot (CBS, Windows Update, pending file renames, pending computer
         rename, SCCM client if present), Windows activation status, Automatic
-        services that are not running, and Critical/Error events from the System log.
+        services that are not running, Critical/Error events from the System log,
+        domain / workgroup membership (+ domain trust test), and the Qualys, Binalyze AIR
+        and Splunk Universal Forwarder agents: installed, version, service running,
+        and connectivity.
+
+    Agent connectivity is judged only from evidence visible on the VM: live TCP
+    connections held by the agent's processes, a TCP test to the agent's configured
+    servers (Splunk outputs.conf / deploymentclient.conf, or -QualysTarget /
+    -BinalyzeTarget / -SplunkTarget), and for Qualys how recently its log was written.
+    When the VM alone cannot prove it, the report says "Unknown" and the Required
+    Actions column says to confirm in the agent's console - it is never guessed.
 
     Each server gets an overall Status (OK / Warning / Critical) and a plain-text
-    Issues column explaining exactly why. A check that cannot be run (access denied,
+    numbered Issues column explaining exactly why, with a matching numbered
+    RequiredActions column. A check that cannot be run (access denied,
     WMI broken, etc.) is reported as "Unable to check ..." with the reason - it is
     never silently left blank or treated as healthy.
 
@@ -47,6 +58,15 @@
     Folder for the .xlsx/.log (created if missing). Default C:\Temp\OSHealthCheck.
     With -ConsolidatePath, defaults to the consolidate folder itself.
 
+.PARAMETER Site
+    Optional site label (e.g. AQ, TB, AB) written to the Site column, so a consolidated
+    report can be filtered per site.
+
+.PARAMETER QualysTarget
+    Optional host:port endpoint(s) to TCP-test for Qualys (e.g. your Qualys platform URL
+    or proxy, qagpublic.qg2.apps.qualys.com:443). Same for -BinalyzeTarget (AIR console)
+    and -SplunkTarget (added to the servers read from the forwarder's config files).
+
 .PARAMETER ConsolidatePath
     Folder (searched recursively) holding the per-VM .xlsx reports. Runs no health checks;
     only merges the reports into one workbook.
@@ -54,6 +74,10 @@
 .EXAMPLE
     .\Invoke-OSHealthCheck.ps1
     Checks the local server.
+
+.EXAMPLE
+    .\Invoke-OSHealthCheck.ps1 -Site AQ -BinalyzeTarget air.corp.local:443
+    Checks the local server, labels it site AQ, and also tests TCP reach to the AIR console.
 
 .EXAMPLE
     .\Invoke-OSHealthCheck.ps1 -ConsolidatePath C:\Temp\AllReports
@@ -79,6 +103,14 @@ param(
 
     # Merge mode: folder of per-VM reports to consolidate (no checks are run)
     [string]$ConsolidatePath,
+
+    # Optional site label (AQ / TB / AB ...) for the Site column
+    [string]$Site,
+
+    # Optional host:port endpoints to TCP-test per agent
+    [string[]]$QualysTarget,
+    [string[]]$BinalyzeTarget,
+    [string[]]$SplunkTarget,
 
     # Look-back window for System log Critical/Error events
     [ValidateRange(1, 90)][int]$EventDays = 7,
@@ -126,7 +158,7 @@ process {
 
 end {
 
-$ScriptBuild = '2026-10-25.1'
+$ScriptBuild = '2026-10-25.2'
 Write-Host "Invoke-OSHealthCheck.ps1 - build $ScriptBuild" -ForegroundColor Magenta
 
 $ErrorActionPreference = 'Stop'
@@ -137,7 +169,7 @@ $ErrorActionPreference = 'Stop'
 # cleanly over remoting.
 # ---------------------------------------------------------------------------------------------
 $collector = {
-    param([int]$EventDays, [string[]]$ServiceExclusions, [int]$MaxEvents)
+    param([int]$EventDays, [string[]]$ServiceExclusions, [int]$MaxEvents, [hashtable]$AgentTargets)
 
     $ErrorActionPreference = 'Stop'
     $checkErrors = New-Object System.Collections.Generic.List[string]
@@ -289,6 +321,166 @@ $collector = {
             })
     } catch { $checkErrors.Add("System event log: $($_.Exception.Message)") }
 
+    # --- Domain / workgroup ----------------------------------------------------------------
+    try {
+        $cs = Get-CimInstance -ClassName Win32_ComputerSystem -OperationTimeoutSec 60
+        $r.PartOfDomain = [bool]$cs.PartOfDomain
+        $r.DomainName   = if ($cs.PartOfDomain) { [string]$cs.Domain } else { [string]$cs.Workgroup }
+        $r.DomainRole   = [int]$cs.DomainRole
+        if (-not $cs.PartOfDomain) {
+            $r.SecureChannel = 'N/A (workgroup)'
+        } elseif ([int]$cs.DomainRole -ge 4) {
+            $r.SecureChannel = 'N/A (domain controller)'
+        } else {
+            # Read-only trust test (no -Repair). nltest fallback for PowerShell 7, which lacks the cmdlet.
+            try {
+                if (Get-Command Test-ComputerSecureChannel -ErrorAction SilentlyContinue) {
+                    $r.SecureChannel = if (Test-ComputerSecureChannel) { 'OK' } else { 'Failed' }
+                } else {
+                    $out = & nltest.exe "/sc_query:$($cs.Domain)" 2>&1
+                    $r.SecureChannel = if ($LASTEXITCODE -eq 0) { 'OK' } else { 'Failed' }
+                    if ($LASTEXITCODE -ne 0) { $r.SecureChannelError = (($out | Out-String) -replace '\s+', ' ').Trim() }
+                }
+            } catch { $r.SecureChannel = 'Failed'; $r.SecureChannelError = $_.Exception.Message }
+        }
+    } catch { $checkErrors.Add("Domain membership: $($_.Exception.Message)") }
+
+    # --- Security agents: Qualys / Binalyze AIR / Splunk UF ---------------------------------
+    function Test-TcpPort {
+        param([string]$HostName, [int]$Port, [int]$TimeoutMs = 3000)
+        $client = New-Object System.Net.Sockets.TcpClient
+        try {
+            $iar = $client.BeginConnect($HostName, $Port, $null, $null)
+            if ($iar.AsyncWaitHandle.WaitOne($TimeoutMs)) { $client.EndConnect($iar); return $true }
+            return $false
+        } catch { return $false } finally { $client.Close() }
+    }
+
+    try {
+        $allSvc = @(Get-CimInstance -ClassName Win32_Service -OperationTimeoutSec 60)
+        $procs  = @()
+        try { $procs = @(Get-CimInstance -ClassName Win32_Process -OperationTimeoutSec 60 | Select-Object ProcessId, ExecutablePath) } catch { }
+
+        # Established TCP connections (Get-NetTCPConnection, or netstat on very old builds)
+        $tcp = $null
+        try {
+            $tcp = @(Get-NetTCPConnection -State Established -ErrorAction Stop | ForEach-Object {
+                [pscustomobject]@{ OwningProcess = [int]$_.OwningProcess; RemoteAddress = [string]$_.RemoteAddress; RemotePort = [int]$_.RemotePort } })
+        } catch {
+            try {
+                $tcp = @(netstat.exe -ano | ForEach-Object {
+                    if ($_ -match '^\s*TCP\s+\S+\s+(\S+):(\d+)\s+ESTABLISHED\s+(\d+)') {
+                        [pscustomobject]@{ OwningProcess = [int]$Matches[3]; RemoteAddress = $Matches[1].Trim('[', ']'); RemotePort = [int]$Matches[2] }
+                    } })
+            } catch { $tcp = $null }
+        }
+
+        $agentDefs = @(
+            @{ Name = 'Qualys';   Services = @('QualysAgent');     Match = '*Qualys*';          Dir = "$env:ProgramFiles\Qualys\QualysAgent" }
+            @{ Name = 'Binalyze'; Services = @();                  Match = '*Binalyze*';        Dir = "${env:ProgramFiles(x86)}\Binalyze\AIR\agent" }
+            @{ Name = 'Splunk';   Services = @('SplunkForwarder'); Match = '*SplunkForwarder*'; Dir = "$env:ProgramFiles\SplunkUniversalForwarder" }
+        )
+
+        $r.Agents = @(foreach ($def in $agentDefs) {
+            $a = [ordered]@{
+                Agent = $def.Name; Installed = $false; ServiceName = $null; State = $null; StartMode = $null
+                Version = $null; Connectivity = $null; Evidence = $null
+            }
+            $evidence = New-Object System.Collections.Generic.List[string]
+            try {
+                $svc = @($allSvc | Where-Object { $def.Services -contains $_.Name -or $_.Name -like $def.Match -or $_.DisplayName -like $def.Match }) | Select-Object -First 1
+                $root = $def.Dir
+                if ($svc) {
+                    $a.Installed   = $true
+                    $a.ServiceName = [string]$svc.Name
+                    $a.State       = [string]$svc.State
+                    $a.StartMode   = [string]$svc.StartMode
+                    $exe = $null
+                    if ($svc.PathName -match '^\s*"([^"]+)"') { $exe = $Matches[1] } elseif ($svc.PathName -match '^\s*(\S+?\.exe)') { $exe = $Matches[1] }
+                    if ($exe -and (Test-Path -LiteralPath $exe)) {
+                        $a.Version = [string](Get-Item -LiteralPath $exe).VersionInfo.ProductVersion
+                        $root = Split-Path -Path $exe -Parent
+                        if ((Split-Path -Path $root -Leaf) -eq 'bin') { $root = Split-Path -Path $root -Parent }
+                    }
+                } elseif ($def.Dir -and (Test-Path -LiteralPath $def.Dir)) {
+                    $evidence.Add("Install folder $($def.Dir) exists but no service is registered (broken/partial install)")
+                }
+
+                # Configured servers to test
+                $targets = New-Object System.Collections.Generic.List[string]
+                if ($AgentTargets -and $AgentTargets[$def.Name]) { foreach ($t in @($AgentTargets[$def.Name])) { if ($t) { $targets.Add([string]$t) } } }
+                if ($def.Name -eq 'Splunk' -and $a.Installed -and $root) {
+                    $confs = @()
+                    foreach ($pattern in 'etc\system\local\*.conf', 'etc\apps\*\local\*.conf', 'etc\apps\*\default\*.conf') {
+                        $confs += @(Get-ChildItem -Path "$root\$pattern" -ErrorAction SilentlyContinue |
+                                    Where-Object { $_.Name -in 'outputs.conf', 'deploymentclient.conf' })
+                    }
+                    foreach ($cf in $confs) {
+                        foreach ($line in (Get-Content -LiteralPath $cf.FullName -ErrorAction SilentlyContinue)) {
+                            if ($line -match '^\s*(server|targetUri)\s*=\s*(.+?)\s*$') {
+                                foreach ($t in ($Matches[2] -split ',')) {
+                                    $t = ($t.Trim() -replace '^\w+://', '').TrimEnd('/')
+                                    if ($t -and -not $targets.Contains($t)) { $targets.Add($t) }
+                                }
+                            }
+                        }
+                    }
+                    if ($targets.Count -eq 0) { $evidence.Add('No server/targetUri found in outputs.conf or deploymentclient.conf') }
+                }
+
+                if (-not $a.Installed) {
+                    $a.Connectivity = 'N/A (not installed)'
+                } elseif ($a.State -ne 'Running') {
+                    $a.Connectivity = 'Not connected (service not running)'
+                } else {
+                    # Live connections held by the service process or any process under the agent folder
+                    $pids = @(@($svc.ProcessId) + @($procs | Where-Object { $_.ExecutablePath -and $root -and $_.ExecutablePath -like "$root\*" } | ForEach-Object { $_.ProcessId }) |
+                              Where-Object { $_ } | Sort-Object -Unique)
+                    $endpoints = @()
+                    if ($null -ne $tcp) {
+                        $endpoints = @($tcp | Where-Object { $pids -contains $_.OwningProcess -and $_.RemoteAddress -notin @('127.0.0.1', '::1', '0.0.0.0', '::') } |
+                                       ForEach-Object { "$($_.RemoteAddress):$($_.RemotePort)" } | Sort-Object -Unique)
+                    } else { $evidence.Add('Could not read TCP connection table') }
+
+                    $reachable = 0; $tested = 0
+                    foreach ($t in $targets) {
+                        if ($t -match '^\[?([^\]]+?)\]?:(\d+)$') {
+                            $tested++
+                            $ok = Test-TcpPort -HostName $Matches[1] -Port ([int]$Matches[2])
+                            if ($ok) { $reachable++ }
+                            $evidence.Add("TCP $t " + $(if ($ok) { 'reachable' } else { 'NOT reachable' }))
+                        } else { $evidence.Add("Target '$t' has no port - not tested") }
+                    }
+
+                    $logAgeH = $null
+                    if ($def.Name -eq 'Qualys') {
+                        $log = "$env:ProgramData\Qualys\QualysAgent\Log.txt"
+                        if (Test-Path -LiteralPath $log) {
+                            $logAgeH = [math]::Round(((Get-Date) - (Get-Item -LiteralPath $log).LastWriteTime).TotalHours, 1)
+                            $evidence.Add("Agent log last written $logAgeH h ago")
+                        } else { $evidence.Add('Agent log not found') }
+                    }
+
+                    if ($endpoints.Count -gt 0) {
+                        $a.Connectivity = 'Connected'
+                        $evidence.Insert(0, "Active connection(s): $($endpoints -join ', ')")
+                    } elseif ($tested -gt 0 -and $reachable -eq 0) {
+                        $a.Connectivity = 'Not connected'
+                    } elseif ($null -ne $logAgeH -and $logAgeH -gt 72) {
+                        $a.Connectivity = 'Not connected'
+                        $evidence.Add('Agent log not updated for more than 3 days')
+                    } elseif ($tested -gt 0) {
+                        $a.Connectivity = 'Reachable (no active connection)'
+                    } else {
+                        $a.Connectivity = 'Unknown'
+                    }
+                }
+            } catch { $evidence.Add("Check failed: $($_.Exception.Message)"); if (-not $a.Connectivity) { $a.Connectivity = 'Unknown' } }
+            $a.Evidence = ($evidence -join '; ')
+            [pscustomobject]$a
+        })
+    } catch { $checkErrors.Add("Security agents: $($_.Exception.Message)") }
+
     $r.CheckErrors = @($checkErrors)
     [pscustomobject]$r
 }
@@ -320,33 +512,106 @@ function Get-WorstStatus {
 }
 
 function ConvertTo-HealthRows {
-    # Turns one collector result (or an unreachable marker) into Summary/Disk/Service/Event rows.
+    # Turns one collector result (or an unreachable marker) into Summary/Agent/Disk/Service/Event rows.
     param([string]$Target, $Raw, [string]$ConnectError)
 
     $issues   = New-Object System.Collections.Generic.List[string]
+    $actions  = New-Object System.Collections.Generic.List[string]
     $statuses = New-Object System.Collections.Generic.List[string]
-    $diskRows = @(); $svcRows = @(); $evtRows = @()
+    # Status '' = observation that needs an action but does not change the server's status
+    $addFinding = { param([string]$Status, [string]$Issue, [string]$Action)
+        $issues.Add($Issue); $actions.Add($Action); if ($Status) { $statuses.Add($Status) } }
+    $number = { param($list) if ($list.Count -eq 0) { 'None' } else { $n = 0; (@($list | ForEach-Object { $n++; "$n) $_" }) -join "`n") } }   # one item per line
+
+    $diskRows = @(); $svcRows = @(); $evtRows = @(); $agentRows = @()
     $critCol  = "CritEvents_$($EventDays)d"
     $errCol   = "ErrEvents_$($EventDays)d"
 
     if (-not $Raw) {
+        & $addFinding 'Critical' "Unreachable / collection failed: $ConnectError" 'Run the script locally on the VM (or fix WinRM access) and re-check'
         $row = [ordered]@{
-            Server = $Target; Status = 'Critical'; Issues = "Unreachable / collection failed: $ConnectError"
+            Server = $Target; Site = $Site; Status = 'Critical'
+            Issues = (& $number $issues); RequiredActions = (& $number $actions)
         }
-        return [pscustomobject]@{ Summary = [pscustomobject]$row; Disks = @(); Services = @(); Events = @() }
+        return [pscustomobject]@{ Summary = [pscustomobject]$row; Agents = @(); Disks = @(); Services = @(); Events = @() }
     }
 
     $now = $Raw.CollectedAt
 
     # Unable-to-check items are surfaced, never hidden.
-    foreach ($ce in @($Raw.CheckErrors)) { if ($ce) { $issues.Add("Unable to check $ce"); $statuses.Add('Warning') } }
-    if ($Raw.IsAdmin -eq $false) { $issues.Add('Not run as Administrator - some results may be incomplete'); $statuses.Add('Warning') }
+    foreach ($ce in @($Raw.CheckErrors)) { if ($ce) { & $addFinding 'Warning' "Unable to check $ce" 'Re-run elevated; if it still fails, check WMI/permissions on the VM' } }
+    if ($Raw.IsAdmin -eq $false) { & $addFinding 'Warning' 'Not run as Administrator - some results may be incomplete' 'Re-run from an elevated (Run as Administrator) PowerShell' }
+
+    # Activation
+    if ($Raw.Activation -and $Raw.Activation -ne 'Licensed') {
+        & $addFinding 'Warning' "Windows activation: $($Raw.Activation)" 'Activate Windows (check KMS/AVMA reachability or product key)'
+    }
+
+    # Domain / workgroup
+    $joinType = $null
+    if ($null -ne $Raw.PartOfDomain) {
+        $joinType = if ($Raw.PartOfDomain) { 'Domain' } else { 'Workgroup' }
+        if ($Raw.SecureChannel -eq 'Failed') {
+            $why = if ($Raw.SecureChannelError) { " ($($Raw.SecureChannelError))" } else { '' }
+            & $addFinding 'Warning' "Domain trust test failed$why - trust broken or no domain controller reachable" 'Check DC reachability from the VM; if DCs are reachable, repair the secure channel with a domain admin'
+        }
+    }
+
+    # Security agents
+    $agentLabel = @{ Qualys = 'Qualys Cloud Agent'; Binalyze = 'Binalyze AIR agent'; Splunk = 'Splunk Universal Forwarder' }
+    $agentConsole = @{ Qualys = 'Qualys console (agent last check-in)'; Binalyze = 'Binalyze AIR console (asset online)'; Splunk = 'Splunk (data received from this host)' }
+    $agentCols = [ordered]@{}
+    foreach ($ag in @($Raw.Agents | Where-Object { $_ })) {
+        $label = $agentLabel[$ag.Agent]; if (-not $label) { $label = $ag.Agent }
+        $astat = 'OK'
+        if (-not $ag.Installed) {
+            $astat = 'Critical'
+            & $addFinding 'Critical' "$label not installed" "Install $label (raise with the agent owner team)"
+            $svcText = 'Not installed'
+        } elseif ($ag.State -ne 'Running') {
+            $astat = 'Critical'
+            & $addFinding 'Critical' "$label installed but service $($ag.ServiceName) is $($ag.State)" "Start service $($ag.ServiceName), set it to Automatic and find out why it stopped"
+            $svcText = "Installed - service $($ag.State)"
+        } else {
+            $svcText = 'Installed - Running'
+            if ($ag.StartMode -and $ag.StartMode -ne 'Auto') {
+                $astat = 'Warning'
+                & $addFinding 'Warning' "$label service start mode is $($ag.StartMode)" "Set service $($ag.ServiceName) to Automatic so it survives reboots"
+            }
+            switch -Wildcard ($ag.Connectivity) {
+                'Connected' { }
+                'Not connected*' {
+                    $astat = 'Warning'
+                    & $addFinding 'Warning' "$label not connected ($($ag.Evidence))" "Check network/firewall/proxy from the VM to the $($ag.Agent) server; confirm in $($agentConsole[$ag.Agent])"
+                }
+                'Reachable*' {
+                    if ($ag.Agent -eq 'Splunk') {
+                        $astat = 'Warning'
+                        & $addFinding 'Warning' "$label has no active forwarding connection although its server is reachable" "Check splunkd.log on the VM and confirm in $($agentConsole[$ag.Agent])"
+                    } else {
+                        & $addFinding '' "$label connectivity: server reachable, no live session at check time" "Confirm in $($agentConsole[$ag.Agent])"
+                    }
+                }
+                default {
+                    & $addFinding '' "$label connectivity could not be confirmed from the VM" "Confirm in $($agentConsole[$ag.Agent])"
+                }
+            }
+        }
+        if ($astat -eq 'OK' -and $ag.Connectivity -ne 'Connected') { $astat = 'Manual/External Required' }
+        $agentCols[$ag.Agent] = $svcText
+        $agentCols["$($ag.Agent)_Connectivity"] = $ag.Connectivity
+        $agentRows += [pscustomobject][ordered]@{
+            Server = $Target; Agent = $label; Installed = [bool]$ag.Installed; Version = $ag.Version
+            Service = $ag.ServiceName; ServiceState = $ag.State; StartMode = $ag.StartMode
+            Connectivity = $ag.Connectivity; Evidence = $ag.Evidence; Status = $astat
+        }
+    }
 
     # Uptime
     $uptimeDays = $null
     if ($Raw.LastBoot) {
         $uptimeDays = [math]::Round(($now - $Raw.LastBoot).TotalDays, 1)
-        if ($uptimeDays -ge $UptimeWarnDays) { $issues.Add("Uptime $uptimeDays days (>= $UptimeWarnDays)"); $statuses.Add('Warning') }
+        if ($uptimeDays -ge $UptimeWarnDays) { & $addFinding 'Warning' "Uptime $uptimeDays days (>= $UptimeWarnDays)" 'Plan a reboot in the next maintenance window' }
     }
 
     # Memory
@@ -355,7 +620,7 @@ function ConvertTo-HealthRows {
         $totalRamGB = [math]::Round($Raw.TotalRAM_KB / 1MB, 1)
         $freeRamGB  = [math]::Round($Raw.FreeRAM_KB / 1MB, 1)
         $freeRamPct = [math]::Round(100 * $Raw.FreeRAM_KB / $Raw.TotalRAM_KB, 1)
-        if ($freeRamPct -lt $RamWarnPct) { $issues.Add("Free RAM $freeRamPct% (< $RamWarnPct%)"); $statuses.Add('Warning') }
+        if ($freeRamPct -lt $RamWarnPct) { & $addFinding 'Warning' "Free RAM $freeRamPct% (< $RamWarnPct%)" 'Review memory usage; add RAM if consistently low' }
     }
 
     # Disks
@@ -370,7 +635,7 @@ function ConvertTo-HealthRows {
             if ($pct -lt $DiskCritPct)     { $ds = 'Critical' }
             elseif ($pct -lt $DiskWarnPct) { $ds = 'Warning' }
         }
-        if ($ds -ne 'OK') { $issues.Add("Disk $($d.Drive) free $freeGB GB ($pct%)"); $statuses.Add($ds) }
+        if ($ds -ne 'OK') { & $addFinding $ds "Disk $($d.Drive) free $freeGB GB ($pct%)" "Free up space on $($d.Drive) or extend the disk" }
         if ($d.Drive -eq 'C:') { $cFreeGB = $freeGB; $cFreePct = $pct }
         $diskRows += [pscustomobject][ordered]@{
             Server = $Target; Drive = $d.Drive; Label = $d.Label
@@ -382,21 +647,18 @@ function ConvertTo-HealthRows {
     $patchAge = $null
     if ($Raw.LastKBDate) {
         $patchAge = [int]($now.Date - $Raw.LastKBDate.Date).TotalDays
-        if ($patchAge -gt $PatchWarnDays) { $issues.Add("Last KB installed $patchAge days ago (> $PatchWarnDays)"); $statuses.Add('Warning') }
+        if ($patchAge -gt $PatchWarnDays) { & $addFinding 'Warning' "Last KB installed $patchAge days ago (> $PatchWarnDays)" 'Apply the latest cumulative update' }
     } elseif ($null -ne $Raw.HotFixCount) {
-        $issues.Add('No dated hotfix found - verify patch status manually'); $statuses.Add('Warning')
+        & $addFinding 'Warning' 'No dated hotfix found' 'Verify patch status manually (Windows Update history)'
     }
 
     # Pending reboot
-    if ($Raw.PendingReboot) { $issues.Add("Pending reboot ($($Raw.PendingRebootReason))"); $statuses.Add('Warning') }
-
-    # Activation
-    if ($Raw.Activation -and $Raw.Activation -ne 'Licensed') { $issues.Add("Windows activation: $($Raw.Activation)"); $statuses.Add('Warning') }
+    if ($Raw.PendingReboot) { & $addFinding 'Warning' "Pending reboot ($($Raw.PendingRebootReason))" 'Reboot in the next maintenance window' }
 
     # Services
     $stopped = @($Raw.StoppedServices | Where-Object { $_ })
     if ($stopped.Count -gt 0) {
-        $issues.Add("$($stopped.Count) automatic service(s) not running: $(($stopped.Name) -join ', ')"); $statuses.Add('Warning')
+        & $addFinding 'Warning' "$($stopped.Count) automatic service(s) not running: $(($stopped.Name) -join ', ')" 'Confirm with the app owner; start the service(s) or set to Manual if not needed'
     }
     foreach ($s in $stopped) {
         $svcRows += [pscustomobject][ordered]@{
@@ -407,8 +669,8 @@ function ConvertTo-HealthRows {
 
     # Events
     $capNote = if ($Raw.EventsCapped) { " (first $MaxEvents read)" } else { '' }
-    if ($Raw.CriticalEvents -gt 0) { $issues.Add("$($Raw.CriticalEvents) Critical System event(s) in $EventDays d$capNote"); $statuses.Add('Warning') }
-    if ($Raw.ErrorEvents -ge $ErrorEventWarn) { $issues.Add("$($Raw.ErrorEvents) Error System events in $EventDays d$capNote (>= $ErrorEventWarn)"); $statuses.Add('Warning') }
+    if ($Raw.CriticalEvents -gt 0) { & $addFinding 'Warning' "$($Raw.CriticalEvents) Critical System event(s) in $EventDays d$capNote" 'Review the Events sheet (e.g. unexpected shutdowns) and find the cause' }
+    if ($Raw.ErrorEvents -ge $ErrorEventWarn) { & $addFinding 'Warning' "$($Raw.ErrorEvents) Error System events in $EventDays d$capNote (>= $ErrorEventWarn)" 'Review the top error sources in the Events sheet' }
     foreach ($e in @($Raw.TopEvents | Where-Object { $_ })) {
         $evtRows += [pscustomobject][ordered]@{
             Server = $Target; Level = $e.Level; Source = $e.Source; EventId = $e.EventId
@@ -422,10 +684,19 @@ function ConvertTo-HealthRows {
 
     $row = [ordered]@{
         Server              = $Target
+        Site                = $Site
         Status              = Get-WorstStatus -Statuses $statuses
-        Issues              = if ($issues.Count) { $issues -join '; ' } else { 'None' }
+        Issues              = (& $number $issues)
+        RequiredActions     = (& $number $actions)
         OS                  = $Raw.OS
         Version             = $version
+        Activation          = $Raw.Activation
+        JoinType            = $joinType
+        DomainOrWorkgroup   = $Raw.DomainName
+        DomainTrust         = $Raw.SecureChannel
+    }
+    foreach ($k in 'Qualys', 'Qualys_Connectivity', 'Binalyze', 'Binalyze_Connectivity', 'Splunk', 'Splunk_Connectivity') { $row[$k] = $agentCols[$k] }
+    $rest = [ordered]@{
         LastBoot            = $Raw.LastBoot
         Uptime_Days         = $uptimeDays
         CPULoad_Pct         = $Raw.CPULoadPct
@@ -440,14 +711,14 @@ function ConvertTo-HealthRows {
         PatchAge_Days       = $patchAge
         PendingReboot       = $Raw.PendingReboot
         PendingRebootReason = $Raw.PendingRebootReason
-        Activation          = $Raw.Activation
         StoppedAutoSvc      = if ($null -ne $Raw.StoppedServices) { $stopped.Count } else { $null }
         StoppedAutoSvcNames = ($stopped.Name -join ', ')
         $critCol            = $Raw.CriticalEvents
         $errCol             = $Raw.ErrorEvents
         CollectedAt         = $Raw.CollectedAt
     }
-    [pscustomobject]@{ Summary = [pscustomobject]$row; Disks = $diskRows; Services = $svcRows; Events = $evtRows }
+    foreach ($k in $rest.Keys) { $row[$k] = $rest[$k] }
+    [pscustomobject]@{ Summary = [pscustomobject]$row; Agents = $agentRows; Disks = $diskRows; Services = $svcRows; Events = $evtRows }
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -474,7 +745,8 @@ function Export-SimpleXlsx {
 
     Add-Type -AssemblyName System.IO.Compression
     $inv = [System.Globalization.CultureInfo]::InvariantCulture
-    $statusStyle = @{ 'OK' = 3; 'Warning' = 4; 'Critical' = 5 }
+    $statusStyle = @{ 'OK' = 3; 'Warning' = 4; 'Critical' = 5; 'Manual/External Required' = 4 }
+    $wrapCols = @('Issues', 'RequiredActions', 'Evidence', 'Message')   # long text: wrapped (style 6)
     $numTypes = @([int16], [int32], [int64], [uint16], [uint32], [uint64], [byte], [sbyte], [double], [single], [decimal])
     $hdr = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
     $nsMain = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
@@ -497,7 +769,7 @@ function Export-SimpleXlsx {
         foreach ($row in ($rows | Select-Object -First 500)) {
             for ($c = 0; $c -lt $cols.Count; $c++) {
                 $v = $row.($cols[$c])
-                $len = if ($v -is [datetime]) { 16 } elseif ($null -ne $v) { ([string]$v).Length } else { 0 }
+                $len = if ($v -is [datetime]) { 16 } elseif ($null -ne $v) { (@(([string]$v) -split "`n") | Measure-Object -Property Length -Maximum).Maximum } else { 0 }
                 if ($len + 2 -gt $widths[$c]) { $widths[$c] = $len + 2 }
             }
         }
@@ -507,7 +779,7 @@ function Export-SimpleXlsx {
         [void]$sb.Append('<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>')
         [void]$sb.Append('<sheetFormatPr defaultRowHeight="15"/><cols>')
         for ($c = 0; $c -lt $cols.Count; $c++) {
-            $w = [math]::Min([math]::Max($widths[$c], 8), 80)
+            $w = [math]::Min([math]::Max($widths[$c], 8), $(if ($wrapCols -contains $cols[$c]) { 70 } else { 80 }))
             [void]$sb.Append("<col min=`"$($c+1)`" max=`"$($c+1)`" width=`"$w`" customWidth=`"1`"/>")
         }
         [void]$sb.Append('</cols><sheetData><row r="1">')
@@ -527,12 +799,13 @@ function Export-SimpleXlsx {
                 if ($v -is [datetime]) {
                     [void]$sb.Append("<c r=`"$ref`" s=`"2`"><v>$($v.ToOADate().ToString('R', $inv))</v></c>")
                 } elseif ($v -is [bool]) {
-                    [void]$sb.Append("<c r=`"$ref`" t=`"inlineStr`"><is><t>$(if ($v) { 'Yes' } else { 'No' })</t></is></c>")
+                    [void]$sb.Append("<c r=`"$ref`" s=`"0`" t=`"inlineStr`"><is><t>$(if ($v) { 'Yes' } else { 'No' })</t></is></c>")
                 } elseif ($numTypes -contains $v.GetType() -and -not ($v -is [double] -and ([double]::IsNaN($v) -or [double]::IsInfinity($v)))) {
-                    [void]$sb.Append("<c r=`"$ref`"><v>$(([double]$v).ToString('R', $inv))</v></c>")
+                    [void]$sb.Append("<c r=`"$ref`" s=`"0`"><v>$(([double]$v).ToString('R', $inv))</v></c>")
                 } else {
                     $text = [string]$v
-                    $s = if ($cols[$c] -eq 'Status' -and $statusStyle.ContainsKey($text)) { " s=`"$($statusStyle[$text])`"" } else { '' }
+                    $s = if ($cols[$c] -eq 'Status' -and $statusStyle.ContainsKey($text)) { " s=`"$($statusStyle[$text])`"" }
+                         elseif ($wrapCols -contains $cols[$c]) { ' s="6"' } else { ' s="0"' }
                     [void]$sb.Append("<c r=`"$ref`"$s t=`"inlineStr`"><is><t xml:space=`"preserve`">$(ConvertTo-XmlText $text)</t></is></c>")
                 }
             }
@@ -583,14 +856,15 @@ function Export-SimpleXlsx {
             '<fill><patternFill patternType="solid"><fgColor rgb="FFFFEB9C"/><bgColor indexed="64"/></patternFill></fill>' +
             '<fill><patternFill patternType="solid"><fgColor rgb="FFFFC7CE"/><bgColor indexed="64"/></patternFill></fill>' +
         '</fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>' +
-        '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>' +
-        '<cellXfs count="6">' +
-            '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>' +
-            '<xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/>' +
-            '<xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>' +
-            '<xf numFmtId="0" fontId="2" fillId="3" borderId="0" xfId="0" applyFont="1" applyFill="1"/>' +
-            '<xf numFmtId="0" fontId="3" fillId="4" borderId="0" xfId="0" applyFont="1" applyFill="1"/>' +
-            '<xf numFmtId="0" fontId="4" fillId="5" borderId="0" xfId="0" applyFont="1" applyFill="1"/>' +
+        '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"><alignment vertical="top"/></xf></cellStyleXfs>' +
+        '<cellXfs count="7">' +
+            '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment vertical="top"/></xf>' +
+            '<xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1" applyAlignment="1"><alignment vertical="top"/></xf>' +
+            '<xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1" applyAlignment="1"><alignment vertical="top"/></xf>' +
+            '<xf numFmtId="0" fontId="2" fillId="3" borderId="0" xfId="0" applyFont="1" applyFill="1" applyAlignment="1"><alignment vertical="top"/></xf>' +
+            '<xf numFmtId="0" fontId="3" fillId="4" borderId="0" xfId="0" applyFont="1" applyFill="1" applyAlignment="1"><alignment vertical="top"/></xf>' +
+            '<xf numFmtId="0" fontId="4" fillId="5" borderId="0" xfId="0" applyFont="1" applyFill="1" applyAlignment="1"><alignment vertical="top"/></xf>' +
+            '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment wrapText="1" vertical="top"/></xf>' +
         '</cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>'
 
     # Write to a temp file first so a failure never leaves a half-written .xlsx behind.
@@ -786,7 +1060,7 @@ function Invoke-Consolidation {
     $servers = @($best.Keys | Sort-Object @{ Expression = { $r = $rank[[string]$best[$_].Row.Status]; if ($null -eq $r) { 3 } else { $r } } }, @{ Expression = { $_ } })
 
     $sheets = @(@{ Name = 'Summary'; Rows = @(Join-RowsUnion -Rows @($servers | ForEach-Object { $best[$_].Row })) })
-    foreach ($name in 'Disks', 'StoppedServices', 'Events') {
+    foreach ($name in 'Agents', 'Disks', 'StoppedServices', 'Events') {
         $rows = foreach ($key in $servers) {
             $book = $books[$best[$key].File]
             @($book[$name]) | Where-Object { $_ -and $_.PSObject.Properties['Server'] -and ([string]$_.Server).ToUpperInvariant() -eq $key }
@@ -833,7 +1107,8 @@ $script:LogFile = Join-Path $OutputPath "$baseName.log"
 Write-Log "Build $ScriptBuild - run by $env:USERDOMAIN\$env:USERNAME on $env:COMPUTERNAME"
 Write-Log "Targets ($($targets.Count)): $($targets -join ', ')"
 
-$collectorArgs = @($EventDays, $ServiceExclusions, $MaxEvents)
+$agentTargets  = @{ Qualys = @($QualysTarget); Binalyze = @($BinalyzeTarget); Splunk = @($SplunkTarget) }
+$collectorArgs = @($EventDays, $ServiceExclusions, $MaxEvents, $agentTargets)
 $rawByTarget   = @{}
 $errByTarget   = @{}
 
@@ -878,10 +1153,11 @@ if ($remoteTargets.Count -gt 0) {
     }
 }
 
-$summary = @(); $disks = @(); $services = @(); $events = @()
+$summary = @(); $agents = @(); $disks = @(); $services = @(); $events = @()
 foreach ($t in $targets) {
     $rows = ConvertTo-HealthRows -Target $t -Raw $rawByTarget[$t] -ConnectError $errByTarget[$t]
     $summary  += $rows.Summary
+    $agents   += $rows.Agents
     $disks    += $rows.Disks
     $services += $rows.Services
     $events   += $rows.Events
@@ -890,6 +1166,7 @@ foreach ($t in $targets) {
 try {
     Export-SimpleXlsx -Path $xlsxPath -Sheets @(
         @{ Name = 'Summary';         Rows = $summary }
+        @{ Name = 'Agents';          Rows = $agents }
         @{ Name = 'Disks';           Rows = $disks }
         @{ Name = 'StoppedServices'; Rows = $services }
         @{ Name = 'Events';          Rows = $events }
