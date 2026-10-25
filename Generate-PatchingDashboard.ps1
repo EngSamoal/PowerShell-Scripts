@@ -95,6 +95,7 @@ param(
     [string]$SiteName,        # optional override only
     [string]$EngineerName,    # optional override only
     [string]$PatchingMonth,   # optional override only  (e.g. "September 2026")
+    [string]$CRNumber,        # optional: change request number shown under the title
 
     [ValidateRange(0, 100)]
     [double]$ComplianceThreshold = 95.0,
@@ -685,6 +686,7 @@ function Build-DashboardHtml {
     $safeTitle = ConvertTo-HtmlSafe $Ctx.Title
     $safeEng   = ConvertTo-HtmlSafe $Ctx.EngineerDisplay
     $safeMon   = ConvertTo-HtmlSafe $Ctx.MonthDisplay
+    $crLine    = if ($Ctx.CRNumber) { "    <p class=""cr-line"">CR: <b>$(ConvertTo-HtmlSafe $Ctx.CRNumber)</b></p>`n" } else { '' }
 
     $body = ''
     $dayNum = 0
@@ -732,6 +734,8 @@ $css = @'
   .report-h1{font-size:34px;font-weight:800;letter-spacing:.4px;margin:0;line-height:1.15;}
   .engineer{font-size:20px;font-weight:600;margin:12px 0 0;color:#DCE7F2;}
   .engineer b{color:#fff;}
+  .cr-line{font-size:18px;font-weight:600;margin:6px 0 0;color:#DCE7F2;}
+  .cr-line b{color:#fff;letter-spacing:.5px;}
   .report-month{font-size:20px;font-weight:700;margin:6px 0 0;color:#fff;}
   .day-banner{background:linear-gradient(135deg,#0F2A43 0%,#1D4E79 100%);color:#fff;border-radius:12px;
        padding:18px 30px;margin:44px 0 6px;box-shadow:0 8px 22px rgba(15,42,67,.20);}
@@ -828,7 +832,7 @@ $css
   <header class="hero">
     <h1 class="report-h1">$safeTitle</h1>
     <p class="engineer"><b>$safeEng</b></p>
-    <p class="report-month">$safeMon</p>
+$crLine    <p class="report-month">$safeMon</p>
   </header>
 
 $body
@@ -1081,7 +1085,7 @@ try {
     $generated = New-Object System.Collections.Generic.List[object]
 
     foreach ($grp in $groups) {
-        $recs = @($grp.Records)
+        $recs = @($grp.Records | ForEach-Object { $_ })
         $siteDisplay = $grp.DisplayName
 
         # engineers
@@ -1227,6 +1231,7 @@ try {
             Title           = 'Monthly Infrastructure Patching Executive Report'
             EngineerDisplay = $(if ($EngineerName) { $EngineerName } else { $ImplementedBy })
             MonthDisplay    = $monthDisplay
+            CRNumber        = $CRNumber
             GrandTotal      = $grandTotal
             Threshold       = $ComplianceThreshold
             Days            = $days.ToArray()
