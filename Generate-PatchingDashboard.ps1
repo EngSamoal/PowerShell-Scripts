@@ -504,9 +504,10 @@ function Get-ScopeDay {
 #  HTML BUILDER
 # ======================================================================
 function Format-Summary {
-    param([hashtable]$S, [string]$Heading, [string]$Note, [string]$Extra = '')
+    param([hashtable]$S, [string]$Heading, [string]$Note, [string]$Extra = '', [string]$Table = '')
     $P = $Palette
     $noteHtml = if ($Note) { "`n    <p class=""sum-note"">$Note</p>" } else { '' }
+    if ($Table) { $noteHtml += "`n$Table" }
     return @"
   <div class="panel summary$Extra">
     <h2>$Heading</h2>
@@ -708,7 +709,22 @@ function Build-DashboardHtml {
             $body += (Format-Summary $day.CumSummary ("Cumulative Summary &mdash; Day 1 to Day $dayNum (through $dt)") $day.CumNote ' cumulative')
         }
     }
-    $body += (Format-Summary $Ctx.MonthSummary 'Overall Summary &mdash; Full Month (Windows + Linux, all days)' $Ctx.MonthNote ' monthend')
+    # ---- day-by-day recap table inside the overall summary ----
+    $progTable = ''
+    if ($Ctx.Progress -and @($Ctx.Progress).Count -gt 0) {
+        $pr = ''
+        foreach ($r in $Ctx.Progress) {
+            $pr += "        <tr><td>Day $($r.DayNum)</td><td>$([string](ConvertTo-HtmlSafe $r.DateText))</td><td>$($r.Open)</td><td class=""c-done"">$($r.Completed)</td><td class=""c-done"">$($r.CumCompleted)</td><td class=""c-pend"">$($r.CumPending)</td><td class=""c-fail"">$($r.Failed)</td><td>$($r.Excluded)</td></tr>`n"
+        }
+        $progTable = @"
+    <table class="prog">
+      <thead><tr><th>Day</th><th>Date</th><th>Open at start of day</th><th>Completed that day</th><th>Cumulative completed</th><th>Pending at end of day</th><th>Failed</th><th>Excluded</th></tr></thead>
+      <tbody>
+$pr      </tbody>
+    </table>
+"@
+    }
+    $body += (Format-Summary $Ctx.MonthSummary 'Overall Summary &mdash; Full Month (Windows + Linux, Day 1 to last day)' $Ctx.MonthNote ' monthend' $progTable)
 
     # ---- data-quality notes -------------------------------------
     $dq = ''
@@ -782,6 +798,11 @@ $css = @'
   .sum b.good{color:#1F8A4C;} .sum b.warn{color:#C77700;} .sum b.bad{color:#C0392B;}
   .sum b.bad,.sum b.good,.sum b.warn{font-size:30px;}
   .sum-note{font-size:13.5px;color:var(--muted);margin:20px 0 0;}
+  table.prog{width:100%;border-collapse:collapse;font-size:13px;margin-top:22px;}
+  .prog th{background:#0F2A43;color:#fff;text-align:left;padding:9px 12px;font-weight:600;}
+  .prog td{padding:8px 12px;border-bottom:1px solid var(--line);}
+  .prog tr:nth-child(even){background:#FAFBFD;}
+  .prog .c-done{color:#1F8A4C;font-weight:700;} .prog .c-pend{color:#C77700;font-weight:700;} .prog .c-fail{color:#C0392B;font-weight:700;}
   .os-row{display:grid;grid-template-columns:230px 1fr 46px;align-items:center;gap:12px;margin-bottom:9px;font-size:13px;}
   .os-name{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#334155;}
   .os-bar{background:#EEF2F7;border-radius:6px;height:16px;overflow:hidden;}
@@ -1140,6 +1161,7 @@ try {
         if ($dayList.Count -eq 0) { $dayList = @($null) }   # single fallback day (no dates in sheet)
 
         $days = New-Object System.Collections.Generic.List[object]
+        $progress = New-Object System.Collections.Generic.List[object]
         $dayIdx = 0
         foreach ($d in $dayList) {
             $dayIdx++
@@ -1187,8 +1209,12 @@ try {
             if ($cumPending -lt 0) { $cumPending = 0 }
             $cumComp = if ($cumInScope -gt 0) { [math]::Round(100.0 * $cumCompleted / $cumInScope, 1) } else { 0 }
             $cl = Get-StatusLabel $cumInScope $cumFailed 0 $cumComp $ComplianceThreshold
+            $progress.Add([pscustomobject]@{
+                DayNum = $dayIdx; DateText = $dateText; Open = $daySum.Total; Completed = $daySum.Completed
+                CumCompleted = $cumCompleted; CumPending = $cumPending; Failed = $cumFailed; Excluded = $excludedCount })
             $cumSum = $null
-            if ($dayIdx -ge 2) {
+            # the last day's cumulative equals the Overall Summary, so it is not repeated
+            if ($dayIdx -ge 2 -and $dayIdx -lt $dayList.Count) {
                 $cumSum = @{ Total = $grandTotal; Completed = $cumCompleted; Failed = $cumFailed
                     Pending = $cumPending; Unknown = 0; Excluded = $excludedCount; InScope = $cumInScope
                     Compliance = $cumComp; StatusText = $cl[0]; StatusClass = $cl[1] }
@@ -1235,6 +1261,7 @@ try {
             GrandTotal      = $grandTotal
             Threshold       = $ComplianceThreshold
             Days            = $days.ToArray()
+            Progress        = $progress.ToArray()
             MonthSummary    = $monthSummary
             MonthNote       = ("$famSummary &nbsp;|&nbsp; {0} patching day(s) &nbsp;|&nbsp; {1} in-scope VMs, {2} excluded as per management (fixed in every calculation)." -f $days.Count, $meInScope, $excludedCount)
             DataQuality     = @($dq | Select-Object -Unique)
