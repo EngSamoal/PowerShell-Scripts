@@ -132,7 +132,8 @@ $ColumnAliases = [ordered]@{
     IPAddress      = @('IP Address', 'IPAddress', 'IP', 'IP Addr', 'Address', 'Mgmt IP', 'Management IP', 'Primary IP')
     OS             = @('OS', 'Operating System', 'OS Name', 'OS Version', 'Platform', 'Image', 'OS(Provide Image)', 'OS (Provide Image)')
     Engineer       = @('Update Engineer', 'Engineer', 'Implementer', 'Implemented By', 'Patching Engineer', 'Patch Engineer', 'Performed By', 'Executed By', 'Assigned To', 'Owner Engineer', 'Resource', 'Applied By')
-    StartDate      = @('Patching starting Date', 'Patching Starting Date', 'Start Patching Date', 'Patching Start Date', 'Patching Date', 'Patch Date', 'Patched On', 'Patched Date', 'Start Date', 'Scheduled Date', 'Completion Date', 'Completed On', 'Activity Date', 'Maintenance Date', 'Date')
+    CompletedDate  = @('Completed Date', 'Completed Day', 'Completion Date', 'Completion Day', 'Date Completed', 'Day Completed', 'Completed On', 'Completed', 'Patched Date', 'Patched Day', 'Patched On', 'Patch Completed Date', 'Patching Completed Date', 'Patching Completion Date', 'Completed Date / Justification', 'Completed Date or Justification')
+    StartDate      = @('Patching starting Date', 'Patching Starting Date', 'Start Patching Date', 'Patching Start Date', 'Patching Date', 'Patch Date', 'Start Date', 'Scheduled Date', 'Activity Date', 'Maintenance Date', 'Date')
     Status         = @('Patching Status', 'Patch Status', 'Status', 'Result', 'Outcome', 'State', 'Compliance Status', 'Patch State', 'Activity Status')
     Remarks        = @('Issues in the source excel sheet', 'Issue', 'Issues', 'Remarks', 'Remark', 'Comments', 'Comment', 'Notes', 'Note', 'Reason', 'Root Cause', 'RootCause', 'Failure Reason', 'FailureReason', 'Error', 'Error Details', 'Details', 'Description', 'Observation', 'Findings', 'Justification')
     Excluded       = @('Excluded', 'Exclude', 'Exclusion', 'Excluded by Management', 'Management Decision', 'Descoped', 'Out of Scope', 'Exempted', 'Exception')
@@ -568,7 +569,6 @@ $doneRows          </tbody></table>
         $pendRows = ''
         foreach ($v in ($b.PendingVMs | Sort-Object HostName)) {
             $why = [string](ConvertTo-HtmlSafe $v.Justification)
-            if (-not $why) { $why = [string](ConvertTo-HtmlSafe $v.Remarks) }
             if (-not $why) { $why = '<span class="muted">&ndash;</span>' }
             $pendRows += "          <tr><td>$([string](ConvertTo-HtmlSafe $v.HostName))</td><td class=""just"">$why</td></tr>`n"
         }
@@ -986,7 +986,7 @@ try {
     $dq = New-Object System.Collections.Generic.List[string]
     if (-not $cols.SiteName)  { $dq.Add("No Site column found - using $([string]$(if($SiteName){"override '$SiteName'"}else{'file name / placeholder'})).") }
     if (-not $cols.Engineer)  { $dq.Add("No Engineer / Implementer column found.") }
-    if (-not $cols.StartDate) { $dq.Add("No Start Patching Date column found - month derived from file name / file date.") }
+    if (-not $cols.StartDate -and -not $cols.CompletedDate) { $dq.Add("No patching date / completed date column found - month derived from file name / file date.") }
     if (-not $cols.OS)        { $dq.Add("No OS column found - OS breakdown will be empty.") }
     if (-not $cols.TechnicalOwner) { $dq.Add("No Technical Owner column found.") }
     if (-not $cols.IPAddress) { $dq.Add("No IP Address column found.") }
@@ -1006,7 +1006,11 @@ try {
         $rm = ConvertTo-Text (Get-Prop $row $cols.Remarks)
         $xc = ConvertTo-Text (Get-Prop $row $cols.Excluded)
         $sr = Resolve-SiteName (ConvertTo-Text (Get-Prop $row $cols.SiteName))
-        $dr = Get-Prop $row $cols.StartDate
+        # completed-date column wins (real date = day patched, free text = justification);
+        # if it is blank, fall back to the start-patching-date column
+        $drC = Get-Prop $row $cols.CompletedDate
+        $drS = Get-Prop $row $cols.StartDate
+        $dr  = if ((ConvertTo-Text $drC) -ne '') { $drC } else { $drS }
 
         if (($h -eq '') -and ($st -eq '') -and ($ip -eq '') -and ($os -eq '') -and ($to -eq '') -and ($en -eq '') -and ($sr -eq '')) {
             $blankRows++; continue
@@ -1022,7 +1026,7 @@ try {
         # is the JUSTIFICATION for why the VM is still pending -> treat the VM as Pending.
         $date = $null
         $just = ''
-        if ($cols.StartDate) {
+        if ($cols.CompletedDate -or $cols.StartDate) {
             $date = ConvertTo-DateOrNull $dr
             $drText = ConvertTo-Text $dr
             if (-not $date -and $drText -ne '') {
