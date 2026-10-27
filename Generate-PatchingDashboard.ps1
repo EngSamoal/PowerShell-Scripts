@@ -567,14 +567,17 @@ $doneRows          </tbody></table>
         # -- pending / not-started VMs : scrollable table  VM Name  ("NA" when none) --
         $pendRows = ''
         foreach ($v in ($b.PendingVMs | Sort-Object HostName)) {
-            $pendRows += "          <tr><td>$([string](ConvertTo-HtmlSafe $v.HostName))</td></tr>`n"
+            $why = [string](ConvertTo-HtmlSafe $v.Justification)
+            if (-not $why) { $why = [string](ConvertTo-HtmlSafe $v.Remarks) }
+            if (-not $why) { $why = '<span class="muted">&ndash;</span>' }
+            $pendRows += "          <tr><td>$([string](ConvertTo-HtmlSafe $v.HostName))</td><td class=""just"">$why</td></tr>`n"
         }
         if ($pendRows) {
             $pendCount = $b.PendingVMs.Count
             $pendSection = @"
       <p class="mini-cap">$pendCount VM(s)</p>
       <div class="scroll-wrap">
-        <table class="lst"><thead><tr><th>VM Name</th></tr></thead>
+        <table class="lst"><thead><tr><th>VM Name</th><th>Justification</th></tr></thead>
         <tbody>
 $pendRows        </tbody></table>
       </div>
@@ -787,6 +790,7 @@ $css = @'
   .lst th{position:sticky;top:0;background:#EEF2F7;color:#334155;text-align:left;padding:7px 10px;font-weight:700;}
   .lst td{padding:5px 10px;border-bottom:1px solid var(--line);white-space:nowrap;}
   .lst tr:nth-child(even){background:#FAFBFD;}
+  .lst td.just{white-space:normal;min-width:260px;}
   .na-box{background:#F4F6F9;border:1px solid var(--line);color:var(--muted);font-weight:800;font-size:15px;
        letter-spacing:1px;padding:16px;border-radius:10px;text-align:center;}
   .summary{padding:30px 32px;}
@@ -989,7 +993,7 @@ try {
     if (-not $cols.Remarks) { $dq.Add("No Issue / Remarks column found - the 'Issues in the source Excel sheet' column in Exceptions falls back to the raw status text.") }
 
     $records   = New-Object System.Collections.Generic.List[object]
-    $blankRows = 0; $noHost = 0; $dateFail = 0; $unknownStatus = 0; $rowNo = $HeaderRow
+    $blankRows = 0; $noHost = 0; $dateFail = 0; $unknownStatus = 0; $justCount = 0; $rowNo = $HeaderRow
 
     foreach ($row in $data) {
         $rowNo++
@@ -1013,16 +1017,25 @@ try {
         # an explicit "Excluded" column (truthy value) overrides the status bucket
         $xk = Get-NormalKey $xc
         if ($xk -in @('y', 'yes', 'true', '1', 'x', 'excluded', 'exclude', 'exempt', 'exempted', 'outofscope', 'descoped', 'notinscope', 'permanagement')) { $bucket = 'Excluded' }
+
+        # Date column: a real date = the day it was patched. Free text instead of a date
+        # is the JUSTIFICATION for why the VM is still pending -> treat the VM as Pending.
+        $date = $null
+        $just = ''
+        if ($cols.StartDate) {
+            $date = ConvertTo-DateOrNull $dr
+            $drText = ConvertTo-Text $dr
+            if (-not $date -and $drText -ne '') {
+                $just = $drText
+                $justCount++
+                if ($bucket -in @('Completed', 'Unknown', 'Pending')) { $bucket = 'Pending' }
+            }
+        }
+
         if ($bucket -eq 'Unknown') {
             $unknownStatus++
             if ($st -ne '') { $dq.Add("Row $rowNo - unrecognised status '$st' (not counted as completed).") }
             else            { $dq.Add("Row $rowNo ($h) - empty Patching Status (not counted as completed).") }
-        }
-
-        $date = $null
-        if ($cols.StartDate) {
-            $date = ConvertTo-DateOrNull $dr
-            if (-not $date -and (ConvertTo-Text $dr) -ne '') { $dateFail++; $dq.Add("Row $rowNo ($h) - unparseable date '$(ConvertTo-Text $dr)'.") }
         }
 
         $records.Add([pscustomobject]@{
@@ -1034,12 +1047,17 @@ try {
             Engineer   = $en
             SiteRaw    = $sr
             Remarks    = $rm
+            Justification = $just
             StatusText = if ($st -ne '') { $st } else { '(blank)' }
             Bucket     = $bucket
             Date       = $date
         })
     }
 
+    if ($justCount -gt 0) {
+        $dq.Add("$justCount VM(s) have a justification text instead of a date in the patching-date column - treated as Pending and shown with their justification.")
+        Write-Log "$justCount VM(s) with a justification instead of a date -> Pending." 'WARN'
+    }
     if ($blankRows -gt 0) { Write-Log "Skipped $blankRows blank row(s)." }
     if ($records.Count -eq 0) { throw "No data rows found after validation. Nothing to report." }
 
@@ -1057,10 +1075,10 @@ try {
         Write-Log "Site name overridden via -SiteName: '$SiteName' -> '$ovr'." 'WARN'
     }
     else {
-        $siteGroups = $records | Group-Object {
+        $siteGroups = @($records | Group-Object {
             $k = Get-NormalKey $_.SiteRaw
             if ($k) { $k } else { '__none__' }
-        }
+        })
         $distinctNames = @($records | ForEach-Object { $_.SiteRaw } | Where-Object { $_ -ne '' } | Sort-Object -Unique)
 
         if ($siteGroups.Count -le 1 -or $CombineSites) {
