@@ -112,7 +112,7 @@ param(
     [switch]$Open
 )
 
-$ScriptBuild = '2026-10-28.3'   # printed in the log + report footer so you can confirm which copy ran
+$ScriptBuild = '2026-10-28.4'   # printed in the log + report footer so you can confirm which copy ran
 $ErrorActionPreference = 'Stop'
 $script:LogFile = $null
 $script:ExitCode = 0
@@ -594,7 +594,6 @@ $pendRows        </tbody></table>
             $exclRows = ''
             foreach ($v in $b.ExcludedVMs) {
                 $why = [string](ConvertTo-HtmlSafe $v.Notes)
-                if (-not $why) { $why = [string](ConvertTo-HtmlSafe $v.Remarks) }
                 if (-not $why) { $why = '<span class="muted">&ndash;</span>' }
                 $exclRows += "          <tr><td>$([string](ConvertTo-HtmlSafe $v.HostName))</td><td class=""just"">$why</td></tr>`n"
             }
@@ -630,7 +629,6 @@ $exclRows        </tbody></table>
         $exRows = ''
         foreach ($e in $b.Exceptions) {
             $issue = [string](ConvertTo-HtmlSafe $e.Remarks)
-            if (-not $issue) { $issue = [string](ConvertTo-HtmlSafe $e.Notes) }
             if (-not $issue) {
                 $rawTrim = ([string]$e.StatusText).Trim()
                 $rawKey  = Get-NormalKey $rawTrim
@@ -1019,7 +1017,8 @@ try {
     if (-not $cols.OS)        { $dq.Add("No OS column found - OS breakdown will be empty.") }
     if (-not $cols.TechnicalOwner) { $dq.Add("No Technical Owner column found.") }
     if (-not $cols.IPAddress) { $dq.Add("No IP Address column found.") }
-    if (-not $cols.Remarks -and -not $cols.Notes) { $dq.Add("No Notes / Issue / Remarks column found - failed-VM issues fall back to the raw status text and excluded VMs show no justification.") }
+    if (-not $cols.Remarks) { $dq.Add("No Issue / Remarks column found - the Issue column for failed VMs falls back to the raw status text.") }
+    if (-not $cols.Notes)   { $dq.Add("No Notes column found - excluded VMs are listed without a justification.") }
 
     $records   = New-Object System.Collections.Generic.List[object]
     $blankRows = 0; $noHost = 0; $dateFail = 0; $unknownStatus = 0; $justCount = 0; $rowNo = $HeaderRow
