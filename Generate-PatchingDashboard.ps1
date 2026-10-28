@@ -177,7 +177,7 @@ $ImplementedBy = 'Asset IT Operations'
 # ======================================================================
 $StatusKeywords = @{
     Failed    = @('failed', 'fail', 'failure', 'error', 'errored', 'unsuccessful', 'aborted', 'rollback', 'rolledback', 'cancelled', 'canceled')
-    Excluded  = @('excluded', 'exclude', 'exclusion', 'exempt', 'exempted', 'exemption', 'descoped', 'descope', 'outofscope', 'notinscope', 'removedfromscope', 'waived', 'waiver', 'perManagement', 'managementexclusion')
+    Excluded  = @('exclu', 'execlu', 'exculd', 'exlud', 'excld', 'exempt', 'descope', 'outofscope', 'notinscope', 'removedfromscope', 'waived', 'waiver', 'permanagement', 'managementexclusion')
     Completed = @('completed', 'complete', 'done', 'success', 'successful', 'successfullypatched', 'patchedsuccessfully', 'patched', 'patchingcompleted', 'installed', 'applied', 'closed', 'resolved', 'compliant', 'uptodate', 'fullypatched', 'ok', 'pass', 'passed', 'green')
     Pending   = @('pending', 'notstarted', 'yettostart', 'tobestarted', 'tobedone', 'scheduled', 'planned', 'inprogress', 'wip', 'workinprogress', 'ongoing', 'incomplete', 'partiallycompleted', 'partial', 'onhold', 'hold', 'deferred', 'postponed', 'rescheduled', 'skipped', 'queued', 'inqueue', 'open', 'new', 'rebootpending', 'pendingreboot', 'amber', 'yellow')
 }
@@ -1020,7 +1020,7 @@ try {
         $bucket = Get-StatusBucket $st
         # an explicit "Excluded" column (truthy value) overrides the status bucket
         $xk = Get-NormalKey $xc
-        if ($xk -in @('y', 'yes', 'true', '1', 'x', 'excluded', 'exclude', 'exempt', 'exempted', 'outofscope', 'descoped', 'notinscope', 'permanagement')) { $bucket = 'Excluded' }
+        if ($xk -in @('y', 'yes', 'true', '1', 'x', 'excluded', 'execluded', 'exculded', 'exclude', 'exempt', 'exempted', 'outofscope', 'descoped', 'notinscope', 'permanagement')) { $bucket = 'Excluded' }
 
         # Date column: a real date = the day it was patched. Free text instead of a date
         # is the JUSTIFICATION for why the VM is still pending -> treat the VM as Pending.
