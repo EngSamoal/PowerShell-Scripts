@@ -112,7 +112,7 @@ param(
     [switch]$Open
 )
 
-$ScriptBuild = '2026-10-28.2'   # printed in the log + report footer so you can confirm which copy ran
+$ScriptBuild = '2026-10-28.3'   # printed in the log + report footer so you can confirm which copy ran
 $ErrorActionPreference = 'Stop'
 $script:LogFile = $null
 $script:ExitCode = 0
@@ -136,7 +136,8 @@ $ColumnAliases = [ordered]@{
     CompletedDate  = @('Completed Date', 'Completed Day', 'Completion Date', 'Completion Day', 'Date Completed', 'Day Completed', 'Completed On', 'Completed', 'Patched Date', 'Patched Day', 'Patched On', 'Patch Completed Date', 'Patching Completed Date', 'Patching Completion Date', 'Completed Date / Justification', 'Completed Date or Justification')
     StartDate      = @('Patching starting Date', 'Patching Starting Date', 'Start Patching Date', 'Patching Start Date', 'Patching Date', 'Patch Date', 'Start Date', 'Scheduled Date', 'Activity Date', 'Maintenance Date', 'Date')
     Status         = @('Patching Status', 'Patch Status', 'Status', 'Result', 'Outcome', 'State', 'Compliance Status', 'Patch State', 'Activity Status')
-    Remarks        = @('Issues in the source excel sheet', 'Issue', 'Issues', 'Remarks', 'Remark', 'Comments', 'Comment', 'Notes', 'Note', 'Reason', 'Root Cause', 'RootCause', 'Failure Reason', 'FailureReason', 'Error', 'Error Details', 'Details', 'Description', 'Observation', 'Findings', 'Justification')
+    Notes          = @('Notes', 'Note')
+    Remarks        = @('Issues in the source excel sheet', 'Issue', 'Issues', 'Remarks', 'Remark', 'Comments', 'Comment', 'Reason', 'Root Cause', 'RootCause', 'Failure Reason', 'FailureReason', 'Error', 'Error Details', 'Details', 'Description', 'Observation', 'Findings', 'Justification')
     Excluded       = @('Excluded', 'Exclude', 'Exclusion', 'Excluded by Management', 'Management Decision', 'Descoped', 'Out of Scope', 'Exempted', 'Exception')
 }
 
@@ -587,6 +588,31 @@ $pendRows        </tbody></table>
             $pendSection = '      <div class="na-box">NA</div>'
         }
 
+        # -- excluded VMs : VM Name | Justification (from the Notes column) --
+        $exclPanel = ''
+        if (@($b.ExcludedVMs).Count -gt 0) {
+            $exclRows = ''
+            foreach ($v in $b.ExcludedVMs) {
+                $why = [string](ConvertTo-HtmlSafe $v.Notes)
+                if (-not $why) { $why = [string](ConvertTo-HtmlSafe $v.Remarks) }
+                if (-not $why) { $why = '<span class="muted">&ndash;</span>' }
+                $exclRows += "          <tr><td>$([string](ConvertTo-HtmlSafe $v.HostName))</td><td class=""just"">$why</td></tr>`n"
+            }
+            $exclCount = @($b.ExcludedVMs).Count
+            $exclPanel = @"
+    <div class="panel">
+      <h2>Excluded VMs &mdash; as per management</h2>
+      <p class="mini-cap">$exclCount VM(s)</p>
+      <div class="scroll-wrap">
+        <table class="lst"><thead><tr><th>VM Name</th><th>Justification (Notes)</th></tr></thead>
+        <tbody>
+$exclRows        </tbody></table>
+      </div>
+    </div>
+
+"@
+        }
+
         # -- OS breakdown bars --
         $osRows = ''
         if ($b.OsBreakdown.Count -gt 0) {
@@ -604,6 +630,7 @@ $pendRows        </tbody></table>
         $exRows = ''
         foreach ($e in $b.Exceptions) {
             $issue = [string](ConvertTo-HtmlSafe $e.Remarks)
+            if (-not $issue) { $issue = [string](ConvertTo-HtmlSafe $e.Notes) }
             if (-not $issue) {
                 $rawTrim = ([string]$e.StatusText).Trim()
                 $rawKey  = Get-NormalKey $rawTrim
@@ -675,6 +702,7 @@ $osRows    </div>
 $pendSection
     </div>
 
+$exclPanel
     <div class="panel">
       <h2>Exceptions / Attention Required</h2>
 $exSection
@@ -991,7 +1019,7 @@ try {
     if (-not $cols.OS)        { $dq.Add("No OS column found - OS breakdown will be empty.") }
     if (-not $cols.TechnicalOwner) { $dq.Add("No Technical Owner column found.") }
     if (-not $cols.IPAddress) { $dq.Add("No IP Address column found.") }
-    if (-not $cols.Remarks) { $dq.Add("No Issue / Remarks column found - the 'Issues in the source Excel sheet' column in Exceptions falls back to the raw status text.") }
+    if (-not $cols.Remarks -and -not $cols.Notes) { $dq.Add("No Notes / Issue / Remarks column found - failed-VM issues fall back to the raw status text and excluded VMs show no justification.") }
 
     $records   = New-Object System.Collections.Generic.List[object]
     $blankRows = 0; $noHost = 0; $dateFail = 0; $unknownStatus = 0; $justCount = 0; $rowNo = $HeaderRow
@@ -1005,6 +1033,7 @@ try {
         $to = ConvertTo-Text (Get-Prop $row $cols.TechnicalOwner)
         $en = ConvertTo-Text (Get-Prop $row $cols.Engineer)
         $rm = ConvertTo-Text (Get-Prop $row $cols.Remarks)
+        $nt = ConvertTo-Text (Get-Prop $row $cols.Notes)
         $xc = ConvertTo-Text (Get-Prop $row $cols.Excluded)
         $sr = Resolve-SiteName (ConvertTo-Text (Get-Prop $row $cols.SiteName))
         # completed-date column wins (real date = day patched, free text = justification);
@@ -1052,6 +1081,7 @@ try {
             Engineer   = $en
             SiteRaw    = $sr
             Remarks    = $rm
+            Notes      = $nt
             Justification = $just
             StatusText = if ($st -ne '') { $st } else { '(blank)' }
             Bucket     = $bucket
@@ -1213,6 +1243,7 @@ try {
                     OsBreakdown  = @($fOs)
                     CompletedVMs = $sd.CompletedList
                     PendingVMs   = $sd.PendingList
+                    ExcludedVMs  = @($excludedRecs | Where-Object { (Get-OsFamily $_.OS) -eq $fam } | Sort-Object HostName)
                     Exceptions   = $sd.FailedList
                 })
             }
