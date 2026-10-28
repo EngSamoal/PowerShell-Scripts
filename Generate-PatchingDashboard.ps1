@@ -112,6 +112,7 @@ param(
     [switch]$Open
 )
 
+$ScriptBuild = '2026-10-28.2'   # printed in the log + report footer so you can confirm which copy ran
 $ErrorActionPreference = 'Stop'
 $script:LogFile = $null
 $script:ExitCode = 0
@@ -864,7 +865,7 @@ $body
   <footer>
 $dqSection
     <p style="margin-top:14px;">
-      Generated $genStamp from <b>$srcName</b> (worksheet: $sheetName).
+      Generated $genStamp from <b>$srcName</b> (worksheet: $sheetName) &middot; script build $(ConvertTo-HtmlSafe $Ctx.Build).
       All figures are calculated directly from the source workbook. This report is read-only; the workbook was not modified.
     </p>
   </footer>
@@ -900,7 +901,7 @@ try {
     $OutputFolder = (Resolve-Path -LiteralPath $OutputFolder).Path
     $script:LogFile = Join-Path $OutputFolder ('Generate-PatchingDashboard_{0:yyyyMMdd_HHmmss}.log' -f (Get-Date))
 
-    Write-Log "==== Patching Dashboard generation started ===="
+    Write-Log "==== Patching Dashboard generation started (script build $ScriptBuild) ===="
     Write-Log "Input workbook : $InputExcel"
     Write-Log "Output folder  : $OutputFolder"
 
@@ -1275,6 +1276,7 @@ try {
             EngineerDisplay = $(if ($EngineerName) { $EngineerName } else { $ImplementedBy })
             MonthDisplay    = $monthDisplay
             CRNumber        = $CRNumber
+            Build           = $ScriptBuild
             GrandTotal      = $grandTotal
             Threshold       = $ComplianceThreshold
             Days            = $days.ToArray()
