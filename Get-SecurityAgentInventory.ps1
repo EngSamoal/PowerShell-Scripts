@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
     READ-ONLY inventory of Qualys / Binalyze AIR / Splunk UF agents on the Windows VMs of
-    ABHA and ALHAMRA. Output: C:\temp\Security_Agent_Inventory.xlsx
+    ABHA, ALHAMRA and GOLF. Output: C:\temp\Security_Agent_Inventory.xlsx
 
 .NOTES
     - Reuses the vCenter sessions already open in this PowerShell window (no Connect-VIServer).
@@ -14,7 +14,7 @@
     - Linux VMs are out of scope and skipped.
 #>
 
-$ScriptBuild = 'SecAgentInv 2026-10-28.2'
+$ScriptBuild = 'SecAgentInv 2026-10-29.1'
 Write-Host "Build: $ScriptBuild" -ForegroundColor Cyan
 
 #region ---------- CONFIGURATION (edit here) ----------
@@ -23,6 +23,7 @@ Write-Host "Build: $ScriptBuild" -ForegroundColor Cyan
 $Sites = [ordered]@{
     'ABHA'    = @{ VCenter = @('10.61.6.140'); Datacenter = @(); TableStyle = 'Medium2'; Tab = '4472C4' }  # blue
     'ALHAMRA' = @{ VCenter = @('10.11.7.120'); Datacenter = @(); TableStyle = 'Medium3'; Tab = 'ED7D31' }  # orange
+    'GOLF'    = @{ VCenter = @('GOLF-VCENTER-CHANGE-ME'); Datacenter = @(); TableStyle = 'Medium7'; Tab = '70AD47' }  # green - set the real GOLF vCenter IP/FQDN
 }
 # Credential files are tried in order; the next one is only tried if the guest rejects the login.
 $WinCredFiles = @('C:\temp\wincred.xml')
