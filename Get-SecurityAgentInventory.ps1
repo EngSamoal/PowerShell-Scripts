@@ -14,7 +14,7 @@
     - Linux VMs are out of scope and skipped.
 #>
 
-$ScriptBuild = 'SecAgentInv 2026-10-29.2'
+$ScriptBuild = 'SecAgentInv 2026-10-29.3'
 Write-Host "Build: $ScriptBuild" -ForegroundColor Cyan
 
 #region ---------- CONFIGURATION (edit here) ----------
@@ -23,7 +23,7 @@ Write-Host "Build: $ScriptBuild" -ForegroundColor Cyan
 $Sites = [ordered]@{
     'ABHA'    = @{ VCenter = @('10.61.6.140'); Datacenter = @(); TableStyle = 'Medium2'; Tab = '4472C4' }  # blue
     'ALHAMRA' = @{ VCenter = @('10.11.7.120'); Datacenter = @(); TableStyle = 'Medium3'; Tab = 'ED7D31' }  # orange
-    'GOLF'    = @{ VCenter = @('GOLF-VCENTER-CHANGE-ME'); Datacenter = @(); TableStyle = 'Medium7'; Tab = '70AD47' }  # green - set the real GOLF vCenter IP/FQDN
+    'GOLF'    = @{ VCenter = @('10.8.20.10'); Datacenter = @(); TableStyle = 'Medium7'; Tab = '70AD47' }  # green
 }
 # Credential files are tried in order; the next one is only tried if the guest rejects the login.
 $WinCredFiles = @('C:\temp\wincred.xml')
@@ -137,7 +137,15 @@ foreach ($site in $Sites.Keys) {
 }
 
 #region ---------- Excel ----------
-if (Test-Path $OutFile) { Remove-Item $OutFile -ErrorAction Stop }   # fails clearly if the file is open in Excel
+# If the old report is open in Excel it can't be replaced - save under a new name instead of losing the run.
+if (Test-Path $OutFile) {
+    try { Remove-Item $OutFile -ErrorAction Stop }
+    catch {
+        $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+        $OutFile = $OutFile -replace '\.xlsx$', "_$stamp.xlsx"; $LogFile = $LogFile -replace '\.csv$', "_$stamp.csv"
+        Write-Warning "Old report is open in Excel - saving this run as $OutFile"
+    }
+}
 $cols = 'VM Name', 'IP', 'OS', 'Qualys Agent Version', 'Qualys Service Status', 'Binalyze Agent Version', 'Binalyze Service Status',
         'Splunk Agent Version', 'Splunk Service Status', 'Verification', 'Evidence / Source', 'vCenter'
 function Get-Color($Hex) { [System.Drawing.ColorTranslator]::FromHtml("#$Hex") }
