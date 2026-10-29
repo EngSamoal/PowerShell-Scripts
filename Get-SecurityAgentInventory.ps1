@@ -14,7 +14,7 @@
     - Linux VMs are out of scope and skipped.
 #>
 
-$ScriptBuild = 'SecAgentInv 2026-10-29.1'
+$ScriptBuild = 'SecAgentInv 2026-10-29.2'
 Write-Host "Build: $ScriptBuild" -ForegroundColor Cyan
 
 #region ---------- CONFIGURATION (edit here) ----------
@@ -94,7 +94,6 @@ foreach ($site in $Sites.Keys) {
             if ($vm.PowerState -ne 'PoweredOn' -or $v.Config.Template) { continue }
             if (-not ($v.Guest.GuestFamily -eq 'windowsGuest' -or $v.Config.GuestId -like 'win*')) { continue }   # Windows only
             $why = if ($vm.Name -match $ApplianceNameRegex) { 'name matches appliance pattern' }
-                   elseif ($v.Config.VAppConfig.Product) { 'deployed as OVF appliance (vApp product info)' }
                    elseif ($v.Config.ManagedBy) { "managed by $($v.Config.ManagedBy.ExtensionKey)" }
             if ($why) { Write-Log $site $vm.Name 'Excluded' $why; continue }
 

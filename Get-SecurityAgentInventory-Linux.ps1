@@ -18,7 +18,7 @@
       (Export-Clixml encrypts the password with DPAPI - only your user on this laptop can read it.)
 #>
 
-$ScriptBuild = 'SecAgentInv-Linux 2026-10-29.1'
+$ScriptBuild = 'SecAgentInv-Linux 2026-10-29.2'
 Write-Host "Build: $ScriptBuild" -ForegroundColor Cyan
 
 #region ---------- CONFIGURATION (edit here) ----------
@@ -99,7 +99,6 @@ foreach ($site in $Sites.Keys) {
             if (-not ($v.Guest.GuestFamily -eq 'linuxGuest' -or $full -match 'Linux|Red Hat|CentOS|Ubuntu|Debian|SUSE|Rocky|Alma|Oracle')) { continue }
             $why = if ($full -match 'Photon') { 'VMware Photon OS appliance' }
                    elseif ($vm.Name -match $ApplianceNameRegex) { 'name matches appliance pattern' }
-                   elseif ($v.Config.VAppConfig.Product) { 'deployed as OVF appliance (vApp product info)' }
                    elseif ($v.Config.ManagedBy) { "managed by $($v.Config.ManagedBy.ExtensionKey)" }
             if ($why) { Write-Log $site $vm.Name 'Excluded' $why; continue }
 
