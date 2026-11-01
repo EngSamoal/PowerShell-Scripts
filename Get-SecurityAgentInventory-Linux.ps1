@@ -16,18 +16,22 @@
     - Anything that can't be proven is reported as 'Unknown' / 'Unable to Verify', never guessed.
     - Linux credential file, created once with:  Get-Credential | Export-Clixml C:\temp\linuxcred.xml
       (Export-Clixml encrypts the password with DPAPI - only your user on this laptop can read it.)
+.PARAMETER ShowResults
+    Also print the report on screen (Summary, each site, Verification Log) with the same
+    columns and status colours as the Excel sheets. The Excel file is still created.
 #>
+param([switch]$ShowResults)
 
-$ScriptBuild = 'SecAgentInv-Linux 2026-10-29.3'
+$ScriptBuild = 'SecAgentInv-Linux 2026-11-01.1'
 Write-Host "Build: $ScriptBuild" -ForegroundColor Cyan
 
 #region ---------- CONFIGURATION (edit here) ----------
 # Site -> vCenter(s) exactly as they appear in $global:DefaultVIServers (IP or FQDN).
 # Datacenter = @() means every datacenter on that vCenter; list names if sites share a vCenter.
 $Sites = [ordered]@{
-    'ABHA'    = @{ VCenter = @('10.61.6.140'); Datacenter = @(); TableStyle = 'Medium2'; Tab = '4472C4' }  # blue
-    'ALHAMRA' = @{ VCenter = @('10.11.7.120'); Datacenter = @(); TableStyle = 'Medium3'; Tab = 'ED7D31' }  # orange
-    'GOLF'    = @{ VCenter = @('10.8.20.10'); Datacenter = @(); TableStyle = 'Medium7'; Tab = '70AD47' }  # green
+    'ABHA'    = @{ VCenter = @('10.61.6.140'); Datacenter = @(); TableStyle = 'Medium2'; Tab = '4472C4'; Console = 'Cyan' }  # blue
+    'ALHAMRA' = @{ VCenter = @('10.11.7.120'); Datacenter = @(); TableStyle = 'Medium3'; Tab = 'ED7D31'; Console = 'DarkYellow' }  # orange
+    'GOLF'    = @{ VCenter = @('10.8.20.10'); Datacenter = @(); TableStyle = 'Medium7'; Tab = '70AD47'; Console = 'Green' }  # green
 }
 # Credential files are tried in order; the next one is only tried if the guest rejects the login.
 $LinuxCredFiles = @('C:\temp\linuxcred.xml')
@@ -188,4 +192,27 @@ $Log | Export-Csv $LogFile -NoTypeInformation
 #endregion
 
 Write-Host "`nDone. Report: $OutFile   Log: $LogFile" -ForegroundColor Green
-$Summary | Format-Table Site, 'Eligible VMs', Verified, 'Unable to Verify' -AutoSize
+if ($ShowResults) {
+    # Same sheets as the workbook, printed on screen, with the Excel status colours.
+    function Show-Sheet($Title, $Data, $Cols, $Color) {
+        Write-Host "`n=== $Title ===" -ForegroundColor $Color
+        if (-not $Data) { Write-Host '  (no rows)'; return }
+        $w = @{}
+        foreach ($c in $Cols) { $w[$c] = [Math]::Min(40, (@($c.Length) + @($Data | ForEach-Object { "$($_.$c)".Length }) | Measure-Object -Maximum).Maximum) }
+        Write-Host (($Cols | ForEach-Object { $_.PadRight($w[$_]) }) -join '  ') -ForegroundColor $Color
+        Write-Host (($Cols | ForEach-Object { '-' * $w[$_] }) -join '  ') -ForegroundColor $Color
+        foreach ($r in $Data) {
+            foreach ($c in $Cols) {
+                $t = "$($r.$c)"; if ($t.Length -gt $w[$c]) { $t = $t.Substring(0, $w[$c] - 3) + '...' }
+                $fg = switch -Regex ($t) { '^Running' { 'Green' } '^Not Installed' { 'Red' } '^Stopped' { 'DarkYellow' } '^(Unknown|Unable)' { 'Yellow' } default { 'Gray' } }
+                Write-Host ($t.PadRight($w[$c]) + '  ') -NoNewline -ForegroundColor $fg
+            }
+            Write-Host ''
+        }
+    }
+    Show-Sheet 'Summary' @($Summary) @(@($Summary)[0].PSObject.Properties.Name) 'White'
+    foreach ($site in $Sites.Keys) { Show-Sheet $site @($Rows | Where-Object Site -eq $site) $cols $Sites[$site].Console }
+    if ($Log.Count) { Show-Sheet 'Verification Log' @($Log) @('Timestamp', 'Site', 'VM', 'Check', 'Reason') 'White' }
+} else {
+    $Summary | Format-Table Site, 'Eligible VMs', Verified, 'Unable to Verify' -AutoSize
+}
