@@ -1,0 +1,19 @@
+1- Assessment:
+
+./Invoke-RdpClipboardAssessment.ps1 -VMName APP01
+
+
+2- Dry (review the fixs before apply):
+
+.\Invoke-RdpClipboardRemediation.ps1 -VMName APP01
+
+
+3- Apply the Fix:
+
+.\Invoke-RdpClipboardRemediation.ps1 -VMName APP01 -Apply
+
+
+4- Rallback:
+
+.\Invoke-RdpClipboardRemediation.ps1 -VMName APP01 -Rollback
+

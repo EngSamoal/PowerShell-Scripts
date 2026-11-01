@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RDP Clipboard Assessment</title>
+<style>
+:root{--bg:#f7f8fa;--card:#fff;--fg:#1d2330;--muted:#5b6475;--line:#dde1e8;--acc:#1f5fbf;--pass:#1e7b3a;--fail:#b3261e;--warn:#9a6700;--unk:#6b7280;--na:#8a8f98;--code:#eef1f6}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#12151b;--card:#1a1f27;--fg:#e4e7ec;--muted:#9aa3b2;--line:#2c333f;--acc:#6ea8ff;--pass:#5cc97a;--fail:#ff7a70;--warn:#e3b341;--unk:#a0a7b4;--na:#7d8592;--code:#232a35}}
+:root[data-theme="dark"]{--bg:#12151b;--card:#1a1f27;--fg:#e4e7ec;--muted:#9aa3b2;--line:#2c333f;--acc:#6ea8ff;--pass:#5cc97a;--fail:#ff7a70;--warn:#e3b341;--unk:#a0a7b4;--na:#7d8592;--code:#232a35}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 "Segoe UI",system-ui,sans-serif}
+main{max-width:1080px;margin:0 auto;padding:24px 16px 64px}
+h1{font-size:26px;margin:0 0 4px}h2{font-size:19px;margin:36px 0 10px;padding-bottom:6px;border-bottom:2px solid var(--line)}h3{font-size:16px;margin:20px 0 6px}
+.sub{color:var(--muted);margin:0 0 20px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:14px 18px;margin:12px 0}
+code,pre{font-family:Consolas,"Cascadia Mono",monospace;font-size:13px;background:var(--code);border-radius:4px}
+code{padding:1px 5px}pre{padding:12px;overflow-x:auto;white-space:pre}
+table{border-collapse:collapse;width:100%;font-size:14px;background:var(--card)}
+.tw{overflow-x:auto;margin:10px 0}
+th,td{border:1px solid var(--line);padding:7px 9px;text-align:left;vertical-align:top}
+th{background:var(--acc);color:#fff;font-weight:600}
+.s{font-weight:700;white-space:nowrap}.pass{color:var(--pass)}.fail{color:var(--fail)}.warn{color:var(--warn)}.unk{color:var(--unk)}.na{color:var(--na)}
+.note{border-left:4px solid var(--warn);padding:8px 12px;background:var(--card);margin:12px 0}
+ul{padding-left:22px}li{margin:3px 0}
+a{color:var(--acc)}
+</style>
+</head>
+<body>
+<main>
+<h1>RDP Clipboard Assessment — BeyondTrust PRA / Windows Server</h1>
+<p class="sub">Companion guide for <code>Invoke-RdpClipboardAssessment.ps1</code>: how to run it, how to read it, and which team owns each result.</p>
+
+<h2>1. What the script does</h2>
+<div class="card">
+<ul>
+<li>Runs from your laptop and uses the vCenter sessions you already have open (<code>$global:DefaultVIServers</code>). It does not reconnect.</li>
+<li>Runs one read-only PowerShell payload in each guest through <code>Invoke-VMScript</code> (VMware Tools guest operations), signing in with <code>C:\temp\wincred.xml</code>. It does not use WinRM, PS Remoting, SSH or RDP.</li>
+<li>Checks RDS clipboard and drive policies, RDP-Tcp listener flags, RDS services, sessions, whether <code>rdpclip.exe</code> runs in each session, application-control blocks, event logs and VMware Tools/console settings.</li>
+<li>Writes <code>C:\temp\RDP_Clipboard_Assessment_&lt;timestamp&gt;.xlsx</code> (5 sheets) and a matching <code>.log</code>.</li>
+<li>Resolves policy names and options from <b>each server's own</b> <code>TerminalServer.admx/.adml</code>, so nothing is assumed. For example, the directional clipboard-format policies are only evaluated on builds that define them.</li>
+<li>Reads the Local GPO <code>Registry.pol</code> to show whether an effective value comes from Local Group Policy or was written straight to the registry (for example by a hardening script).</li>
+</ul>
+</div>
+
+<h2>2. Execution instructions</h2>
+<h3>Prerequisites (laptop only)</h3>
+<ul>
+<li>VMware PowerCLI (<code>VMware.VimAutomation.Core</code>), already connected to the vCenters.</li>
+<li><b>ImportExcel</b> module for the formatted workbook. Without it, the script writes 5 CSV files instead.</li>
+<li>vCenter role with <i>Virtual machine › Guest operations › Guest operation program execution / modifications / queries</i>.</li>
+<li>The guest account in <code>wincred.xml</code> should be the built-in Administrator, or another account with an elevated token. A UAC-filtered admin token is reported as WARNING, and checks it cannot read show as UNKNOWN.</li>
+</ul>
+<pre>Install-Module ImportExcel -Scope CurrentUser</pre>
+<h3>Select and run</h3>
+<pre>cd C:\path\to\script
+# one VM
+.\Invoke-RdpClipboardAssessment.ps1 -VMName APP01
+# list of VMs (wildcards allowed)
+.\Invoke-RdpClipboardAssessment.ps1 -VMName APP01,APP02,'SQL*'
+# from file (one name per line, # = comment)
+.\Invoke-RdpClipboardAssessment.ps1 -VMListFile C:\temp\vms.txt
+# all eligible Windows Server VMs on all connected vCenters
+.\Invoke-RdpClipboardAssessment.ps1 -AllWindowsVMs
+# options: -EventLookbackDays 14  -IncludeWindowsClient  -OutputFolder C:\temp</pre>
+<div class="note"><b>Best evidence:</b> keep a BeyondTrust RDP session to the affected VM open, try copying, and run the script for that VM <i>while the session is connected</i>. Only then can it show whether <code>rdpclip.exe</code> is running in the BeyondTrust session, which it identifies by the Jumpoint source address from LocalSessionManager events 21/25.</div>
+<h3>Automatic exclusions</h3>
+<p>Templates, vCLS and other solution-managed VMs, vApp/OVF appliances, non-Windows guests, Windows client OS (unless <code>-IncludeWindowsClient</code>), powered-off VMs, and VMs where Tools is not running or guest operations are not ready. Each skipped VM is listed with its reason on <i>Errors and Skipped</i>. A VM reached through two vCenter connections is counted once (keyed on its instance UUID).</p>
+<h3>Production safety</h3>
+<p>The script is read-only. It makes no registry, GPO, service, process, session, firewall, VM or BeyondTrust changes, installs nothing, and never logs credentials. The one write in the guest is the temporary script and output file that <code>Invoke-VMScript</code> creates and deletes in the guest account's <code>%TEMP%</code>. All VMware Tools guest operations do this. Corrective actions appear only as text in the report.</p>
+
+<h2>3. Interpreting results</h2>
+<div class="tw"><table>
+<tr><th>Status</th><th>Meaning</th><th>Action</th></tr>
+<tr><td class="s pass">PASS</td><td>Verified compliant (for example, the policy is explicitly Disabled, the service is running, or no block events).</td><td>None for this check. A VM whose checks all pass is <b>not</b> proven healthy. It only means Windows shows no blocker.</td></tr>
+<tr><td class="s fail">FAIL</td><td>Verified setting that blocks or breaks the capability. <i>Root-Cause Class</i> tells you which capability: <code>Confirmed</code> = text and file clipboard, <code>Confirmed-Files</code> = drive redirection or file transfer only.</td><td>Windows team fixes it under change control, using the Recommended Corrective Action text.</td></tr>
+<tr><td class="s warn">WARNING</td><td>A possible contributor, or a restriction that affects only some formats or directions (for example, a clipboard-format restriction that allows text but blocks files, or rdpclip missing from an active session).</td><td>Investigate. Not a confirmed root cause on its own.</td></tr>
+<tr><td class="s">NOT CONFIGURED</td><td>Policy is not set, so the lower-precedence setting (the listener value) or the Windows default applies.</td><td>Normally fine. Read it together with the listener row.</td></tr>
+<tr><td class="s unk">UNKNOWN</td><td>Could not be verified: access denied, command error, unparsable output, or not observable from session 0 (for example, which channels the client negotiated).</td><td>Never treat as PASS. Re-run with an elevated credential, or verify during a live session or with the PAM team.</td></tr>
+<tr><td class="s na">NOT APPLICABLE</td><td>Informational, or not relevant to RDP clipboard (for example, VMware console isolation, firewall rules, or a listener value overridden by policy).</td><td>No action for this issue.</td></tr>
+</table></div>
+<h3>Key evaluation rules</h3>
+<ul>
+<li><b>"Do not allow Clipboard redirection" = Enabled (fDisableClip=1) blocks clipboard.</b> Disabled (0) allows it explicitly. Not Configured falls through to the RDP-Tcp listener flag.</li>
+<li>When the computer policy is configured, it overrides the listener (Tsconfig) <code>fDisableClip</code>/<code>fDisableCdm</code> values.</li>
+<li>Drive redirection (<code>fDisableCdm</code>, <code>UmRdpService</code>) affects <b>files</b> only. Text clipboard depends on <code>rdpclip.exe</code> and the clipboard policy.</li>
+<li><code>rdpclip.exe</code> is checked <b>per active RDP session</b>. If no RDP session is active, the check is NOT APPLICABLE, not FAIL.</li>
+<li>TermService start mode Manual is the Windows default. Only "not Running" fails. UmRdpService and SessionEnv are on-demand services.</li>
+<li>Firewall rules are informational only. Clipboard data travels inside the established RDP connection as a virtual channel.</li>
+<li>VMware <code>isolation.tools.copy/paste.disable</code> controls the VMRC/web console clipboard only, <b>never</b> RDP. Do not change it for this issue.</li>
+</ul>
+<h3>Windows-side vs BeyondTrust-side</h3>
+<ul>
+<li><b>Windows-side (server team):</b> any FAIL with Root-Cause Class <code>Confirmed</code> or <code>Confirmed-Files</code>.</li>
+<li><b>BeyondTrust-side (PAM team):</b> <i>PAM Investigation Required = YES</i>. Windows shows no confirmed text-clipboard blocker, so the remaining causes are the session policy, Jump Item, Jumpoint or console. Work through the <i>PAM Verification</i> sheet.</li>
+<li><b>Laptop / security team:</b> the Access Console version and elevation, and laptop DLP. Also any server with an <i>Endpoint DLP indicator</i> of UNKNOWN, which means MDE is present and Purview DLP may apply.</li>
+</ul>
+
+<h2>4. Root-cause decision matrix</h2>
+<div class="tw"><table>
+<tr><th>Observation</th><th>Most likely area</th><th>Investigate</th><th>Owner</th></tr>
+<tr><td>Windows configuration FAILs</td><td>Server configuration</td><td>Fix the FAIL rows first: <code>fDisableClip</code> policy or listener, a <code>CSClipLevel/SCClipLevel</code> set to disable, IFEO on rdpclip, AppLocker/WDAC block events, TermService stopped, rdpclip.exe missing. Run <code>gpupdate</code>, have the user <b>sign out and reconnect</b> (settings apply to new sessions), then retest.</td><td>Windows</td></tr>
+<tr><td>Windows passes, clipboard still fails via BeyondTrust</td><td>BeyondTrust</td><td>Effective clipboard permission (user, group policy, Jump Policy, Session Policy on the Jump Item), Jump Item RDP options, Jumpoint version and health, Access Console version, and the session report for the failed session.</td><td>PAM</td></tr>
+<tr><td>Text copy/paste works, file copy/paste fails</td><td>File-transfer controls</td><td>BeyondTrust file-transfer permission (separate from clipboard) and whether your PRA version supports file copy in RDP sessions. On Windows: <code>CSClipLevel/SCClipLevel</code> format restrictions, <code>fDisableCdm</code>, UmRdpService. On the laptop: DLP rules on file copy.</td><td>PAM first, then Windows</td></tr>
+<tr><td>Works through direct RDP (mstsc), fails through BeyondTrust</td><td>BeyondTrust</td><td>Windows is proven able to redirect clipboard. Focus on the PRA session policy, Jump Item, Jumpoint and Access Console. Compare the source address in the workbook (Jumpoint IP vs laptop IP) and whether rdpclip runs in each session.</td><td>PAM</td></tr>
+<tr><td>Fails through both direct RDP and BeyondTrust</td><td>Server or laptop</td><td>Server FAIL/WARNING rows (policy, rdpclip, application control, crashes in the Application log). Laptop: mstsc <i>Local Resources › Clipboard</i> ticked, laptop RDP client policy, DLP agent, and clipboard tools. Test from a second admin workstation to separate the laptop from the server.</td><td>Windows, then security / desktop</td></tr>
+</table></div>
+<h3>Direct RDP comparison test</h3>
+<pre>mstsc /v:&lt;VM-IP&gt;   → Show Options › Local Resources › Clipboard ☑ (More… › Drives if testing files)
+Equivalent .rdp properties:  redirectclipboard:i:1   drivestoredirect:s:*</pre>
+<p>Test each case on its own: text laptop→VM, text VM→laptop, file laptop→VM, file VM→laptop, and <code>\\tsclient</code> visibility. Run the script while each session is open.</p>
+
+<h2>5. Limitations of the guest-script method</h2>
+<ul>
+<li>The payload runs in <b>session 0</b> as the guest credential. It cannot see what the RDP client requested at connect time, so clipboard (CLIPRDR) and drive (RDPDR) channel negotiation is reported as <b>UNKNOWN</b>.</li>
+<li><code>rdpclip.exe</code> running in a session proves the server-side component is up, but not that BeyondTrust enabled the clipboard channel. rdpclip missing has several possible causes, so it is a WARNING, not a confirmed cause.</li>
+<li>A non-elevated guest token can block reading some logs. Those checks become UNKNOWN.</li>
+<li>Session parsing relies on <code>qwinsta</code>. On non-English OS builds it may return UNKNOWN.</li>
+<li>Third-party DLP and clipboard agents cannot be detected generically. Only the Defender for Endpoint sensor is flagged, as a DLP indicator.</li>
+<li>BeyondTrust settings cannot be read from the VM. They are listed on the PAM Verification sheet for the PAM team to complete.</li>
+</ul>
+
+<h2>6. Remediation script (Windows side)</h2>
+<div class="card">
+<p><code>Invoke-RdpClipboardRemediation.ps1</code> fixes the Windows-side blockers that the assessment confirms. It is a <b>dry run by default</b>. It changes nothing until you add <code>-Apply</code>, and then asks for confirmation on each VM.</p>
+<pre># 1. dry run: see what would change
+.\Invoke-RdpClipboardRemediation.ps1 -VMName APP01
+# 2. apply the default fix (clipboard policy + listener)
+.\Invoke-RdpClipboardRemediation.ps1 -VMName APP01 -Apply
+# optional fixes (approval needed)
+.\Invoke-RdpClipboardRemediation.ps1 -VMListFile C:\temp\fail.txt -Apply -FixClipboardFormatPolicies -FixDriveRedirection -StartRdpServices -RemoveRdpclipIfeo
+# undo the last applied run on a VM
+.\Invoke-RdpClipboardRemediation.ps1 -VMName APP01 -Rollback</pre>
+<div class="tw"><table>
+<tr><th>Fix</th><th>When</th><th>What changes</th></tr>
+<tr><td>Do not allow Clipboard redirection → Disabled (0)</td><td>Default</td><td>Local GPO <code>Registry.pol</code> and the live registry value are changed together, so the next policy refresh does not revert the fix. The <code>gpt.ini</code> version is incremented and <code>gpupdate /target:computer /force</code> runs.</td></tr>
+<tr><td>RDP-Tcp listener <code>fDisableClip</code> → 0</td><td>Default, and only when no computer policy overrides the listener</td><td>Listener registry value.</td></tr>
+<tr><td><code>CSClipLevel</code> / <code>SCClipLevel</code> → Not Configured</td><td><code>-FixClipboardFormatPolicies</code></td><td>Removes the format restriction in both LGPO and the registry.</td></tr>
+<tr><td>Drive redirection policy and listener → allowed; UmRdpService Disabled → Manual</td><td><code>-FixDriveRedirection</code></td><td>Use only if file transfer is approved.</td></tr>
+<tr><td>Start TermService / UmRdpService</td><td><code>-StartRdpServices</code></td><td>Starts stopped services only. It never stops or restarts a service and never re-enables a Disabled TermService.</td></tr>
+<tr><td>IFEO Debugger on rdpclip.exe</td><td><code>-RemoveRdpclipIfeo</code></td><td>Removes the value. Confirm with the security team first.</td></tr>
+<tr><td>AppLocker, WDAC, SRP, DLP, firewall, VMware, BeyondTrust</td><td>Never changed</td><td>Reported only.</td></tr>
+</table></div>
+<ul>
+<li><b>Backup and rollback.</b> Before any change, the script copies <code>Registry.pol</code> and <code>gpt.ini</code> and records each registry and service change in <code>C:\Windows\Temp\RdpClipRemediation\&lt;timestamp&gt;\changes.json</code> in the guest. <code>-Rollback</code> uses that file to restore the original state.</li>
+<li><b>Registry.pol safety.</b> The script edits <code>Registry.pol</code> only if it can read and rewrite the original file byte for byte. Otherwise it fixes only the live value and tells you to use gpedit.msc.</li>
+<li><b>Values that can come back.</b> If the bad value was not set by Local GPO (for example, a hardening script or baseline wrote it), or an MDM RDS policy exists, the report warns that the value may be re-applied.</li>
+<li><b>No disruption, but users must reconnect.</b> There is no reboot and no session disconnect, but settings apply only to <b>new</b> RDP sessions. Users must sign out and reconnect, then re-run the assessment during a live BeyondTrust session.</li>
+<li><b>Credentials.</b> Use an elevated guest credential (the built-in Administrator). Apply and rollback refuse to run without elevation.</li>
+<li><b>Report.</b> Results go to <code>C:\temp\RDP_Clipboard_Remediation_&lt;Mode&gt;_&lt;timestamp&gt;.xlsx</code>, with result values PLANNED, APPLIED, SKIPPED, NOT NEEDED, REPORT ONLY, FAILED and RESTORED.</li>
+</ul>
+</div>
+
+<h2>7. PAM team checklist (summary of sheet 4)</h2>
+<div class="card"><ol>
+<li>For the affected user and Jump Item, which policy wins (user, group policy, Jump Policy, or the Session Policy on the Jump Item), and what is the <b>effective</b> clipboard permission and direction?</li>
+<li>Is file transfer allowed for RDP sessions, separately from clipboard? In which directions, with what path restrictions, and does your PRA version support RDP file copy/paste?</li>
+<li>Jump Item properties: assigned Jumpoint, assigned Session Policy, and any RDP options affecting redirection.</li>
+<li>Jumpoint online, with a version that matches the appliance. Access Console version on the technician laptop.</li>
+<li>Session report for a failed session (session ID and time): which policy was applied, and any clipboard or file-transfer denials.</li>
+<li>Policy conditions (approval, schedule, location) that could apply a more restrictive variant.</li>
+<li>Evidence: screenshots or exports of each item above, plus the live-test matrix results.</li>
+</ol>
+<p class="sub">BeyondTrust menu labels differ between PRA releases. The PAM team should match each item to the screens in your deployed version.</p></div>
+
+<h2>8. Official references</h2>
+<ul>
+<li>Microsoft: <a href="https://learn.microsoft.com/en-us/windows/client-management/mdm/policy-csp-admx-terminalserver">Policy CSP – ADMX_TerminalServer</a> (RDS device and resource redirection policies)</li>
+<li>Microsoft: <a href="https://learn.microsoft.com/en-us/windows/client-management/mdm/policy-csp-remotedesktopservices">Policy CSP – RemoteDesktopServices</a> (Do not allow drive redirection, etc.)</li>
+<li>Microsoft: <a href="https://learn.microsoft.com/en-us/azure/virtual-desktop/rdp-properties">Supported RDP properties</a> (<code>redirectclipboard</code>, <code>drivestoredirect</code>)</li>
+<li>Microsoft: <a href="https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/qwinsta">qwinsta / query session</a></li>
+<li>Microsoft: <a href="https://learn.microsoft.com/en-us/windows/security/application-security/application-control/app-control-for-business/applocker/applocker-overview">AppLocker overview</a>; <a href="https://learn.microsoft.com/en-us/purview/endpoint-dlp-learn-about">Learn about Endpoint DLP</a></li>
+<li>Broadcom: <a href="https://developer.broadcom.com/powercli/latest/vmware.vimautomation.core/commands/invoke-vmscript">PowerCLI Invoke-VMScript</a></li>
+<li>Broadcom: vSphere Security guide, section <i>"Disable Copy and Paste Operations Between Guest Operating System and Remote Console"</i> (<a href="https://techdocs.broadcom.com/">techdocs.broadcom.com</a>). It confirms <code>isolation.tools.*</code> applies to the VMware console only.</li>
+<li>BeyondTrust: <a href="https://www.beyondtrust.com/docs/privileged-remote-access/">Privileged Remote Access documentation</a>. See the admin guide sections on Group Policies, Session Policies, Jump Policies, RDP Jump Items and Jumpoints.</li>
+<li>ImportExcel: <a href="https://github.com/dfinke/ImportExcel">github.com/dfinke/ImportExcel</a></li>
+</ul>
+</main>
+</body>
+</html>
