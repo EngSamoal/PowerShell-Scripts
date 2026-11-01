@@ -415,6 +415,7 @@ $Skipped = New-Object System.Collections.ArrayList   # errors / skipped
 $Seen    = @{}
 
 function Add-Skip { param($vc, $name, $reason, $next, $kind)
+    if ($kind -ne 'None') { Write-Log "SKIPPED $name ($kind): $reason" 'WARN' }
     [void]$Skipped.Add([pscustomobject]@{ vCenter = $vc; 'VM Name' = $name; Category = $kind; 'Error / Reason' = $reason; 'Recommended Next Step' = $next }) }
 function Get-VCName($vm) { if ($vm.Uid -match '@([^:/]+)') { $Matches[1] } else { '?' } }
 
