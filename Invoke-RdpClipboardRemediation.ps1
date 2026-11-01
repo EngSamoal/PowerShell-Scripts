@@ -310,6 +310,23 @@ Emit
 '@
 #endregion
 
+function Invoke-GuestPayload {
+    # Runs the payload with -ScriptType Powershell; if PowerCLI cannot locate the guest PowerShell
+    # interpreter (known detection issue), copies the payload to the guest and runs it via Bat instead.
+    param($VM, [string]$Payload, $Cred)
+    try { return Invoke-VMScript -VM $VM -ScriptText $Payload -ScriptType Powershell -GuestCredential $Cred -ErrorAction Stop -WarningAction SilentlyContinue }
+    catch { if ($_.Exception.Message -notmatch 'Could not locate "Powershell"') { throw } }
+    Write-Log "$($VM.Name): PowerShell interpreter not detected by PowerCLI - using copy + Bat fallback." 'WARN'
+    $name = 'rdpclip_' + [guid]::NewGuid().ToString('N') + '.ps1'
+    $local = Join-Path $env:TEMP $name; $remote = "C:\Windows\Temp\$name"
+    Set-Content -Path $local -Value $Payload -Encoding ASCII
+    try {
+        Copy-VMGuestFile -LocalToGuest -Source $local -Destination $remote -VM $VM -GuestCredential $Cred -Force -ErrorAction Stop | Out-Null
+        $bat = "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$remote`" & del /f /q `"$remote`""
+        return Invoke-VMScript -VM $VM -ScriptText $bat -ScriptType Bat -GuestCredential $Cred -ErrorAction Stop -WarningAction SilentlyContinue
+    } finally { Remove-Item -LiteralPath $local -Force -ErrorAction SilentlyContinue }
+}
+
 #region ------------------------------------------------------------------ VM resolution
 $Rows = New-Object System.Collections.ArrayList
 $Errs = New-Object System.Collections.ArrayList
@@ -342,7 +359,7 @@ foreach ($vm in $vms) {
     Write-Log "$($vm.Name) @ ${vc}: $Mode"
     $payload = $GuestPayload.Replace('__MODE__', $Mode).Replace('__OPTS__', ($opts -join ',')).Replace('__RUNID__', $ts)
     try {
-        $res = Invoke-VMScript -VM $vm -ScriptText $payload -ScriptType Powershell -GuestCredential $GuestCred -ErrorAction Stop -WarningAction SilentlyContinue
+        $res = Invoke-GuestPayload -VM $vm -Payload $payload -Cred $GuestCred
         $txt = [string]$res.ScriptOutput
         if ($txt -notmatch '###REMJSON###(.*)###END###') { $o = $txt -replace '\s+', ' '; throw "No parsable result (exit $($res.ExitCode)): $($o.Substring(0, [math]::Min(300, $o.Length)))" }
         $data = $Matches[1] | ConvertFrom-Json

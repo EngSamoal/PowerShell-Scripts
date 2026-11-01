@@ -408,6 +408,23 @@ $out = [ordered]@{ m=$M; s=$S; f=$F }
 $GuestPayload = $GuestPayload.Replace('__LOOKBACK__', [string]$EventLookbackDays)
 #endregion
 
+function Invoke-GuestPayload {
+    # Runs the payload with -ScriptType Powershell; if PowerCLI cannot locate the guest PowerShell
+    # interpreter (known detection issue), copies the payload to the guest and runs it via Bat instead.
+    param($VM, [string]$Payload, $Cred)
+    try { return Invoke-VMScript -VM $VM -ScriptText $Payload -ScriptType Powershell -GuestCredential $Cred -ErrorAction Stop -WarningAction SilentlyContinue }
+    catch { if ($_.Exception.Message -notmatch 'Could not locate "Powershell"') { throw } }
+    Write-Log "$($VM.Name): PowerShell interpreter not detected by PowerCLI - using copy + Bat fallback." 'WARN'
+    $name = 'rdpclip_' + [guid]::NewGuid().ToString('N') + '.ps1'
+    $local = Join-Path $env:TEMP $name; $remote = "C:\Windows\Temp\$name"
+    Set-Content -Path $local -Value $Payload -Encoding ASCII
+    try {
+        Copy-VMGuestFile -LocalToGuest -Source $local -Destination $remote -VM $VM -GuestCredential $Cred -Force -ErrorAction Stop | Out-Null
+        $bat = "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$remote`" & del /f /q `"$remote`""
+        return Invoke-VMScript -VM $VM -ScriptText $bat -ScriptType Bat -GuestCredential $Cred -ErrorAction Stop -WarningAction SilentlyContinue
+    } finally { Remove-Item -LiteralPath $local -Force -ErrorAction SilentlyContinue }
+}
+
 #region ------------------------------------------------------------------ VM selection
 $Assess  = New-Object System.Collections.ArrayList   # per-VM summary rows
 $Detail  = New-Object System.Collections.ArrayList   # per-check rows
@@ -478,7 +495,7 @@ foreach ($vm in $eligible) {
         'RDP Session Status' = ''; 'Security/Policy Restrictions' = ''; 'Overall Assessment' = ''; 'Potential Root Cause' = ''; 'Recommended Action' = ''; 'PAM Investigation Required' = '' }
 
     try {
-        $res = Invoke-VMScript -VM $vm -ScriptText $GuestPayload -ScriptType Powershell -GuestCredential $GuestCred -ErrorAction Stop -WarningAction SilentlyContinue
+        $res = Invoke-GuestPayload -VM $vm -Payload $GuestPayload -Cred $GuestCred
         $txt = [string]$res.ScriptOutput
         if ($txt -notmatch '###RDPJSON###(.*)###END###') { throw "Guest script returned no parsable result (exit code $($res.ExitCode)). Output: $($o = $txt -replace '\s+', ' '; $o.Substring(0, [math]::Min(300, $o.Length)))" }
         $data = $Matches[1] | ConvertFrom-Json
