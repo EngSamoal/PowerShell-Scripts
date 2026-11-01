@@ -24,7 +24,7 @@
 #>
 param([switch]$ShowResults)
 
-$ScriptBuild = 'SecAgentInv-Linux-VMList 2026-11-01.1'
+$ScriptBuild = 'SecAgentInv-Linux-VMList 2026-11-01.2'
 Write-Host "Build: $ScriptBuild" -ForegroundColor Cyan
 
 #region ---------- CONFIGURATION (edit here) ----------
@@ -32,10 +32,11 @@ Write-Host "Build: $ScriptBuild" -ForegroundColor Cyan
 # Datacenter = @() means every datacenter on that vCenter; list names if sites share a vCenter.
 $Sites = [ordered]@{
     'ABHA'    = @{ VCenter = @('10.61.6.140'); Datacenter = @(); TableStyle = 'Medium2'; Tab = '4472C4'; Console = 'Cyan' }  # blue
-    'ALHAMRA' = @{ VCenter = @('10.11.7.120'); Datacenter = @(); TableStyle = 'Medium3'; Tab = 'ED7D31'; Console = 'DarkYellow' }  # orange
+    'ALHAMRA' = @{ VCenter = @('10.11.7.120'); Datacenter = @(); TableStyle = 'Medium3'; Tab = 'ED7D31'; Console = 'DarkYellow'; LinuxCred = @('C:\temp\LinuxCredHA.xml') }  # orange
     'GOLF'    = @{ VCenter = @('10.8.20.10'); Datacenter = @(); TableStyle = 'Medium7'; Tab = '70AD47'; Console = 'Green' }  # green
 }
-# Credential files are tried in order; the next one is only tried if the guest rejects the login.
+# Default Linux credential(s) for sites without their own LinuxCred = @(...) entry above.
+# Files are tried in order; the next one is only tried if the guest rejects the login.
 $LinuxCredFiles = @('C:\temp\linuxcred.xml')
 # Target VM names, one per line.
 $VMListFile = 'C:\temp\vmlist.txt'
@@ -85,8 +86,8 @@ function Resolve-Agent($Line) {
 if (-not (Get-Module -ListAvailable ImportExcel)) { throw 'ImportExcel module missing. Run: Install-Module ImportExcel -Scope CurrentUser' }
 $servers = @($global:DefaultVIServers | Where-Object IsConnected)
 if (-not $servers) { throw 'No connected vCenter. Run Connect-VIServer first.' }
-$LinuxCreds = @(foreach ($f in $LinuxCredFiles) { if (Test-Path $f) { Import-Clixml $f } })
-if (-not $LinuxCreds) { Write-Warning "No Linux credential file found - all VMs will be 'Unable to Verify'." }
+function Get-Creds($Files) { @(foreach ($f in $Files) { if (Test-Path $f) { Import-Clixml $f } else { Write-Warning "Credential file not found: $f" } }) }
+$DefaultCreds = Get-Creds $LinuxCredFiles
 if (-not (Test-Path $VMListFile)) { throw "VM list not found: $VMListFile" }
 $Targets = @(Get-Content $VMListFile | ForEach-Object { $_.Trim() } | Where-Object { $_ -and $_ -notlike '#*' } | Select-Object -Unique)
 if (-not $Targets) { throw "VM list is empty: $VMListFile" }
@@ -98,6 +99,7 @@ $Rows = [System.Collections.Generic.List[object]]::new()
 $seen = @{}
 foreach ($site in $Sites.Keys) {
     $cfg = $Sites[$site]
+    $LinuxCreds = if ($cfg.LinuxCred) { Get-Creds $cfg.LinuxCred } else { $DefaultCreds }   # per-site login, else default
     $siteServers = @($servers | Where-Object { $_.Name -in $cfg.VCenter -or $_.ServiceUri.Host -in $cfg.VCenter })
     if (-not $siteServers) { Write-Log $site '-' 'vCenter' "Not connected to $($cfg.VCenter -join ', ') - site NOT inventoried"; continue }
     foreach ($srv in $siteServers) {
@@ -125,7 +127,7 @@ foreach ($site in $Sites.Keys) {
             $lines = @(); $result = 'OK'
             if (-not $v.Guest.GuestOperationsReady) { $result = "VMware Tools not ready for guest operations (Tools: $($v.Guest.ToolsRunningStatus))" }
             else {
-                if (-not $LinuxCreds) { $result = 'No Linux credential file' }
+                if (-not $LinuxCreds) { $result = "No Linux credential file for site $site" }
                 foreach ($c in $LinuxCreds) {
                     try {
                         $out = Invoke-VMScript -VM $vm -Server $srv -GuestCredential $c -ScriptText $LinuxScript -ScriptType Bash -ToolsWaitSecs 60 -ErrorAction Stop
