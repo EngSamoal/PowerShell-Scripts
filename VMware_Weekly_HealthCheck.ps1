@@ -1218,7 +1218,7 @@ $clusterTableRows
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>VMware Weekly Health Check - Dashboard</title>
+<title>VMware Monthly Health Check - Dashboard</title>
 <style>
   body { font-family: Calibri, Arial, sans-serif; background:#eef1f5; color:#1a1a1a; margin:0; padding:0 32px 32px; font-size:16px; line-height:1.4; }
   h1 { color:#1E3A5F; margin:0; font-size:36px; }
@@ -1328,7 +1328,7 @@ $clusterTableRows
 </style>
 </head>
 <body>
-  <h1>VMware Weekly Health Check - Dashboard</h1>
+  <h1>VMware Monthly Health Check - Dashboard</h1>
   <p class="subtitle">Generated $(ConvertTo-HtmlSafe $RunDateDisplay) - $($summaries.Count) site(s)</p>
 
   <nav class="tabs">
