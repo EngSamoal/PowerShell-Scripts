@@ -90,10 +90,15 @@ param(
     [string[]]$BackupCsvPaths = @(),
     [string]$StorageWorkbookPath = '',
 
+    # Reporting period shown on the dashboard (e.g. 1-October-2026 / 31-October-2026). Prompted
+    # for at run time when omitted; pressing Enter at the prompt accepts the previous month.
+    [string]$PeriodStart = '',
+    [string]$PeriodEnd = '',
+
     [string]$OutputPath = (Join-Path $PSScriptRoot "BackupStorage_HealthCheck_Reports")
 )
 
-$ScriptBuild = '2026-11-03-02-storage-checklist'
+$ScriptBuild = '2026-11-03-03-reporting-period'
 Write-Host "BackupStorage_Weekly_HealthCheck.ps1 - build $ScriptBuild" -ForegroundColor Magenta
 
 $ErrorActionPreference = 'Stop'
@@ -101,6 +106,32 @@ $ScriptStart = Get-Date
 $RunDate = $ScriptStart.ToString('yyyy-MM-dd')
 $RunDateDisplay = $ScriptStart.ToString('d-MMMM-yyyy', [System.Globalization.CultureInfo]::InvariantCulture)
 if (-not (Test-Path $OutputPath)) { New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null }
+
+# ---- Reporting period (prompted when not passed as parameters) ----
+$Invariant = [System.Globalization.CultureInfo]::InvariantCulture
+$DateFormats = [string[]]@('d-MMMM-yyyy', 'd-MMM-yyyy', 'd MMMM yyyy', 'd MMM yyyy', 'yyyy-MM-dd', 'd/M/yyyy', 'dd/MM/yyyy')
+function Read-PeriodDate {
+    param([string]$Value, [string]$Label, [datetime]$Default)
+    while ($true) {
+        if (-not $Value) {
+            $Value = Read-Host "Enter $Label date (e.g. $($Default.ToString('d-MMMM-yyyy', $Invariant))) [Enter = $($Default.ToString('d-MMMM-yyyy', $Invariant))]"
+            if (-not $Value) { return $Default }
+        }
+        $parsed = [datetime]::MinValue
+        if ([datetime]::TryParseExact($Value.Trim(), $DateFormats, $Invariant, [System.Globalization.DateTimeStyles]::None, [ref]$parsed)) { return $parsed }
+        Write-Host "  '$Value' isn't a valid date - use a format like 1-October-2026." -ForegroundColor Yellow
+        $Value = ''
+    }
+}
+$prevMonthStart = (Get-Date -Day 1).Date.AddMonths(-1)
+$PeriodStartDate = Read-PeriodDate -Value $PeriodStart -Label 'reporting period START' -Default $prevMonthStart
+$PeriodEndDate   = Read-PeriodDate -Value $PeriodEnd   -Label 'reporting period END'   -Default $PeriodStartDate.AddMonths(1).AddDays(-1)
+while ($PeriodEndDate -lt $PeriodStartDate) {
+    Write-Host "  End date is before the start date - please re-enter." -ForegroundColor Yellow
+    $PeriodEndDate = Read-PeriodDate -Value '' -Label 'reporting period END' -Default $PeriodStartDate.AddMonths(1).AddDays(-1)
+}
+$PeriodDisplay = "$($PeriodStartDate.ToString('d-MMMM-yyyy', $Invariant)) to $($PeriodEndDate.ToString('d-MMMM-yyyy', $Invariant))"
+Write-Host "Reporting period: $PeriodDisplay" -ForegroundColor Cyan
 
 # ============================================================================
 # 0. LOGGING / SAFE-EXECUTION HELPERS (same pattern as Network_Weekly_HealthCheck.ps1)
@@ -762,7 +793,7 @@ $checkRows
         <div class="site-hero" style="border-left-color:$color">
           <h1>$(ConvertTo-HtmlSafe $s.Site)</h1>
           <span class="badge big" style="background:$color">No Backup Solution - Risk Communicated</span>
-          <div class="meta">Report generated $(ConvertTo-HtmlSafe $RunDateDisplay)</div>
+          <div class="meta">Reporting period $(ConvertTo-HtmlSafe $PeriodDisplay) - report generated $(ConvertTo-HtmlSafe $RunDateDisplay)</div>
         </div>
         <div class="panel panel-full risk-panel" style="border-top-color:$color">
           <h3><span class="n" style="background:$color">&#9888;&#65039;</span>Backup</h3>
@@ -779,7 +810,7 @@ $storagePanel
         <div class="site-hero" style="border-left-color:$color">
           <h1>$(ConvertTo-HtmlSafe $s.Site)</h1>
           <span class="badge big" style="background:$color">$(ConvertTo-HtmlSafe $healthLabelText.NoData)</span>
-          <div class="meta">Report generated $(ConvertTo-HtmlSafe $RunDateDisplay)</div>
+          <div class="meta">Reporting period $(ConvertTo-HtmlSafe $PeriodDisplay) - report generated $(ConvertTo-HtmlSafe $RunDateDisplay)</div>
         </div>
         <div class="panel panel-full nodata-panel">
           <p class="nodata-text-big">There is no data provided yet</p>
@@ -815,7 +846,7 @@ $storagePanel
         <div class="site-hero" style="border-left-color:$color">
           <h1>$(ConvertTo-HtmlSafe $s.Site)</h1>
           <span class="badge big" style="background:$color">$(ConvertTo-HtmlSafe $healthLabelText[$s.OverallHealth])</span>
-          <div class="meta">Report generated $(ConvertTo-HtmlSafe $RunDateDisplay)</div>
+          <div class="meta">Reporting period $(ConvertTo-HtmlSafe $PeriodDisplay) - report generated $(ConvertTo-HtmlSafe $RunDateDisplay)</div>
         </div>
 
         <div class="risk-row big">
@@ -863,6 +894,7 @@ $storagePanel
   .dashboard-header { width:100%; text-align:left; background:#1E3A5F; border-radius:10px; padding:26px 32px; margin:24px 0 0; box-sizing:border-box; }
   .dashboard-header h1 { color:#fff; font-size:36px; }
   .dashboard-header .subtitle { color:rgba(255,255,255,0.8); margin:8px 0 0; font-size:16px; }
+  .dashboard-header .subtitle.period { color:#fff; font-size:20px; font-weight:bold; margin-top:10px; }
   .overview-box { display:flex; justify-content:center; align-items:center; width:100%; text-align:center; margin-top:16px; font-size:52px; letter-spacing:1px; padding:34px 32px; min-height:0; box-sizing:border-box; }
   .tabs { display:grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap:20px; padding:24px 0 20px; position:sticky; top:0; background:#eef1f5; z-index:10; border-bottom:1px solid #dfe3e8; margin-bottom:32px; }
   .page { display:none; }
@@ -944,6 +976,7 @@ $storagePanel
 <body>
   <div class="dashboard-header">
     <h1>Backup &amp; Storage Monthly Health Check - Dashboard</h1>
+    <p class="subtitle period">Reporting period: $(ConvertTo-HtmlSafe $PeriodDisplay)</p>
     <p class="subtitle">Generated $(ConvertTo-HtmlSafe $RunDateDisplay) - $($summaries.Count) site(s)</p>
   </div>
 
@@ -1001,6 +1034,7 @@ Invoke-SafeCheck -CheckName 'Dashboard generation' -Site 'n/a' -ObjectName 'Dash
 $LogPath = Join-Path $OutputPath "BackupStorage_Weekly_HealthCheck_$RunDate.log"
 $LogLines = @()
 $LogLines += "Backup & Storage Weekly Health Check run - $($ScriptStart.ToString('u')) - build $ScriptBuild"
+$LogLines += "Reporting period: $PeriodDisplay"
 $LogLines += "Sites processed: $($SiteLabels -join ', ')"
 $LogLines += "Total findings collected: $($Global:AllResults.Count)"
 $LogLines += "Total collection failures: $($Global:FailureLog.Count)"
