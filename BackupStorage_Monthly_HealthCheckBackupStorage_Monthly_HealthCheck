@@ -66,8 +66,8 @@
     bad racks out of 15-20 is normal noise), a site typically only has a handful of protection
     groups, so any single failed backup job is itself worth flagging immediately.
 
-    This dashboard template covers 6 sites (AquaArabia, SixFlags, SceneCinema, SEVEN Tabuk,
-    SEVEN ABHA, SEVEN Alhamra) so it's ready to use as each site's data becomes available - a
+    This dashboard template covers 7 sites (AquaArabia, SixFlags, SceneCinema, SEVEN Tabuk,
+    SEVEN ABHA, SEVEN Alhamra, Golf) so it's ready to use as each site's data becomes available - a
     site with no CSV rows and no Storage row still gets its own tab and page, showing "There is
     no data provided yet" instead of being silently left out.
 
@@ -93,7 +93,7 @@ param(
     [string]$OutputPath = (Join-Path $PSScriptRoot "BackupStorage_HealthCheck_Reports")
 )
 
-$ScriptBuild = '2026-10-04-01-backupstorage-initial'
+$ScriptBuild = '2026-11-03-01-add-golf-site'
 Write-Host "BackupStorage_Weekly_HealthCheck.ps1 - build $ScriptBuild" -ForegroundColor Magenta
 
 $ErrorActionPreference = 'Stop'
@@ -185,6 +185,8 @@ function Find-HeaderRow {
 function Get-SiteForBackupRow {
     param([string]$ProtectionGroup, [string]$Source)
     if ($ProtectionGroup -match '^AQ-?') { return 'AquaArabia' }
+    if ($ProtectionGroup -match '^(GF-|Golf)') { return 'Golf' }
+    if ($Source -match 'golf')     { return 'Golf' }
     if ($Source -match 'sevenab')  { return 'SEVEN ABHA' }
     if ($Source -match 'seventb')  { return 'SEVEN Tabuk' }
     if ($Source -match 'sixflags') { return 'SixFlags' }
@@ -289,6 +291,7 @@ $StorageSiteNameMap = @{
     'tabuk'       = 'SEVEN Tabuk'
     'abha'        = 'SEVEN ABHA'
     'alhamra'     = 'SEVEN Alhamra'
+    'golf'        = 'Golf'
 }
 
 function ConvertFrom-CapacityNumber {
@@ -367,7 +370,7 @@ function Read-StorageWorkbook {
 # ============================================================================
 # This dashboard's 6 sites, in display order - not derived from any workbook content, since
 # Backup and Storage each only have rows for whichever sites currently have data.
-$SiteDisplayOrder = @('AquaArabia', 'SixFlags', 'SceneCinema', 'SEVEN Tabuk', 'SEVEN ABHA', 'SEVEN Alhamra')
+$SiteDisplayOrder = @('AquaArabia', 'SixFlags', 'SceneCinema', 'SEVEN Tabuk', 'SEVEN ABHA', 'SEVEN Alhamra', 'Golf')
 
 if ($BackupCsvPaths -and $BackupCsvPaths.Count -gt 0) {
     Write-Host "`n=== Collecting Backup ===" -ForegroundColor Green
