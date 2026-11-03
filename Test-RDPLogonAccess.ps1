@@ -50,7 +50,7 @@ param(
     [ValidateRange(1, 720)] [int] $Hours = 24
 )
 
-$ScriptBuild = 'Test-RDPLogonAccess build 2026-11-01.1'
+$ScriptBuild = 'Test-RDPLogonAccess build 2026-11-03.1'
 Write-Host $ScriptBuild -ForegroundColor Cyan
 
 $ErrorActionPreference = 'Stop'
@@ -163,9 +163,11 @@ try {
     secedit /export /areas USER_RIGHTS /cfg $tmp /quiet | Out-Null
     foreach ($line in Get-Content $tmp) {
         if ($line -match '^(Se\w+)\s*=\s*(.*)$') {
-            $rights[$Matches[1]] = @($Matches[2] -split ',' | ForEach-Object {
+            # Copy the captures first: the -like test below must not clobber $Matches
+            $rightName = $Matches[1]; $entries = $Matches[2]
+            $rights[$rightName] = @($entries -split ',' | ForEach-Object {
                 $e = $_.Trim().TrimStart('*')
-                if ($e -match '^S-1-') { $e } else {
+                if ($e -like 'S-1-*') { $e } else {
                     try { ([Security.Principal.NTAccount]$e).Translate([Security.Principal.SecurityIdentifier]).Value } catch { $e }
                 }
             })
