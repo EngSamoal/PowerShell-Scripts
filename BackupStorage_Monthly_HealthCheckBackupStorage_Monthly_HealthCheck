@@ -93,7 +93,7 @@ param(
     [string]$OutputPath = (Join-Path $PSScriptRoot "BackupStorage_HealthCheck_Reports")
 )
 
-$ScriptBuild = '2026-11-03-01-add-golf-site'
+$ScriptBuild = '2026-11-03-02-storage-checklist'
 Write-Host "BackupStorage_Weekly_HealthCheck.ps1 - build $ScriptBuild" -ForegroundColor Magenta
 
 $ErrorActionPreference = 'Stop'
@@ -294,12 +294,64 @@ $StorageSiteNameMap = @{
     'abha'        = 'SEVEN ABHA'
     'alhamra'     = 'SEVEN Alhamra'
     'golf'        = 'Golf'
+    'sf'          = 'SixFlags'
 }
 
 function ConvertFrom-CapacityNumber {
     param([string]$Text)
     if ($Text -match '([\d.]+)') { return [double]$Matches[1] }
     return $null
+}
+
+# Weekly checklist layout ("Weekly_HealthCheck_Storage&Backup_all_sites_<date>.xlsx"): one tab per
+# site named SF/Tabuk/Abha/Alhamra/Golf, each with a Category / Check Item / ... / Current Value /
+# Status / Severity / Ticket / Action Taken table. Only non-backup rows are kept (backup comes
+# from the Cohesity CSVs). Returns how many site tabs were read.
+function Read-StorageChecklistWorkbook {
+    param($Workbook, [string]$Path)
+    $sitesRead = 0
+    foreach ($ws in $Workbook.Worksheets) {
+        $key = ($ws.Name -replace '\s+', ' ').Trim().ToLower()
+        if (-not $StorageSiteNameMap.ContainsKey($key)) { continue }
+        $site = $StorageSiteNameMap[$key]
+        $hdr = Find-HeaderRow -Worksheet $ws -Labels @('Category', 'Check Item', 'Status')
+        if (-not $hdr) {
+            Write-CheckLog -Site $site -Object $ws.Name -CheckName 'Storage checklist' -ErrorMessage 'Could not locate the Category/Check Item/Status header on this tab.'
+            continue
+        }
+        Invoke-SafeCheck -Site $site -ObjectName $ws.Name -CheckName 'Storage checklist' -Script {
+            $cols = $hdr.Columns
+            $extra = @{}
+            for ($c = 1; $c -le 20; $c++) {
+                $v = "$($ws.Cells.Item($hdr.Row, $c).Value2)".Trim()
+                if ($v -match '^Current Value') { $extra.Current = $c }
+                elseif ($v -ieq 'Severity') { $extra.Severity = $c }
+                elseif ($v -match '^Ticket') { $extra.Ticket = $c }
+                elseif ($v -match '^Action Taken') { $extra.Action = $c }
+            }
+            $cellText = { param($c) if ($c) { ("$($ws.Cells.Item($r, $c).Text)".Trim() -replace '\|', '/') } else { '' } }
+
+            $used = $ws.UsedRange
+            $lastRow = $used.Row + $used.Rows.Count - 1
+            for ($r = $hdr.Row + 1; $r -le $lastRow; $r++) {
+                $checkItem = & $cellText $cols['Check Item']
+                if (-not $checkItem) { continue }
+                $category = & $cellText $cols['Category']
+                if ($category -match 'Cohesity|Backup') { continue }
+                $rawStatus = & $cellText $cols['Status']
+                $status = switch -regex ($rawStatus) {
+                    '^Critical' { 'Critical' }
+                    '^Warning'  { 'Warning' }
+                    '^Healthy'  { 'Healthy' }
+                    default     { 'Information' }
+                }
+                $value = "$category|$(& $cellText $extra.Current)|$(& $cellText $extra.Severity)|$(& $cellText $extra.Ticket)|$(& $cellText $extra.Action)|$rawStatus"
+                New-Finding -Site $site -Area 'StorageCheck' -Group $site -Object $checkItem -Item 'Storage Check' -Value $value -Status $status
+            }
+        }
+        $sitesRead++
+    }
+    return $sitesRead
 }
 
 function Read-StorageWorkbook {
@@ -316,7 +368,11 @@ function Read-StorageWorkbook {
             if ($hdr) { $ws = $candidate; break }
         }
         if (-not $ws) {
-            Write-CheckLog -Site 'n/a' -Object $Path -CheckName 'Storage Capacity by Site table' -ErrorMessage 'Could not locate the Site/Total Capacity/Used Capacity/Free Capacity header on any tab.'
+            # Not the capacity-table layout - try the weekly checklist layout (one tab per site).
+            $sitesRead = Read-StorageChecklistWorkbook -Workbook $wb -Path $Path
+            if (-not $sitesRead) {
+                Write-CheckLog -Site 'n/a' -Object $Path -CheckName 'Storage workbook' -ErrorMessage 'Neither a Site/Total Capacity/Used Capacity/Free Capacity table nor per-site Category/Check Item/Status checklist tabs were found.'
+            }
             return
         }
         Invoke-SafeCheck -Site 'n/a' -ObjectName $ws.Name -CheckName 'Storage Capacity by Site table' -Script {
@@ -515,13 +571,32 @@ function Get-SiteStorageSummary {
     param([string]$SiteLabel)
     $f = $Global:AllResults | Where-Object { $_.Site -eq $SiteLabel -and $_.Area -eq 'Storage' } | Select-Object -First 1
     if (-not $f) {
-        return [pscustomobject]@{ HasData = $false; Status = 'NoData'; TotalCapacity = ''; UsedCapacity = ''; FreeCapacity = ''; UsedPct = $null; Model = '' }
+        $checkFindings = @($Global:AllResults | Where-Object { $_.Site -eq $SiteLabel -and $_.Area -eq 'StorageCheck' })
+        if ($checkFindings.Count -gt 0) {
+            $checks = @(foreach ($cf in $checkFindings) {
+                $p = $cf.Value -split '\|'
+                [pscustomobject]@{
+                    CheckItem = $cf.Object; Category = $p[0]; Current = $p[1]; Severity = $p[2]
+                    Ticket = $p[3]; Action = $p[4]; RawStatus = $p[5]; Status = $cf.Status
+                }
+            })
+            $crit = @($checks | Where-Object { $_.Status -eq 'Critical' }).Count
+            $warn = @($checks | Where-Object { $_.Status -eq 'Warning' }).Count
+            $ok   = @($checks | Where-Object { $_.Status -eq 'Healthy' }).Count
+            $overall = if ($crit -gt 0) { 'Critical' } elseif ($warn -gt 0) { 'Warning' } else { 'Healthy' }
+            return [pscustomobject]@{
+                HasData = $true; Mode = 'Checklist'; Status = $overall; Checks = $checks
+                CriticalCount = $crit; WarningCount = $warn; HealthyCount = $ok; Model = 'HPE Alletra'
+            }
+        }
+        return [pscustomobject]@{ HasData = $false; Mode = ''; Status = 'NoData'; TotalCapacity = ''; UsedCapacity = ''; FreeCapacity = ''; UsedPct = $null; Model = '' }
     }
     $p = $f.Value -split '\|'
     $usedPctVal = $null
     if ($p[3]) { try { $usedPctVal = [double]$p[3] } catch { } }
     [pscustomobject]@{
         HasData       = $true
+        Mode          = 'Capacity'
         Status        = $f.Status
         TotalCapacity = $p[0]
         UsedCapacity  = $p[1]
@@ -640,6 +715,24 @@ function Write-DashboardHtml {
           <div class="nodata-panel">
             <p class="nodata-text-big">There is no data provided yet</p>
           </div>
+        </div>
+"@
+        } elseif ($storage.Mode -eq 'Checklist') {
+            $storageColor = $healthColor[$storage.Status]
+            $checkRows = ($storage.Checks | ForEach-Object {
+                $pillText = if ($_.RawStatus) { $_.RawStatus } else { 'Not Checked' }
+                $cur = if ($_.Current) { $_.Current } else { '-' }
+                $sev = if ($_.Severity) { $_.Severity } else { '-' }
+                $act = if ($_.Action) { $_.Action } else { '-' }
+                "<tr><td>$(ConvertTo-HtmlSafe $_.CheckItem)</td><td>$(ConvertTo-HtmlSafe $cur)</td><td>$(Get-StatusPillHtml -Status $_.Status -Text $pillText)</td><td>$(ConvertTo-HtmlSafe $sev)</td><td>$(ConvertTo-HtmlSafe $act)</td></tr>"
+            }) -join "`n"
+@"
+        <div class="panel panel-full" style="border-top-color:$storageColor">
+          <h3><span class="n" style="background:$storageColor">&#128451;&#65039;</span>Storage <span style="font-weight:normal;font-size:14px;color:#999">($(ConvertTo-HtmlSafe $storage.Model) - $($storage.Checks.Count) checks: $($storage.HealthyCount) healthy, $($storage.WarningCount) warning, $($storage.CriticalCount) critical)</span>$(Get-StatusPillHtml -Status $storage.Status -Text $storage.Status)</h3>
+          <table class="checks">
+            <tr><th>Check</th><th>Current Value / Evidence</th><th>Status</th><th>Severity</th><th>Action Taken / Required</th></tr>
+$checkRows
+          </table>
         </div>
 "@
         } else {
@@ -838,6 +931,9 @@ $storagePanel
   .storage-card .meter-track { height:12px; border-radius:6px; overflow:hidden; background:#eef2f5; margin-bottom:8px; }
   .storage-card .meter-fill { height:100%; border-radius:6px; }
   .storage-card .storage-pct { font-size:13px; color:#666; font-weight:600; margin-bottom:12px; }
+  table.checks { width:100%; border-collapse:collapse; font-size:14px; }
+  table.checks th { text-align:left; color:#666; font-weight:600; padding:8px 6px; border-bottom:2px solid #ddd; }
+  table.checks td { padding:8px 6px; border-bottom:1px solid #eee; vertical-align:top; }
 
   /* No-data placeholder (template site, or a site's Storage panel until that data is supplied) */
   .nodata-panel { text-align:center; padding:48px 24px; }
