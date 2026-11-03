@@ -186,7 +186,7 @@ function Get-SiteForBackupRow {
     param([string]$ProtectionGroup, [string]$Source)
     if ($ProtectionGroup -match '^AQ-?') { return 'AquaArabia' }
     if ($ProtectionGroup -match '^(GF-|Golf)') { return 'Golf' }
-    if ($Source -match 'golf')     { return 'Golf' }
+    if ($Source -match 'golf|qicpg') { return 'Golf' }
     if ($Source -match 'sevenab')  { return 'SEVEN ABHA' }
     if ($Source -match 'seventb')  { return 'SEVEN Tabuk' }
     if ($Source -match 'sixflags') { return 'SixFlags' }
@@ -208,14 +208,16 @@ function ConvertTo-DataReadText {
 
 function Read-BackupCsvReport {
     param([string]$Path)
-    if (-not $Path -or -not (Test-Path $Path)) {
+    # Forgive a path typed without its ".csv" extension (Explorer hides it by default).
+    if ($Path -and -not (Test-Path -LiteralPath $Path) -and (Test-Path -LiteralPath "$Path.csv")) { $Path = "$Path.csv" }
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) {
         if ($Path) { Write-CheckLog -Site 'n/a' -Object $Path -CheckName 'Backup CSV' -ErrorMessage 'File not found.' }
         return
     }
     Invoke-SafeCheck -Site 'n/a' -ObjectName $Path -CheckName 'Backup CSV' -Script {
         # A couple of report-header lines ("Report Name: ...", "Parameters = ...") sit above the
         # real header row - located by content, not assumed to be a fixed line number.
-        $lines = Get-Content -Path $Path
+        $lines = Get-Content -LiteralPath $Path
         $headerIndex = -1
         for ($i = 0; $i -lt $lines.Count; $i++) {
             if ($lines[$i] -match '^"?Protection Group"?,') { $headerIndex = $i; break }
