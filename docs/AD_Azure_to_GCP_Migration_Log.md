@@ -12,7 +12,9 @@ Last updated: 2026-11-05
 | Item | Value | How verified |
 |---|---|---|
 | AD domain | `amccinemasksa.net` | `Resolve-DnsName`, `netdom` |
-| Azure DC (healthy, writable) | `p-amcsccl-adc` = **10.7.30.8** | `repadmin /replsummary` 0 fails; `ipconfig` |
+| Azure DC (healthy, writable) | `p-amcsccl-adc` = **10.7.30.8** /27, GW 10.7.30.1 | `repadmin /replsummary` 0 fails; `ipconfig` |
+| Azure DC RPC dynamic ports in use | 49668, 49670, 49671, 50028 (can change after reboot; firewall must allow the full 49152–65535) | `Get-NetTCPConnection` on lsass/dfsrs |
+| Enterprise Admins = Schema Admins members | Asem Alzughaibi, Vcenter Admin, Ibrahim Jafari, Super Administrator, Abdullah AlSubhi, Administrator (migration engineer's account **not** a member) | `Get-ADGroupMember` |
 | FSMO (before any change) | Schema, Domain Naming, PDC, Infrastructure = `p-amcsccl-adc`; **RID = `KSA-HOS-AD`** | `netdom query fsmo` |
 | Dead writable DCs | `KSA-HOS-AD`, `KSA-HOS-BD`: 100% replication failure, >60 days, error 1722 (RPC unavailable) | `repadmin /replsummary` |
 | Domain A records also returned | 10.7.7.13, 10.7.7.14 (probably the dead KSA-HOS DCs, **not yet confirmed**) | `Resolve-DnsName amccinemasksa.net` |
@@ -73,7 +75,7 @@ Last updated: 2026-11-05
 ```powershell
 # Fast TCP test (1 s per port). Add RPC ports found on the Azure DC to $rpc
 $ip  = '10.7.30.8'
-$rpc = @()
+$rpc = @(49668,49670,49671,50028)   # Azure DC ports found 2026-11-05
 $ports = @{53='DNS';88='Kerberos';135='RPC-EPM';389='LDAP';445='SMB';464='Kpasswd';636='LDAPS';3268='GC';3269='GC-SSL';9389='ADWS'}
 foreach ($r in $rpc) { $ports[[int]$r] = 'RPC-dynamic' }
 foreach ($p in ($ports.Keys | Sort-Object)) {
