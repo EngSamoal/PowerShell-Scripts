@@ -50,7 +50,7 @@ param(
     [ValidateRange(1, 720)] [int] $Hours = 24
 )
 
-$ScriptBuild = 'Test-RDPLogonAccess build 2026-11-03.1'
+$ScriptBuild = 'Test-RDPLogonAccess build 2026-11-08.1'
 Write-Host $ScriptBuild -ForegroundColor Cyan
 
 $ErrorActionPreference = 'Stop'
@@ -279,7 +279,7 @@ $codes = @{
     'C0000072' = 'Account disabled'; 'C000006F' = 'Outside allowed logon hours'; 'C0000070' = 'Workstation restriction'
     'C0000193' = 'Account expired'; 'C0000071' = 'Password expired'; 'C0000224' = 'Must change password at next logon'
     'C000015B' = 'Logon type not granted (User Rights Assignment / Deny right)'; 'C000006E' = 'Account restriction'
-    'C0000133' = 'Clock skew'; 'C0000413' = 'Authentication firewall'; 'C000006D' = 'Bad user name or authentication info'
+    'C0000133' = 'Clock skew'; 'C0000413' = 'Authentication firewall'; 'C000006D' = 'Bad user name or authentication info (with SubStatus 0: NTLM version/security mismatch, not a wrong password)'
 }
 $ms = $Hours * 3600000
 $xp = "*[System[EventID=4625 and TimeCreated[timediff(@SystemTime) <= $ms]]] and *[EventData[Data[@Name='TargetUserName']='$UserName']]"
@@ -296,8 +296,9 @@ if ($fails.Count -eq 0) {
     if ($sub -eq '' -or $sub -eq '0' -or $sub -eq '00000000') { $sub = ("{0}" -f $d['Status']).ToUpper() -replace '^0X', '' }
     $reason = if ($codes.ContainsKey($sub)) { $codes[$sub] } else { 'Unknown code' }
     Add-Check 'Evidence' "Failed logons (4625), last $Hours h" 'FAIL' `
-        ("{0} failures. Latest {1:yyyy-MM-dd HH:mm}: 0x{2} = {3} | LogonType {4} | Auth {5} | From {6} {7}" -f
-            $fails.Count, $fails[0].TimeCreated, $sub, $reason, $d['LogonType'], $d['AuthenticationPackageName'], $d['WorkstationName'], $d['IpAddress']) `
+        ("{0} failures. Latest {1:yyyy-MM-dd HH:mm}: 0x{2} = {3} | Status {4} SubStatus {5} | LogonType {6} | Auth {7} ({8}) | From {9} {10}" -f
+            $fails.Count, $fails[0].TimeCreated, $sub, $reason, $d['Status'], $d['SubStatus'], $d['LogonType'],
+            $d['AuthenticationPackageName'], (Show-Value $d['LmPackageName']), $d['WorkstationName'], $d['IpAddress']) `
         'This is the reason Windows rejected the logon - fix the matching FAIL above.'
 }
 
