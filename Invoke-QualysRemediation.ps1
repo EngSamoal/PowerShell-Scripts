@@ -4,6 +4,8 @@
     Guest Operations (Copy-VMGuestFile + Invoke-VMScript). No WinRM dependency.
 
 .DESCRIPTION
+    Build: 2026.11.10-1 (printed as the first log line of every run).
+
     Built from CHG0002363 (Compliance_Report + VA_Report, scan 2026-10-07/08).
     Default run is AUDIT ONLY - nothing is changed in the guest. Add -Apply to remediate.
 
@@ -49,6 +51,7 @@ param(
     [string]$LogDir = (Join-Path $PSScriptRoot 'Logs')
 )
 
+$ScriptBuild = '2026.11.10-1'
 $ErrorActionPreference = 'Stop'
 
 # Targets: -VMName wins; otherwise one vCenter VM name per line in -VMListPath (blank lines and # comments ignored)
@@ -649,6 +652,7 @@ function Write-Log([string]$Message, [string]$Level = 'INFO') {
 
 $guestDir = 'C:\Windows\Temp\QRem'
 $all = New-Object System.Collections.Generic.List[object]
+Write-Log "Invoke-QualysRemediation build $ScriptBuild"
 Write-Log "Mode=$mode Tiers=$tiers UserProfiles=$userFlg Targets=$($VMName -join ',') Operator=$env:USERNAME GuestUser=$($GuestCredential.UserName)"
 
 foreach ($name in $VMName) {
