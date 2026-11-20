@@ -109,6 +109,7 @@ certutil -error 0x800705B4
 - [ ] Confirm KSA-HOS-AD is permanently gone → seize RID to `p-amcsccl-adc` (status: **not yet confirmed done**)
 - [ ] Re-run promotion → verify replication → transfer FSMO → time config
 - [ ] Later: metadata cleanup of KSA-HOS-AD/BD, decommission RODCs, second GCP DC, retire Azure DC
+- [ ] **Non-domain machines using 10.7.30.8 as DNS** (Linux, appliances, printers): identify them (device DNS settings / network team query logs), allow UDP/TCP 53 to the GCP DCs, and repoint their DNS before the Azure DC is decommissioned
 
 ## 7. Remaining planned steps (current version)
 
