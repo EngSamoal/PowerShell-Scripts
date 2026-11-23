@@ -390,13 +390,22 @@ foreach ($VC in $Connections) {
                 }
             }
 
-            # Secure Boot (via EsxCli, no SSH required - this is the vSphere API path)
+            # Secure Boot - via TPM Attestation (Summary.TpmAttestation), NOT the EsxCli encryption
+            # "RequireSecureBoot" flag: that flag is an encryption-subsystem policy requirement,
+            # not the host's actual live Secure Boot state, and reads false on every host
+            # regardless of real BIOS state. TPM Attestation reflects the measured boot chain -
+            # the same data vCenter's own Cluster > Monitor > Attestation report shows.
             Invoke-SafeCheck -CheckName 'Secure Boot' -VCenter $VCName -Site $Site -ObjectName $HName -Script {
-                $esxcli = Get-EsxCli -VMHost $VMHost -Server $VC -V2
-                $sb = $esxcli.system.settings.encryption.get.Invoke()
-                $enabled = $sb.RequireSecureBoot
-                New-Finding -Site $Site -VCenter $VCName -Area 'Security' -Cluster $ClusterName -Object $HName `
-                    -Item 'Secure Boot' -Value $enabled -Status $(if ($enabled -eq $true -or $enabled -eq 'true') {'Healthy'} else {'Warning'})
+                $att = $VMHost.ExtensionData.Summary.TpmAttestation
+                if (-not $att) {
+                    New-Finding -Site $Site -VCenter $VCName -Area 'Security' -Cluster $ClusterName -Object $HName `
+                        -Item 'Secure Boot' -Value 'No TPM' -Status 'Information' -Notes 'No TPM 2.0 present on this host - Secure Boot attestation not available.'
+                } else {
+                    $passed = $att.Status -eq 'accepted'
+                    $msg = if ($att.Message) { $att.Message.Message } else { '' }
+                    New-Finding -Site $Site -VCenter $VCName -Area 'Security' -Cluster $ClusterName -Object $HName `
+                        -Item 'Secure Boot' -Value $(if ($passed) { 'true' } else { 'false' }) -Status $(if ($passed) { 'Healthy' } else { 'Warning' }) -Notes $msg
+                }
             }
 
             # Lockdown Mode
